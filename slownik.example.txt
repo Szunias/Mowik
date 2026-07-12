@@ -1,0 +1,5 @@
+# Jedna nazwa lub fraza w każdym wierszu.
+# Linie zaczynające się od # są ignorowane.
+OpenAI
+ChatGPT
+Mówik

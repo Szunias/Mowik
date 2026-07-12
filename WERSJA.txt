@@ -1,0 +1,2 @@
+Mowik 2.2.0
+Wykrywanie przycisku, własne dźwięki WAV i jawne kopiowanie do schowka.

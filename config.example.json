@@ -1,0 +1,50 @@
+{
+  "trigger": "keyboard:f8",
+  "language": "pl",
+  "model": "auto",
+  "device": "auto",
+  "cpu_threads": 0,
+  "beam_size": 5,
+  "pre_roll_ms": 300,
+  "post_roll_ms": 160,
+  "minimum_recording_ms": 250,
+  "minimum_rms": 0.0015,
+  "microphone": null,
+  "vad": {
+    "enabled": true,
+    "threshold": 0.45,
+    "min_speech_duration_ms": 120,
+    "min_silence_duration_ms": 250,
+    "speech_pad_ms": 180
+  },
+  "dictionary": {
+    "enabled": true,
+    "max_terms": 120
+  },
+  "paste": {
+    "enabled": true,
+    "copy_to_clipboard": true,
+    "append_space": true,
+    "delay_ms": 90
+  },
+  "feedback": {
+    "sounds": true,
+    "notifications": true,
+    "loop_recording_sound": false,
+    "custom_sounds": {
+      "start": "",
+      "stop": "",
+      "done": "",
+      "error": ""
+    }
+  },
+  "voice_commands": {
+    "enabled": false
+  },
+  "ollama_cleanup": {
+    "enabled": false,
+    "url": "http://127.0.0.1:11434",
+    "model": "",
+    "timeout_seconds": 45
+  }
+}
