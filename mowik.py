@@ -188,8 +188,13 @@ def deep_merge(defaults: dict[str, Any], loaded: dict[str, Any]) -> dict[str, An
     for key, default_value in defaults.items():
         if key not in loaded:
             result[key] = default_value
-        elif isinstance(default_value, dict) and isinstance(loaded[key], dict):
-            result[key] = deep_merge(default_value, loaded[key])
+        elif isinstance(default_value, dict):
+            if isinstance(loaded[key], dict):
+                result[key] = deep_merge(default_value, loaded[key])
+            else:
+                # Zły typ w ręcznie edytowanym config.json nie może
+                # wywrócić programu w trakcie dyktowania.
+                result[key] = default_value
         else:
             result[key] = loaded[key]
     for key, value in loaded.items():
@@ -2537,7 +2542,9 @@ class MowikApp:
 def acquire_single_instance() -> Optional[int]:
     if os.name != "nt":
         return None
-    kernel32 = ctypes.windll.kernel32
+    # use_last_error zachowuje kod błędu od razu po wywołaniu CreateMutexW;
+    # zwykłe GetLastError może zostać nadpisane przez inne wywołania Win32.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
     kernel32.CreateMutexW.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
@@ -2545,9 +2552,9 @@ def acquire_single_instance() -> Optional[int]:
 
     handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
     if not handle:
-        raise ctypes.WinError()
+        raise ctypes.WinError(ctypes.get_last_error())
     ERROR_ALREADY_EXISTS = 183
-    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         ctypes.windll.user32.MessageBoxW(
             None,
             "Mówik jest już uruchomiony. Poszukaj ikony mikrofonu przy zegarze.",
