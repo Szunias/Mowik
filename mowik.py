@@ -178,7 +178,7 @@ import pyperclip
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 MUTEX_NAME = r"Local\MowikLocalDictation"
 SETTINGS_MUTEX_NAME = r"Local\MowikLocalDictation.Settings"
 PROCESS_STARTED_AT_NS = time.time_ns()

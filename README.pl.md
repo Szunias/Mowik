@@ -93,7 +93,7 @@ Instalator wymaga 64-bitowego Windows 10 w wersji 1809 lub nowszej albo Windows 
 Instalator proponuje język zgodny z interfejsem Windows i pozwala go potwierdzić lub zmienić. Aplikacja domyślnie dopasowuje język automatycznie; w Centrum Mówika możesz niezależnie wybrać **Automatycznie**, **Polski** albo **English**, a następnie **Zapisz i uruchom ponownie**.
 
 > [!WARNING]
-> Publiczny instalator Mówika 2.7.0 **nie jest podpisany cyfrowo**. Windows może przez to wyświetlić komunikat **Nieznany wydawca** albo ostrzeżenie Microsoft Defender SmartScreen. Pobieraj instalator wyłącznie z [oficjalnego wydania Mówika na GitHubie](https://github.com/Szunias/Mowik/releases/latest) i przed uruchomieniem porównaj jego SHA-256 z plikiem `SHA256SUMS.txt` z tego samego wydania. W PowerShell użyj `Get-FileHash .\Mowik-2.7.0-Setup-UNSIGNED.exe -Algorithm SHA256` i porównaj całą wartość. Nie wyłączaj zabezpieczeń Windows, żeby zainstalować Mówika.
+> Publiczny instalator Mówika 2.7.1 **nie jest podpisany cyfrowo**. Windows może przez to wyświetlić komunikat **Nieznany wydawca** albo ostrzeżenie Microsoft Defender SmartScreen. Pobieraj instalator wyłącznie z [oficjalnego wydania Mówika na GitHubie](https://github.com/Szunias/Mowik/releases/latest) i przed uruchomieniem porównaj jego SHA-256 z plikiem `SHA256SUMS.txt` z tego samego wydania. W PowerShell użyj `Get-FileHash .\Mowik-2.7.1-Setup-UNSIGNED.exe -Algorithm SHA256` i porównaj całą wartość. Nie wyłączaj zabezpieczeń Windows, żeby zainstalować Mówika.
 
 ### Aktualizacja istniejącej instalacji
 
@@ -187,7 +187,7 @@ Fioletowy wskaźnik ekranowy odróżnia komendy od zwykłego zielonego dyktowani
 
 ### Przejrzystość wobec antywirusa i SmartScreen
 
-Mówik nie zaciemnia kodu, nie wyłącza ochrony, nie dodaje wyjątków Defendera, nie ukrywa konsol poleceń i nie pobiera wykonywalnych aktualizacji. Build Windows jest katalogiem aplikacji zamiast samorozpakowującego się pojedynczego EXE, ma manifest `asInvoker`, pozostawia autostart jako świadomy wybór i nie wykonuje szkiców terminala. To ogranicza podejrzane zachowania, ale nie zastępuje podpisu Authenticode ani normalnego budowania reputacji. Publiczny instalator 2.7.0 jest niepodpisany, więc komunikat Nieznany wydawca albo ostrzeżenie SmartScreen może wystąpić nawet wtedy, gdy SHA-256 zgadza się z oficjalnym wydaniem. Jeżeli antywirus zgłosi zweryfikowany oficjalny plik, prześlij dokładnie ten plik jako możliwy fałszywy alarm zamiast osłabiać zabezpieczenia użytkownika.
+Mówik nie zaciemnia kodu, nie wyłącza ochrony, nie dodaje wyjątków Defendera, nie ukrywa konsol poleceń i nie pobiera wykonywalnych aktualizacji. Build Windows jest katalogiem aplikacji zamiast samorozpakowującego się pojedynczego EXE, ma manifest `asInvoker`, pozostawia autostart jako świadomy wybór i nie wykonuje szkiców terminala. To ogranicza podejrzane zachowania, ale nie zastępuje podpisu Authenticode ani normalnego budowania reputacji. Publiczny instalator 2.7.1 jest niepodpisany, więc komunikat Nieznany wydawca albo ostrzeżenie SmartScreen może wystąpić nawet wtedy, gdy SHA-256 zgadza się z oficjalnym wydaniem. Jeżeli antywirus zgłosi zweryfikowany oficjalny plik, prześlij dokładnie ten plik jako możliwy fałszywy alarm zamiast osłabiać zabezpieczenia użytkownika.
 
 Samo rozpoznawanie mowy nadal działa lokalnie, ale akcja otwierająca stronę lub program korzystający z sieci może oczywiście użyć połączenia internetowego tego programu.
 
@@ -236,7 +236,7 @@ Mówik nie wklei tekstu do aplikacji uruchomionej jako administrator, jeżeli sa
 - Autostart jest domyślnie odznaczony i wymaga świadomego zaznaczenia w kreatorze; ponowne uruchomienie instalatora pozwala zmienić tę opcję.
 - Język interfejsu może automatycznie podążać za językiem Windows albo zostać ustawiony na polski lub angielski w Centrum Mówika.
 - `BUDUJ_EXE.cmd` buduje katalog aplikacji `dist\Mowik`.
-- `BUDUJ_INSTALATOR.cmd` uruchamia testy, buduje aplikację i tworzy jednoznacznie lokalny `release\Mowik-x.y.z-Setup-UNSIGNED.exe` wraz z sumą SHA-256. Doraźnego lokalnego buildu nie należy wgrywać jako oficjalnego wydania. Oficjalne artefakty powstają przez workflow wydania na GitHubie razem z `SHA256SUMS.txt`; publiczny instalator 2.7.0 również jest niepodpisany i może wywołać ostrzeżenia Windows.
+- `BUDUJ_INSTALATOR.cmd` uruchamia testy, buduje aplikację i tworzy jednoznacznie lokalny `release\Mowik-x.y.z-Setup-UNSIGNED.exe` wraz z sumą SHA-256. Doraźnego lokalnego buildu nie należy wgrywać jako oficjalnego wydania. Oficjalne artefakty powstają przez workflow wydania na GitHubie razem z `SHA256SUMS.txt`; publiczny instalator 2.7.1 również jest niepodpisany i może wywołać ostrzeżenia Windows.
 - Definicje powtarzalnego wydania znajdują się w `packaging`, a workflow GitHub Actions w `.github/workflows/windows-release.yml`.
 
 ## Licencja

@@ -135,6 +135,7 @@ class ReleasePipelineHardeningTests(unittest.TestCase):
         self.assertIn("SignedUninstaller=yes", script)
         self.assertIn("SignedUninstaller=no", script)
         self.assertIn("Setup-UNSIGNED", script)
+        self.assertNotIn("DisablePrecompiledFileVerifications", script)
         self.assertRegex(
             script,
             r'Name: "autostart";[^\n]*Flags: unchecked',
@@ -567,7 +568,7 @@ class ReleasePowerShellBehaviorTests(unittest.TestCase):
             "WERSJA.txt",
             "install.ps1",
         )
-        command = "& $env:MOWIK_TEST_VERSION_SCRIPT -Version 2.7.0"
+        command = "& $env:MOWIK_TEST_VERSION_SCRIPT -Version 2.7.1"
         for scenario in ("stale-comment", "duplicate"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
                 project = Path(temp)
@@ -586,12 +587,12 @@ class ReleasePowerShellBehaviorTests(unittest.TestCase):
                 content = source_file.read_text(encoding="utf-8")
                 if scenario == "stale-comment":
                     content = content.replace(
-                        'APP_VERSION = "2.7.0"',
-                        'APP_VERSION = "9.9.9"\n# APP_VERSION = "2.7.0"',
+                        'APP_VERSION = "2.7.1"',
+                        'APP_VERSION = "9.9.9"\n# APP_VERSION = "2.7.1"',
                         1,
                     )
                 else:
-                    content += '\nAPP_VERSION = "2.7.0"\n'
+                    content += '\nAPP_VERSION = "2.7.1"\n'
                 source_file.write_text(content, encoding="utf-8")
                 self.run_powershell(
                     command, environment=environment, expect_success=False

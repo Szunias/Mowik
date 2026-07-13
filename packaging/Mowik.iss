@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "2.7.0"
+  #define MyAppVersion "2.7.1"
 #endif
 
 #ifndef MyOutputBaseFilename
@@ -61,7 +61,6 @@ UsePreviousTasks=yes
 Uninstallable=yes
 ASLRCompatible=yes
 DEPCompatible=yes
-DisablePrecompiledFileVerifications=no
 #ifdef SignedRelease
 SignTool=MowikAuthenticode
 SignedUninstaller=yes

@@ -74,4 +74,4 @@ jobs:
             $parseErrors | Format-List | Out-String | Write-Error
             throw 'PowerShell parser errors were found.'
           }
-          ./scripts/test-release-version.ps1 -Version 2.7.0
+          ./scripts/test-release-version.ps1 -Version 2.7.1

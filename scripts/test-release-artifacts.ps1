@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.7.0',
+    [string]$Version = '2.7.1',
 
     [Parameter()]
     [string]$InstallerFileName = "Mowik-$Version-Setup.exe",
