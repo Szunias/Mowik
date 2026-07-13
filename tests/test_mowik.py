@@ -925,6 +925,10 @@ class CustomCommandFlowTests(unittest.TestCase):
             "items": [item],
         }
         app = mowik.MowikApp(config)
+        # GitHub-hosted Windows runners execute under an elevated token.  Keep
+        # these command-flow tests independent of the host account; dedicated
+        # elevation tests override this value explicitly.
+        app.process_elevated = False
         app.dictation_indicator = mock.Mock()
         return app
 
