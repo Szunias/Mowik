@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "2.3.0"
+  #define MyAppVersion "2.4.0"
 #endif
 
 #define MyAppName "Mówik"
@@ -19,7 +19,7 @@ AppUpdatesURL={#MyAppUrl}/releases/latest
 AppContact={#MyAppUrl}/issues
 VersionInfoVersion={#MyAppVersion}.0
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoDescription=Instalator aplikacji Mówik
+VersionInfoDescription=Mówik installer
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 DefaultDirName={localappdata}\Programs\Mowik
@@ -34,6 +34,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 WizardStyle=modern dynamic
 WizardSizePercent=110
+ShowLanguageDialog=yes
+LanguageDetectionMethod=uilanguage
+UsePreviousLanguage=yes
 SetupIconFile=assets\Mowik.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile=LICENSE.txt
@@ -54,12 +57,32 @@ UsePreviousTasks=yes
 Uninstallable=yes
 
 [Languages]
-Name: "polish"; MessagesFile: "compiler:Languages\Polish.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "polish"; MessagesFile: "compiler:Languages\Polish.isl"
+
+[CustomMessages]
+english.DesktopIconTask=Create a &desktop shortcut
+polish.DesktopIconTask=Utwórz skrót na &pulpicie
+english.AdditionalShortcutsGroup=Additional shortcuts:
+polish.AdditionalShortcutsGroup=Dodatkowe skróty:
+english.AutoStartTask=Start Mówik automatically when I &sign in to Windows
+polish.AutoStartTask=Uruchamiaj Mówika po &zalogowaniu do Windows
+english.StartupGroup=Startup:
+polish.StartupGroup=Uruchamianie:
+english.LocalDictationComment=Private local push-to-talk dictation
+polish.LocalDictationComment=Lokalne dyktowanie push-to-talk
+english.SettingsShortcut=Mówik Settings
+polish.SettingsShortcut=Centrum Mówika
+english.SettingsComment=Mówik settings
+polish.SettingsComment=Ustawienia Mówika
+english.UninstallShortcut=Uninstall Mówik
+polish.UninstallShortcut=Odinstaluj Mówika
+english.LaunchApp=Launch Mówik
+polish.LaunchApp=Uruchom Mówika
 
 [Tasks]
-Name: "desktopicon"; Description: "Utwórz skrót na &pulpicie"; GroupDescription: "Dodatkowe skróty:"; Flags: unchecked
-Name: "autostart"; Description: "Uruchamiaj Mówika po &zalogowaniu do Windows"; GroupDescription: "Uruchamianie:"; Flags: checkedonce
+Name: "desktopicon"; Description: "{cm:DesktopIconTask}"; GroupDescription: "{cm:AdditionalShortcutsGroup}"; Flags: unchecked
+Name: "autostart"; Description: "{cm:AutoStartTask}"; GroupDescription: "{cm:StartupGroup}"; Flags: checkedonce
 
 [Files]
 Source: "dist\Mowik\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -70,16 +93,16 @@ Type: files; Name: "{userstartup}\Mowik.lnk"
 Type: files; Name: "{userstartup}\Mówik.lnk"
 
 [Icons]
-Name: "{autoprograms}\Mówik\Mówik"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Comment: "Lokalne dyktowanie push-to-talk"
-Name: "{autoprograms}\Mówik\Centrum Mówika"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--settings"; WorkingDir: "{app}"; Comment: "Ustawienia Mówika"
-Name: "{autoprograms}\Mówik\Odinstaluj Mówika"; Filename: "{uninstallexe}"
+Name: "{autoprograms}\Mówik\Mówik"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Comment: "{cm:LocalDictationComment}"
+Name: "{autoprograms}\Mówik\{cm:SettingsShortcut}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--settings"; WorkingDir: "{app}"; Comment: "{cm:SettingsComment}"
+Name: "{autoprograms}\Mówik\{cm:UninstallShortcut}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Mówik"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Mowik"; ValueData: """{app}\{#MyAppExeName}"""; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Uruchom Mówika"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);

@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.3.0',
+    [string]$Version = '2.4.0',
 
     [Parameter()]
     [switch]$SkipTests,
@@ -67,14 +67,12 @@ function Find-InnoCompiler {
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'Instalator Mówika można zbudować wyłącznie w Windows.'
 }
-if (-not (Test-Path -LiteralPath $Python)) {
-    throw 'Brak .venv. Najpierw uruchom ZAINSTALUJ.cmd.'
-}
 
 Set-Location $Root
-$Source = Get-Content -LiteralPath (Join-Path $Root 'mowik.py') -Raw
-if ($Source -notmatch ('APP_VERSION\s*=\s*"' + [regex]::Escape($Version) + '"')) {
-    throw "Wersja $Version nie zgadza się z APP_VERSION w mowik.py."
+& (Join-Path $PSScriptRoot 'test-release-version.ps1') -Version $Version
+
+if (-not (Test-Path -LiteralPath $Python)) {
+    throw 'Brak .venv. Najpierw uruchom ZAINSTALUJ.cmd.'
 }
 
 Write-Host "[1/6] Przygotowuję zależności wydania..." -ForegroundColor Cyan

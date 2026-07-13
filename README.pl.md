@@ -26,6 +26,7 @@ Bez chmury, bez abonamentu i bez wysyłania głosu do internetu.
 - **W pełni lokalnie**: rozpoznawanie mowy (faster-whisper) działa na Twoim komputerze; po jednorazowym pobraniu modelu internet nie jest potrzebny.
 - **Wykrywanie przycisku jednym kliknięciem**: wybierz `Wykryj…` i naciśnij dowolny klawisz albo przycisk myszy.
 - **Graficzny panel ustawień** w zasobniku systemowym: model, mikrofon, VAD, schowek, dźwięki i więcej, bez edytowania JSON-a.
+- **Polski i angielski interfejs** z automatycznym dopasowaniem do języka Windows oraz trwałym przełącznikiem języka.
 - **Łagodne sygnały wbudowane i własne dźwięki WAV** dla startu nagrywania, puszczenia przycisku, gotowego tekstu i błędu, z odsłuchem i opcjonalnym zapętleniem.
 - **Elastyczne wyjście**: automatyczne wklejanie do aktywnego okna, kopiowanie do schowka albo jedno i drugie.
 - **Prywatny słownik**: nazwiska, marki i fachowe terminy jako podpowiedź dla modelu.
@@ -50,7 +51,9 @@ Bez chmury, bez abonamentu i bez wysyłania głosu do internetu.
 3. Zostaw zaznaczone **Uruchom Mówika** i kliknij **Zakończ**.
 4. Przytrzymaj **F8**, powiedz zdanie i puść klawisz.
 
-Instalator działa bez uprawnień administratora, dodaje Mówika do menu Start i tworzy normalny wpis w **Ustawienia → Aplikacje**. Opcjonalnie może dodać skrót na pulpicie i uruchamiać program po zalogowaniu. Pierwszy start jednorazowo pobiera lokalny model mowy do `%LOCALAPPDATA%\Mowik\models`; później rozpoznawanie działa offline.
+Instalator wymaga 64-bitowego Windows 10 w wersji 1809 lub nowszej albo Windows 11. Działa bez uprawnień administratora, dodaje Mówika do menu Start i tworzy normalny wpis w **Ustawienia → Aplikacje**. Opcjonalnie może dodać skrót na pulpicie i uruchamiać program po zalogowaniu. Pierwszy start jednorazowo pobiera lokalny model mowy do `%LOCALAPPDATA%\Mowik\models`; później rozpoznawanie działa offline.
+
+Instalator proponuje język zgodny z interfejsem Windows i pozwala go potwierdzić lub zmienić. Aplikacja domyślnie dopasowuje język automatycznie; w Centrum Mówika możesz niezależnie wybrać **Automatycznie**, **Polski** albo **English**. Zastosowanie zmiany uruchamia Mówika ponownie.
 
 Obecne wydanie nie jest jeszcze podpisane płatnym certyfikatem Authenticode, dlatego Windows SmartScreen może pokazać komunikat „Nieznany wydawca”. Pobieraj instalator wyłącznie z oficjalnego wydania GitHub i w razie wątpliwości porównaj SHA-256 z dołączonym `SHA256SUMS.txt`.
 
@@ -123,7 +126,7 @@ Słownik jest przekazywany modelowi jako podpowiedź. Pomaga przy nazwiskach, ma
 
 ## Komendy głosowe
 
-Po włączeniu w sekcji **Tekst i słownik** rozpoznawane są komendy "nowa linia" i "nowy akapit". Domyślnie są wyłączone, aby zwykłe zdania z tymi słowami nie były zamieniane.
+Po włączeniu w sekcji **Tekst i słownik** rozpoznawane są komendy „nowa linia” i „nowy akapit” dla polskiego oraz `new line` i `new paragraph` dla angielskiego. Domyślnie są wyłączone, aby zwykłe zdania z tymi słowami nie były zamieniane.
 
 ## Opcjonalna korekta LLM (Ollama)
 
@@ -167,6 +170,7 @@ Mówik nie wklei tekstu do aplikacji uruchomionej jako administrator, jeżeli sa
 
 - Ponowne uruchomienie tego samego instalatora naprawia pliki programu bez usuwania danych użytkownika.
 - Autostart można wybrać w kreatorze instalacji; ponowne uruchomienie instalatora pozwala zmienić tę opcję.
+- Język interfejsu może automatycznie podążać za językiem Windows albo zostać ustawiony na polski lub angielski w Centrum Mówika.
 - `BUDUJ_EXE.cmd` buduje katalog aplikacji `dist\Mowik`.
 - `BUDUJ_INSTALATOR.cmd` uruchamia testy, buduje aplikację i tworzy gotowy `release\Mowik-x.y.z-Setup.exe` wraz z sumą SHA-256.
 - Definicje powtarzalnego wydania znajdują się w `packaging`, a workflow GitHub Actions w `.github/workflows/windows-release.yml`.

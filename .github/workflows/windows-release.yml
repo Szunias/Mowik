@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Wersja bez prefiksu v, np. 2.3.0"
+        description: "Version without the v prefix, for example 2.4.0"
         required: true
-        default: "2.3.0"
+        default: "2.4.0"
 
 permissions:
   contents: write
@@ -22,16 +22,16 @@ jobs:
       PYTHONUTF8: "1"
 
     steps:
-      - name: Pobierz kod
+      - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Wybierz Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Ustal wersję
+      - name: Resolve release version
         shell: pwsh
         run: |
           if ($env:GITHUB_REF_TYPE -eq 'tag') {
@@ -41,21 +41,25 @@ jobs:
           }
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Przygotuj środowisko
+      - name: Verify release version consistency
+        shell: pwsh
+        run: ./scripts/test-release-version.ps1 -Version $env:RELEASE_VERSION
+
+      - name: Prepare build environment
         shell: pwsh
         run: |
           python -m venv .venv
           choco install innosetup --yes --no-progress
 
-      - name: Zbuduj i sprawdź instalator
+      - name: Build and verify installer
         shell: pwsh
         run: ./scripts/build-release.ps1 -Version $env:RELEASE_VERSION -SkipToolInstall
 
-      - name: Przetestuj instalację i deinstalację
+      - name: Test English and Polish installation and uninstall
         shell: pwsh
         run: ./scripts/test-installer.ps1 -Version $env:RELEASE_VERSION
 
-      - name: Zachowaj artefakt
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: Mowik-${{ env.RELEASE_VERSION }}-Windows
@@ -65,7 +69,7 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-      - name: Dodaj pliki do GitHub Release
+      - name: Attach files to GitHub Release
         if: github.ref_type == 'tag'
         shell: pwsh
         env:

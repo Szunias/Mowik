@@ -31,6 +31,8 @@ from collections import deque
 from functools import lru_cache
 from typing import Any, Optional
 
+from mowik_i18n import Translator
+
 
 _CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
 _CUDA_DLL_HANDLES: list[Any] = []
@@ -137,7 +139,7 @@ import pyperclip
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 MUTEX_NAME = r"Local\MowikLocalDictation"
 SAMPLE_RATE = 16_000
 
@@ -160,7 +162,8 @@ RESTART_REQUEST_PATH = CONTROL_DIR / "restart.request"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "trigger": "keyboard:f8",
-    "language": "pl",
+    "ui_language": "auto",
+    "language": "auto",
     "model": "auto",
     "device": "auto",
     "cpu_threads": 0,
@@ -211,8 +214,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 QUICK_PROFILES: dict[str, dict[str, Any]] = {
     "light": {
-        "label": "Szybki",
-        "description": "small, beam 1 — najmniejsze obciążenie",
+        "display": {
+            "pl": {
+                "label": "Szybki",
+                "description": "small, beam 1 — najmniejsze obciążenie",
+            },
+            "en": {
+                "label": "Fast",
+                "description": "small, beam 1 — lowest resource use",
+            },
+        },
         "changes": {
             "model": "small",
             "device": "auto",
@@ -220,8 +231,16 @@ QUICK_PROFILES: dict[str, dict[str, Any]] = {
         },
     },
     "balanced": {
-        "label": "Zalecany",
-        "description": "large-v3-turbo, beam 2 — zalecany",
+        "display": {
+            "pl": {
+                "label": "Zalecany",
+                "description": "large-v3-turbo, beam 2 — zalecany",
+            },
+            "en": {
+                "label": "Recommended",
+                "description": "large-v3-turbo, beam 2 — recommended",
+            },
+        },
         "changes": {
             "model": "large-v3-turbo",
             "device": "auto",
@@ -229,8 +248,16 @@ QUICK_PROFILES: dict[str, dict[str, Any]] = {
         },
     },
     "accurate": {
-        "label": "Najdokładniejszy",
-        "description": "large-v3, beam 5 — najwyższa jakość",
+        "display": {
+            "pl": {
+                "label": "Najdokładniejszy",
+                "description": "large-v3, beam 5 — najwyższa jakość",
+            },
+            "en": {
+                "label": "Most accurate",
+                "description": "large-v3, beam 5 — highest accuracy",
+            },
+        },
         "changes": {
             "model": "large-v3",
             "device": "auto",
@@ -239,18 +266,25 @@ QUICK_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
-DICTIONARY_TEMPLATE = """# Jedna nazwa lub fraza w każdym wierszu.
-# Linie zaczynające się od # są ignorowane.
-# Dopisz nazwiska, nazwy firm, projekty, miejscowości i fachowe terminy.
+DICTIONARY_TEMPLATE = """# One name or phrase per line. / Jedna nazwa lub fraza w każdym wierszu.
+# Lines beginning with # are ignored. / Linie zaczynające się od # są ignorowane.
+# Add names, brands, projects, places, and specialist terms.
+# Dopisz nazwiska, marki, projekty, miejscowości i fachowe terminy.
 OpenAI
 ChatGPT
 Mówik
 """
 
-VOICE_COMMAND_REPLACEMENTS = [
-    (re.compile(r"\bnowy akapit\b[,.]?", re.IGNORECASE), "\n\n"),
-    (re.compile(r"\bnowa linia\b[,.]?", re.IGNORECASE), "\n"),
-]
+VOICE_COMMAND_REPLACEMENTS = {
+    "pl": (
+        (re.compile(r"\bnowy akapit\b[,.]?", re.IGNORECASE), "\n\n"),
+        (re.compile(r"\bnowa linia\b[,.]?", re.IGNORECASE), "\n"),
+    ),
+    "en": (
+        (re.compile(r"\bnew paragraph\b[,.]?", re.IGNORECASE), "\n\n"),
+        (re.compile(r"\bnew line\b[,.]?", re.IGNORECASE), "\n"),
+    ),
+}
 
 
 class AppError(RuntimeError):
@@ -318,12 +352,25 @@ def create_default_files() -> None:
 
 def load_config() -> dict[str, Any]:
     create_default_files()
+    fallback_translator = Translator("auto")
     try:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise AppError(f"Nie można odczytać {CONFIG_PATH}: {exc}") from exc
+        raise AppError(
+            fallback_translator.t(
+                "Nie można odczytać {path}: {error}",
+                "Could not read {path}: {error}",
+                path=CONFIG_PATH,
+                error=exc,
+            )
+        ) from exc
     if not isinstance(loaded, dict):
-        raise AppError("Plik config.json musi zawierać obiekt JSON.")
+        raise AppError(
+            fallback_translator.t(
+                "Plik config.json musi zawierać obiekt JSON.",
+                "config.json must contain a JSON object.",
+            )
+        )
     return deep_merge(DEFAULT_CONFIG, loaded)
 
 
@@ -345,7 +392,13 @@ def save_config(config: dict[str, Any]) -> None:
 def apply_quick_profile(config: dict[str, Any], profile_name: str) -> dict[str, Any]:
     profile = QUICK_PROFILES.get(profile_name)
     if profile is None:
-        raise AppError(f"Nieznany profil: {profile_name}")
+        raise AppError(
+            Translator.from_config(config).t(
+                "Nieznany profil: {profile}",
+                "Unknown profile: {profile}",
+                profile=profile_name,
+            )
+        )
     result = deep_merge(DEFAULT_CONFIG, config)
     for key, value in profile["changes"].items():
         result[key] = value
@@ -431,7 +484,11 @@ def get_cuda_count() -> int:
     return count
 
 
-def resolve_model_plan(config: dict[str, Any]) -> tuple[str, str, str]:
+def resolve_model_plan(
+    config: dict[str, Any],
+    translator: Optional[Translator] = None,
+) -> tuple[str, str, str]:
+    translator = translator or Translator("pl")
     requested_device = str(config.get("device", "auto")).lower().strip()
     requested_model = str(config.get("model", "auto")).strip()
     cuda_available = get_cuda_count() > 0
@@ -441,7 +498,12 @@ def resolve_model_plan(config: dict[str, Any]) -> tuple[str, str, str]:
     elif requested_device in {"cuda", "cpu"}:
         device = requested_device
     else:
-        raise AppError("device musi mieć wartość: auto, cuda albo cpu.")
+        raise AppError(
+            translator.t(
+                "device musi mieć wartość: auto, cuda albo cpu.",
+                "device must be one of: auto, cuda, or cpu.",
+            )
+        )
 
     if requested_model.lower() == "auto":
         # Turbo zachowuje jakość rodziny large-v3, a na krótkich dyktowaniach
@@ -471,8 +533,10 @@ def load_model_local_first(
     model_name: str,
     kwargs: dict[str, Any],
     status_callback=None,
+    translator: Optional[Translator] = None,
 ) -> WhisperModel:
     """Załaduj cache bez odpytywania Hugging Face; sieć tylko przy braku plików."""
+    translator = translator or Translator("pl")
     try:
         return WhisperModel(model_name, local_files_only=True, **kwargs)
     except Exception as local_error:
@@ -483,7 +547,13 @@ def load_model_local_first(
             local_error,
         )
         if status_callback:
-            status_callback(f"Sprawdzam pliki modelu {model_name}…")
+            status_callback(
+                translator.t(
+                    "Sprawdzam pliki modelu {model_name}…",
+                    "Checking model files for {model_name}…",
+                    model_name=model_name,
+                )
+            )
         return WhisperModel(model_name, local_files_only=False, **kwargs)
 
 
@@ -496,10 +566,20 @@ def warm_up_cuda_model(model: WhisperModel, config: dict[str, Any]) -> None:
     model.encode(pad_or_trim(features))
 
 
-def create_model(config: dict[str, Any], status_callback=None) -> tuple[WhisperModel, str, str]:
-    model_name, device, compute_type = resolve_model_plan(config)
+def create_model(
+    config: dict[str, Any], status_callback=None
+) -> tuple[WhisperModel, str, str]:
+    translator = Translator.from_config(config)
+    model_name, device, compute_type = resolve_model_plan(config, translator)
     if status_callback:
-        status_callback(f"Ładowanie modelu {model_name} ({device})…")
+        status_callback(
+            translator.t(
+                "Ładowanie modelu {model_name} ({device})…",
+                "Loading model {model_name} ({device})…",
+                model_name=model_name,
+                device=device,
+            )
+        )
 
     kwargs: dict[str, Any] = {
         "device": device,
@@ -518,10 +598,20 @@ def create_model(config: dict[str, Any], status_callback=None) -> tuple[WhisperM
         cpu_threads if device == "cpu" else "n/d",
     )
     try:
-        model = load_model_local_first(model_name, kwargs, status_callback)
+        model = load_model_local_first(
+            model_name,
+            kwargs,
+            status_callback,
+            translator,
+        )
         if device == "cuda":
             if status_callback:
-                status_callback("Optymalizuję model na GPU…")
+                status_callback(
+                    translator.t(
+                        "Optymalizuję model na GPU…",
+                        "Optimizing model for GPU…",
+                    )
+                )
             warm_started = time.perf_counter()
             warm_up_cuda_model(model, config)
             logging.info(
@@ -543,7 +633,12 @@ def create_model(config: dict[str, Any], status_callback=None) -> tuple[WhisperM
         )
         if status_callback:
             status_callback(
-                "CUDA nie ruszyła — przełączam na CPU. Szczegóły zapisano w logu."
+                translator.t(
+                    "CUDA nie ruszyła — przełączam na CPU. "
+                    "Szczegóły zapisano w logu.",
+                    "CUDA failed to start — switching to CPU. "
+                    "Details were saved to the log.",
+                )
             )
         logging.warning(
             "Fallback CPU po błędzie CUDA (%s). Model: %s", exc, fallback_model
@@ -557,6 +652,7 @@ def create_model(config: dict[str, Any], status_callback=None) -> tuple[WhisperM
                 "cpu_threads": cpu_threads,
             },
             status_callback,
+            translator,
         )
         return model, fallback_model, "cpu"
 
@@ -571,8 +667,16 @@ def normalize_transcript(text: str) -> str:
 def apply_voice_commands(text: str, config: dict[str, Any]) -> str:
     if not config.get("voice_commands", {}).get("enabled", False):
         return text
+    language = str(config.get("language", "auto")).strip().lower()
+    if language in VOICE_COMMAND_REPLACEMENTS:
+        replacements = VOICE_COMMAND_REPLACEMENTS[language]
+    else:
+        replacements = (
+            *VOICE_COMMAND_REPLACEMENTS["pl"],
+            *VOICE_COMMAND_REPLACEMENTS["en"],
+        )
     result = text
-    for pattern, replacement in VOICE_COMMAND_REPLACEMENTS:
+    for pattern, replacement in replacements:
         result = pattern.sub(replacement, result)
     return normalize_transcript(result)
 
@@ -584,7 +688,10 @@ def strip_llm_wrapping(text: str) -> str:
         if value.lower().startswith("text\n"):
             value = value[5:]
     value = re.sub(
-        r"^(poprawiony tekst|wynik|transkrypcja)\s*:\s*",
+        (
+            r"^(poprawiony tekst|wynik|transkrypcja|corrected text|result|"
+            r"transcription)\s*:\s*"
+        ),
         "",
         value,
         flags=re.IGNORECASE,
@@ -609,9 +716,25 @@ def llm_result_is_safe(original: str, corrected: str) -> bool:
         r"\d+(?:[.,]\d+)?", corrected
     ):
         return False
-    if len(re.findall(r"\bnie\b", original, flags=re.IGNORECASE)) != len(
-        re.findall(r"\bnie\b", corrected, flags=re.IGNORECASE)
-    ):
+    negation_pattern = (
+        r"\b(?:"
+        r"nie|nigdy|żaden|żadna|żadne|bez|"
+        r"not|no|never|without|cannot|"
+        r"nicht|niemals|kein(?:e|en|er|es|em)?|ohne|"
+        r"ne|pas|jamais|sans|aucun(?:e)?|"
+        r"nunca|jamás|sin|ningún|ninguna|"
+        r"не|ні|ніколи|без"
+        r")\b|\b\w+n['’]t\b|\bn['’]"
+    )
+    original_negations = sorted(
+        match.group(0).casefold().replace("’", "'")
+        for match in re.finditer(negation_pattern, original, flags=re.IGNORECASE)
+    )
+    corrected_negations = sorted(
+        match.group(0).casefold().replace("’", "'")
+        for match in re.finditer(negation_pattern, corrected, flags=re.IGNORECASE)
+    )
+    if original_negations != corrected_negations:
         return False
     return True
 
@@ -629,16 +752,35 @@ def cleanup_with_ollama(
 
     base_url = str(settings.get("url", "http://127.0.0.1:11434")).rstrip("/")
     timeout = max(1, int(settings.get("timeout_seconds", 45)))
-    glossary = ", ".join(dictionary_terms[:80]) or "brak"
-    system_prompt = (
-        "Jesteś bardzo zachowawczym korektorem polskiej transkrypcji mowy. "
-        "Zwróć wyłącznie poprawiony tekst, bez komentarza i bez cudzysłowu. "
-        "Wolno poprawić interpunkcję, wielkie litery, oczywiste literówki i "
-        "jednoznaczne błędy rozpoznania dźwięku. Nie parafrazuj, nie skracaj, "
-        "nie dodawaj informacji. Nigdy nie zmieniaj liczb, nazw własnych, negacji "
-        "ani znaczenia. Gdy nie masz pewności, pozostaw fragment bez zmian."
-    )
-    user_prompt = f"Słownik preferowanych zapisów: {glossary}\n\nTekst:\n{text}"
+    transcription_language = str(config.get("language", "auto")).strip().lower()
+    glossary = ", ".join(dictionary_terms[:80])
+    if transcription_language == "pl":
+        glossary = glossary or "brak"
+        system_prompt = (
+            "Jesteś bardzo zachowawczym korektorem polskiej transkrypcji mowy. "
+            "Zwróć wyłącznie poprawiony tekst, bez komentarza i bez cudzysłowu. "
+            "Wolno poprawić interpunkcję, wielkie litery, oczywiste literówki i "
+            "jednoznaczne błędy rozpoznania dźwięku. Nie parafrazuj, nie skracaj, "
+            "nie dodawaj informacji. Nigdy nie zmieniaj liczb, nazw własnych, negacji "
+            "ani znaczenia. Gdy nie masz pewności, pozostaw fragment bez zmian."
+        )
+        user_prompt = (
+            f"Słownik preferowanych zapisów: {glossary}\n\nTekst:\n{text}"
+        )
+    else:
+        glossary = glossary or "none"
+        system_prompt = (
+            "You are an extremely conservative proofreader of a speech "
+            "transcription. Preserve the language of the input. Return only the "
+            "corrected text, without commentary or quotation marks. You may fix "
+            "punctuation, capitalization, obvious spelling mistakes, and "
+            "unambiguous speech-recognition errors. Do not paraphrase, shorten, or "
+            "add information. Never change numbers, proper names, negations, or "
+            "meaning. When unsure, leave the passage unchanged."
+        )
+        user_prompt = (
+            f"Preferred spellings: {glossary}\n\nTranscription:\n{text}"
+        )
     payload = {
         "model": model,
         "stream": False,
@@ -692,7 +834,13 @@ def builtin_sound_wav(kind: str) -> bytes:
     """Zbuduj cichy PCM WAV z łagodnym atakiem i wybrzmieniem, bez kliknięć."""
     notes = BUILTIN_SOUND_NOTES.get(kind)
     if notes is None:
-        raise AppError(f"Nieznany wbudowany dźwięk: {kind}")
+        raise AppError(
+            Translator("auto").t(
+                "Nieznany wbudowany dźwięk: {kind}",
+                "Unknown built-in sound: {kind}",
+                kind=kind,
+            )
+        )
 
     sample_rate = 44_100
     pieces: list[np.ndarray] = []
@@ -772,39 +920,86 @@ def resolve_sound_path(value: Any) -> Optional[Path]:
     return path
 
 
-def validate_wave_file(path: Path) -> None:
+def validate_wave_file(
+    path: Path,
+    translator: Optional[Translator] = None,
+) -> None:
+    translator = translator or Translator("auto")
     if path.suffix.lower() != ".wav":
-        raise AppError("Własny dźwięk musi być plikiem WAV.")
+        raise AppError(
+            translator.t(
+                "Własny dźwięk musi być plikiem WAV.",
+                "A custom sound must be a WAV file.",
+            )
+        )
     if not path.is_file():
-        raise AppError(f"Nie znaleziono pliku dźwięku: {path}")
+        raise AppError(
+            translator.t(
+                "Nie znaleziono pliku dźwięku: {path}",
+                "Sound file not found: {path}",
+                path=path,
+            )
+        )
     if path.stat().st_size > 50 * 1024 * 1024:
-        raise AppError("Plik WAV jest większy niż 50 MB.")
+        raise AppError(
+            translator.t(
+                "Plik WAV jest większy niż 50 MB.",
+                "The WAV file is larger than 50 MB.",
+            )
+        )
     try:
         with wave.open(str(path), "rb") as wav_file:
             if wav_file.getnframes() <= 0:
-                raise AppError(f"Plik WAV nie zawiera dźwięku: {path}")
+                raise AppError(
+                    translator.t(
+                        "Plik WAV nie zawiera dźwięku: {path}",
+                        "The WAV file contains no audio: {path}",
+                        path=path,
+                    )
+                )
             if wav_file.getcomptype() != "NONE":
                 raise AppError(
-                    "Plik WAV musi używać nieskompresowanego formatu PCM."
+                    translator.t(
+                        "Plik WAV musi używać nieskompresowanego formatu PCM.",
+                        "The WAV file must use uncompressed PCM audio.",
+                    )
                 )
     except (OSError, wave.Error) as exc:
-        raise AppError(f"Nieprawidłowy plik WAV „{path.name}”: {exc}") from exc
+        raise AppError(
+            translator.t(
+                "Nieprawidłowy plik WAV „{name}”: {error}",
+                "Invalid WAV file “{name}”: {error}",
+                name=path.name,
+                error=exc,
+            )
+        ) from exc
 
 
-def import_custom_sound(kind: str, source_value: Any) -> str:
+def import_custom_sound(
+    kind: str,
+    source_value: Any,
+    translator: Optional[Translator] = None,
+) -> str:
     """Skopiuj wskazany WAV do prywatnego folderu Mówika."""
+    translator = translator or Translator("auto")
     if kind not in CUSTOM_SOUND_KINDS:
-        raise AppError(f"Nieznany rodzaj dźwięku: {kind}")
+        raise AppError(
+            translator.t(
+                "Nieznany rodzaj dźwięku: {kind}",
+                "Unknown sound type: {kind}",
+                kind=kind,
+            )
+        )
     source = resolve_sound_path(source_value)
     if source is None:
         return ""
     source = source.resolve()
-    validate_wave_file(source)
+    validate_wave_file(source, translator)
     ensure_directories()
     destination = (SOUNDS_DIR / f"{kind}.wav").resolve()
     if source != destination:
         shutil.copy2(source, destination)
-    validate_wave_file(destination)
+    validate_wave_file(destination, translator)
     return str(Path("sounds") / destination.name)
 
 
@@ -822,19 +1017,43 @@ def configured_sound_path(config: dict[str, Any], kind: str) -> Optional[Path]:
     return None
 
 
-def windows_set_clipboard_text(text: str) -> None:
+def windows_set_clipboard_text(
+    text: str,
+    translator: Optional[Translator] = None,
+) -> None:
+    translator = translator or Translator("auto")
     if os.name != "nt":
-        raise AppError("Wklejanie jest obsługiwane wyłącznie na Windowsie.")
+        raise AppError(
+            translator.t(
+                "Wklejanie jest obsługiwane wyłącznie na Windowsie.",
+                "Pasting is supported only on Windows.",
+            )
+        )
     try:
         pyperclip.copy(text)
     except pyperclip.PyperclipException as exc:
-        raise AppError(f"Nie udało się zapisać tekstu do schowka: {exc}") from exc
+        raise AppError(
+            translator.t(
+                "Nie udało się zapisać tekstu do schowka: {error}",
+                "Could not copy text to the clipboard: {error}",
+                error=exc,
+            )
+        ) from exc
 
 
-def windows_type_unicode_text(text: str) -> None:
+def windows_type_unicode_text(
+    text: str,
+    translator: Optional[Translator] = None,
+) -> None:
     """Wpisz tekst przez Win32 SendInput bez używania schowka."""
+    translator = translator or Translator("auto")
     if os.name != "nt":
-        raise AppError("Wpisywanie tekstu jest obsługiwane wyłącznie na Windowsie.")
+        raise AppError(
+            translator.t(
+                "Wpisywanie tekstu jest obsługiwane wyłącznie na Windowsie.",
+                "Typing text is supported only on Windows.",
+            )
+        )
     if not text:
         return
 
@@ -921,11 +1140,17 @@ def windows_type_unicode_text(text: str) -> None:
         sent = int(user32.SendInput(len(inputs), array, ctypes.sizeof(INPUT)))
         if sent != len(inputs):
             raise AppError(
-                f"Windows wysłał tylko {sent} z {len(inputs)} zdarzeń klawiatury."
+                translator.t(
+                    "Windows wysłał tylko {sent} z {total} zdarzeń klawiatury.",
+                    "Windows sent only {sent} of {total} keyboard events.",
+                    sent=sent,
+                    total=len(inputs),
+                )
             )
 
 
 def paste_text(text: str, config: dict[str, Any]) -> None:
+    translator = Translator.from_config(config)
     settings = config.get("paste", {})
     paste_enabled = bool(settings.get("enabled", True))
     copy_to_clipboard = bool(settings.get("copy_to_clipboard", True))
@@ -933,13 +1158,16 @@ def paste_text(text: str, config: dict[str, Any]) -> None:
 
     if not paste_enabled and not copy_to_clipboard:
         raise AppError(
-            "Włącz automatyczne wklejanie lub kopiowanie tekstu do schowka."
+            translator.t(
+                "Włącz automatyczne wklejanie lub kopiowanie tekstu do schowka.",
+                "Enable automatic pasting or copying text to the clipboard.",
+            )
         )
 
     # Schowek zawiera dokładną transkrypcję. Ewentualną końcową spację
     # wysyłamy osobno, dzięki czemu nie zostaje dopisana do kopiowanego tekstu.
     if copy_to_clipboard:
-        windows_set_clipboard_text(text)
+        windows_set_clipboard_text(text, translator)
 
     if not paste_enabled:
         return
@@ -961,7 +1189,7 @@ def paste_text(text: str, config: dict[str, Any]) -> None:
         payload = text
         if append_space and text and not text[-1].isspace():
             payload += " "
-        windows_type_unicode_text(payload)
+        windows_type_unicode_text(payload, translator)
 
 
 def key_name(key: keyboard.Key | keyboard.KeyCode) -> str:
@@ -980,32 +1208,47 @@ def mouse_name(button: mouse.Button) -> str:
     return aliases.get(value, value)
 
 
-def split_trigger(trigger: str) -> tuple[str, str]:
+def split_trigger(
+    trigger: str,
+    translator: Optional[Translator] = None,
+) -> tuple[str, str]:
+    translator = translator or Translator("pl")
     parts = trigger.strip().lower().split(":", 1)
     if len(parts) != 2 or parts[0] not in {"keyboard", "mouse"} or not parts[1]:
         raise AppError(
-            "trigger musi wyglądać np. tak: keyboard:f8 albo mouse:x2."
+            translator.t(
+                "trigger musi wyglądać np. tak: keyboard:f8 albo mouse:x2.",
+                "trigger must look like keyboard:f8 or mouse:x2.",
+            )
         )
     return parts[0], parts[1]
 
 
-def trigger_display_name(trigger: str) -> str:
-    trigger_type, name = split_trigger(trigger)
+def trigger_display_name(
+    trigger: str,
+    translator: Optional[Translator] = None,
+) -> str:
+    translator = translator or Translator("pl")
+    trigger_type, name = split_trigger(trigger, translator)
     if trigger_type == "mouse":
         mouse_labels = {
-            "left": "lewy przycisk",
-            "right": "prawy przycisk",
-            "middle": "środkowy przycisk",
-            "x1": "boczny przycisk X1",
-            "x2": "boczny przycisk X2",
+            "left": translator.t("lewy przycisk", "left button"),
+            "right": translator.t("prawy przycisk", "right button"),
+            "middle": translator.t("środkowy przycisk", "middle button"),
+            "x1": translator.t("boczny przycisk X1", "side button X1"),
+            "x2": translator.t("boczny przycisk X2", "side button X2"),
         }
-        return f"Mysz: {mouse_labels.get(name, name.upper())}"
+        return translator.t(
+            "Mysz: {label}",
+            "Mouse: {label}",
+            label=mouse_labels.get(name, name.upper()),
+        )
 
     key_labels = {
         "pause": "Pause/Break",
         "scroll_lock": "Scroll Lock",
         "caps_lock": "Caps Lock",
-        "space": "Spacja",
+        "space": translator.t("Spacja", "Space"),
         "tab": "Tab",
         "insert": "Insert",
         "delete": "Delete",
@@ -1014,17 +1257,17 @@ def trigger_display_name(trigger: str) -> str:
         "page_up": "Page Up",
         "page_down": "Page Down",
         "ctrl": "Ctrl",
-        "ctrl_l": "Lewy Ctrl",
-        "ctrl_r": "Prawy Ctrl",
+        "ctrl_l": translator.t("Lewy Ctrl", "Left Ctrl"),
+        "ctrl_r": translator.t("Prawy Ctrl", "Right Ctrl"),
         "alt": "Alt",
-        "alt_l": "Lewy Alt",
-        "alt_r": "Prawy Alt",
+        "alt_l": translator.t("Lewy Alt", "Left Alt"),
+        "alt_r": translator.t("Prawy Alt", "Right Alt"),
         "shift": "Shift",
-        "shift_l": "Lewy Shift",
-        "shift_r": "Prawy Shift",
+        "shift_l": translator.t("Lewy Shift", "Left Shift"),
+        "shift_r": translator.t("Prawy Shift", "Right Shift"),
         "cmd": "Windows",
-        "cmd_l": "Lewy Windows",
-        "cmd_r": "Prawy Windows",
+        "cmd_l": translator.t("Lewy Windows", "Left Windows"),
+        "cmd_r": translator.t("Prawy Windows", "Right Windows"),
     }
     if name in key_labels:
         label = key_labels[name]
@@ -1033,43 +1276,71 @@ def trigger_display_name(trigger: str) -> str:
     elif re.fullmatch(r"f\d{1,2}", name):
         label = name.upper()
     elif name.startswith("vk") and name[2:].isdigit():
-        label = f"klawisz VK {name[2:]}"
+        label = translator.t(
+            "klawisz VK {number}",
+            "VK key {number}",
+            number=name[2:],
+        )
     else:
         label = name.replace("_", " ").title()
-    return f"Klawiatura: {label}"
+    return translator.t(
+        "Klawiatura: {label}",
+        "Keyboard: {label}",
+        label=label,
+    )
 
 
 def tray_state_for_status(status: str, error: bool = False) -> str:
     """Mapuj komunikat aplikacji na niewielki zestaw stanów ikony zasobnika."""
     normalized = status.casefold()
-    if error or "błąd" in normalized:
+    if error or "błąd" in normalized or "error" in normalized:
         return "error"
-    if "nagrywanie" in normalized:
+    if "nagrywanie" in normalized or "recording" in normalized:
         return "recording"
-    if normalized.startswith(("gotowy", "nagranie było", "nie wykryłem")):
+    if normalized.startswith(
+        (
+            "gotowy",
+            "ready",
+            "nagranie było",
+            "recording was",
+            "nie wykryłem",
+            "no clear speech",
+        )
+    ):
         return "ready"
     if normalized.startswith(
         (
             "cuda nie ruszyła",
+            "cuda failed",
             "kończę",
+            "finishing",
             "kopiuję",
+            "copying",
             "ładowanie",
+            "loading",
             "przełączam",
+            "switching",
             "przygotowuję",
+            "preparing",
             "rozpoznaję",
+            "transcribing",
             "stosuję",
+            "applying",
             "wklejam",
+            "pasting",
             "włączam profil",
+            "activating profile",
         )
     ):
         return "processing"
     return "idle"
 
 
-@lru_cache(maxsize=5)
+@lru_cache(maxsize=6)
 def make_tray_image(state: str = "idle") -> Image.Image:
-    """Utwórz czytelną ikonę mikrofonu z plakietką bieżącego stanu."""
+    """Utwórz ikonę mikrofonu; wariant ``brand`` nie pokazuje stanu."""
     state_colors = {
+        "brand": (59, 130, 246, 255),
         "idle": (100, 116, 139, 255),
         "ready": (34, 197, 94, 255),
         "recording": (244, 63, 94, 255),
@@ -1093,6 +1364,9 @@ def make_tray_image(state: str = "idle") -> Image.Image:
     draw.arc((17, 21, 47, 47), start=0, end=180, fill=foreground, width=4)
     draw.line((32, 45, 32, 52), fill=foreground, width=4)
     draw.rounded_rectangle((23, 51, 41, 55), radius=2, fill=foreground)
+
+    if state == "brand":
+        return image
 
     # Plakietka rozróżnia stany także kształtem, nie tylko kolorem.
     draw.ellipse((43, 42, 62, 61), fill=surface)
@@ -1119,45 +1393,101 @@ def settings_process_args() -> list[str]:
 
 def run_settings_window() -> int:
     """Uruchom osobny panel ustawień oparty na wbudowanym Tkinterze."""
+    config = load_config()
+    translator = Translator.from_config(config)
+    t = translator.t
+
     try:
         import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk
+        from tkinter import filedialog, font as tkfont, messagebox, ttk
     except ImportError as exc:
         raise AppError(
-            "Brakuje składnika Tkinter. Zainstaluj standardowy 64-bitowy Python "
-            "3.10–3.12 z python.org albo uruchom NAPRAW_INSTALACJE.cmd."
+            t(
+                "Brakuje składnika Tkinter. Zainstaluj standardowy 64-bitowy "
+                "Python 3.10–3.12 z python.org albo uruchom "
+                "NAPRAW_INSTALACJE.cmd.",
+                "Tkinter is missing. Install standard 64-bit Python 3.10–3.12 "
+                "from python.org or run NAPRAW_INSTALACJE.cmd.",
+            )
         ) from exc
 
-    config = load_config()
-
     root = tk.Tk()
-    root.title(f"{APP_DISPLAY_NAME} — centrum ustawień")
-    root.geometry("1120x780")
-    root.minsize(960, 660)
+    root.title(
+        t(
+            "{app} — centrum ustawień",
+            "{app} — Settings Center",
+            app=APP_DISPLAY_NAME,
+        )
+    )
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    window_width = min(1120, max(480, screen_width - 64))
+    window_height = min(780, max(420, screen_height - 96))
+    window_x = max(0, (screen_width - window_width) // 2)
+    window_y = max(0, (screen_height - window_height) // 2)
+    root.geometry(
+        f"{window_width}x{window_height}+{window_x}+{window_y}"
+    )
+    root.minsize(min(960, window_width), min(660, window_height))
     try:
         root.iconbitmap(default=str(RESOURCE_ROOT / "assets" / "Mowik.ico"))
     except tk.TclError:
         logging.debug("Nie udało się ustawić ikony okna", exc_info=True)
 
     colors = {
-        "canvas": "#F5F7FB",
+        "canvas": "#F3F6FA",
         "surface": "#FFFFFF",
-        "surface_alt": "#F8FAFD",
-        "sidebar": "#10243E",
-        "sidebar_active": "#1C3B61",
-        "sidebar_hover": "#173250",
-        "text": "#172033",
-        "muted": "#627087",
-        "border": "#DDE3EC",
+        "surface_alt": "#F8FAFC",
+        "surface_hover": "#EEF2F7",
+        "sidebar": "#0F172A",
+        "sidebar_active": "#1E3A5F",
+        "sidebar_hover": "#182B46",
+        "sidebar_success": "#12372D",
+        "sidebar_success_text": "#86E7BD",
+        "text": "#0F172A",
+        "muted": "#5B667A",
+        "border": "#D8E0EA",
         "primary": "#2563EB",
         "primary_hover": "#1D4ED8",
-        "primary_soft": "#EAF1FF",
-        "success": "#168A5B",
-        "success_soft": "#E8F7F0",
-        "danger": "#D64550",
+        "primary_soft": "#EFF6FF",
+        "primary_border": "#BFDBFE",
+        "success": "#0F6B45",
+        "success_soft": "#ECFDF5",
+        "success_border": "#B7E4CF",
+        "warning": "#9A5A00",
+        "danger": "#B4232F",
         "white": "#FFFFFF",
     }
     root.configure(background=colors["canvas"])
+
+    font_families = {
+        family.casefold(): family for family in tkfont.families(root)
+    }
+    ui_font_family = font_families.get(
+        "segoe ui variable text",
+        font_families.get("segoe ui", "Segoe UI"),
+    )
+    display_font_family = font_families.get(
+        "segoe ui variable display",
+        ui_font_family,
+    )
+    named_font_settings = {
+        "TkDefaultFont": (10, "normal"),
+        "TkTextFont": (10, "normal"),
+        "TkMenuFont": (10, "normal"),
+        "TkHeadingFont": (11, "bold"),
+        "TkCaptionFont": (10, "normal"),
+        "TkSmallCaptionFont": (9, "normal"),
+    }
+    for font_name, (size, weight) in named_font_settings.items():
+        try:
+            tkfont.nametofont(font_name, root=root).configure(
+                family=ui_font_family,
+                size=size,
+                weight=weight,
+            )
+        except tk.TclError:
+            logging.debug("Nie udało się ustawić czcionki %s", font_name)
 
     style = ttk.Style(root)
     try:
@@ -1165,7 +1495,7 @@ def run_settings_window() -> int:
     except tk.TclError:
         pass
 
-    base_font = ("Segoe UI", 10)
+    base_font = (ui_font_family, 10)
     style.configure(".", font=base_font)
     style.configure("TFrame", background=colors["surface"])
     style.configure("App.TFrame", background=colors["canvas"])
@@ -1174,45 +1504,46 @@ def run_settings_window() -> int:
     style.configure("TLabel", background=colors["surface"], foreground=colors["text"])
     style.configure(
         "Title.TLabel",
-        font=("Segoe UI", 22, "bold"),
+        font=(display_font_family, 21, "bold"),
         foreground=colors["text"],
     )
     style.configure(
         "Subtitle.TLabel",
-        font=("Segoe UI", 10),
+        font=(ui_font_family, 10),
         foreground=colors["muted"],
     )
     style.configure(
         "Section.TLabel",
-        font=("Segoe UI", 11, "bold"),
+        font=(ui_font_family, 11, "bold"),
         foreground=colors["text"],
     )
     style.configure(
         "Muted.TLabel",
         foreground=colors["muted"],
+        font=(ui_font_family, 9),
     )
     style.configure(
         "Field.TLabel",
         foreground=colors["text"],
-        font=("Segoe UI", 9, "bold"),
+        font=(ui_font_family, 9, "bold"),
     )
     style.configure(
         "SidebarBrand.TLabel",
         background=colors["sidebar"],
         foreground=colors["white"],
-        font=("Segoe UI", 17, "bold"),
+        font=(display_font_family, 17, "bold"),
     )
     style.configure(
         "SidebarMeta.TLabel",
         background=colors["sidebar"],
-        foreground="#AFC2DA",
-        font=("Segoe UI", 9),
+        foreground="#CBD5E1",
+        font=(ui_font_family, 9),
     )
     style.configure(
         "SidebarSection.TLabel",
         background=colors["sidebar"],
-        foreground="#8199B5",
-        font=("Segoe UI", 8, "bold"),
+        foreground="#94A3B8",
+        font=(ui_font_family, 9, "bold"),
     )
     style.configure(
         "TButton",
@@ -1222,11 +1553,14 @@ def run_settings_window() -> int:
         lightcolor=colors["border"],
         darkcolor=colors["border"],
         relief="flat",
-        padding=(13, 8),
+        padding=(14, 9),
     )
     style.map(
         "TButton",
-        background=[("pressed", "#E7ECF4"), ("active", "#EEF2F8")],
+        background=[
+            ("pressed", "#E3E9F1"),
+            ("active", colors["surface_hover"]),
+        ],
         bordercolor=[("focus", colors["primary"]), ("active", "#C9D2DF")],
     )
     style.configure(
@@ -1236,13 +1570,18 @@ def run_settings_window() -> int:
         bordercolor=colors["primary"],
         lightcolor=colors["primary"],
         darkcolor=colors["primary"],
-        font=("Segoe UI", 10, "bold"),
-        padding=(16, 9),
+        font=(ui_font_family, 10, "bold"),
+        padding=(17, 10),
     )
     style.map(
         "Primary.TButton",
-        background=[("pressed", "#1E40AF"), ("active", colors["primary_hover"])],
-        foreground=[("disabled", "#DCE7FF")],
+        background=[
+            ("disabled", "#AFC4F2"),
+            ("pressed", "#1E40AF"),
+            ("active", colors["primary_hover"]),
+        ],
+        foreground=[("disabled", "#F5F8FF")],
+        bordercolor=[("disabled", "#AFC4F2")],
     )
     style.configure(
         "Nav.TButton",
@@ -1253,13 +1592,13 @@ def run_settings_window() -> int:
         darkcolor=colors["sidebar"],
         anchor="w",
         padding=(18, 11),
-        font=("Segoe UI", 10),
+        font=(ui_font_family, 10),
     )
     style.map(
         "Nav.TButton",
         background=[("active", colors["sidebar_hover"])],
         foreground=[("active", colors["white"])],
-        bordercolor=[("focus", colors["sidebar_hover"])],
+        bordercolor=[("focus", "#60A5FA")],
     )
     style.configure(
         "NavActive.TButton",
@@ -1270,29 +1609,30 @@ def run_settings_window() -> int:
         darkcolor=colors["sidebar_active"],
         anchor="w",
         padding=(18, 11),
-        font=("Segoe UI", 10, "bold"),
+        font=(ui_font_family, 10, "bold"),
     )
     style.map(
         "NavActive.TButton",
         background=[("active", colors["sidebar_active"])],
         foreground=[("active", colors["white"])],
+        bordercolor=[("focus", "#60A5FA")],
     )
     style.configure(
         "Profile.TButton",
         anchor="w",
         padding=(14, 12),
-        font=("Segoe UI", 9),
+        font=(ui_font_family, 9),
     )
     style.configure(
         "SelectedProfile.TButton",
         background=colors["primary_soft"],
         foreground=colors["primary_hover"],
-        bordercolor="#9EBBFF",
-        lightcolor="#9EBBFF",
-        darkcolor="#9EBBFF",
+        bordercolor=colors["primary_border"],
+        lightcolor=colors["primary_border"],
+        darkcolor=colors["primary_border"],
         anchor="w",
         padding=(14, 12),
-        font=("Segoe UI", 9, "bold"),
+        font=(ui_font_family, 9, "bold"),
     )
     style.map(
         "SelectedProfile.TButton",
@@ -1307,7 +1647,7 @@ def run_settings_window() -> int:
         lightcolor=colors["border"],
         darkcolor=colors["border"],
         insertcolor=colors["text"],
-        padding=8,
+        padding=9,
     )
     style.configure(
         "TCombobox",
@@ -1318,7 +1658,7 @@ def run_settings_window() -> int:
         lightcolor=colors["border"],
         darkcolor=colors["border"],
         arrowcolor=colors["muted"],
-        padding=6,
+        padding=7,
     )
     style.map(
         "TCombobox",
@@ -1336,13 +1676,13 @@ def run_settings_window() -> int:
         lightcolor=colors["border"],
         darkcolor=colors["border"],
         arrowcolor=colors["muted"],
-        padding=6,
+        padding=7,
     )
     style.configure(
         "TCheckbutton",
         background=colors["surface"],
         foreground=colors["text"],
-        padding=(0, 3),
+        padding=(0, 4),
     )
     style.map(
         "TCheckbutton",
@@ -1362,7 +1702,8 @@ def run_settings_window() -> int:
         "TLabelframe.Label",
         background=colors["surface"],
         foreground=colors["text"],
-        font=("Segoe UI", 11, "bold"),
+        font=(ui_font_family, 11, "bold"),
+        padding=(4, 0, 8, 0),
     )
     style.configure(
         "Vertical.TScrollbar",
@@ -1377,7 +1718,7 @@ def run_settings_window() -> int:
         from PIL import ImageTk
 
         root._mowik_icon = ImageTk.PhotoImage(  # type: ignore[attr-defined]
-            make_tray_image("processing")
+            make_tray_image("brand")
         )
         root.iconphoto(True, root._mowik_icon)  # type: ignore[attr-defined]
     except Exception:
@@ -1386,50 +1727,128 @@ def run_settings_window() -> int:
     trigger_values: dict[str, Any] = {
         "F6": "keyboard:f6",
         "F7": "keyboard:f7",
-        "F8 (domyślnie)": "keyboard:f8",
+        t("F8 (domyślnie)", "F8 (default)"): "keyboard:f8",
         "F9": "keyboard:f9",
         "F10": "keyboard:f10",
         "F11": "keyboard:f11",
         "F12": "keyboard:f12",
         "Pause/Break": "keyboard:pause",
         "Scroll Lock": "keyboard:scroll_lock",
-        "Boczny przycisk myszy 1 (X1)": "mouse:x1",
-        "Boczny przycisk myszy 2 (X2)": "mouse:x2",
+        t(
+            "Boczny przycisk myszy 1 (X1)",
+            "Side mouse button 1 (X1)",
+        ): "mouse:x1",
+        t(
+            "Boczny przycisk myszy 2 (X2)",
+            "Side mouse button 2 (X2)",
+        ): "mouse:x2",
     }
     model_values: dict[str, Any] = {
-        "Automatycznie": "auto",
-        "tiny — najmniejszy": "tiny",
-        "base — bardzo lekki": "base",
-        "small — lekki (~0,5 GB)": "small",
-        "medium — dokładniejszy": "medium",
-        "large-v3-turbo — zalecany (~1,6 GB)": "large-v3-turbo",
-        "large-v3 — najdokładniejszy (~3,1 GB)": "large-v3",
+        t("Automatycznie", "Automatic"): "auto",
+        t("tiny — najmniejszy", "tiny — smallest"): "tiny",
+        t("base — bardzo lekki", "base — very lightweight"): "base",
+        t("small — lekki (~0,5 GB)", "small — lightweight (~0.5 GB)"): "small",
+        t("medium — dokładniejszy", "medium — more accurate"): "medium",
+        t(
+            "large-v3-turbo — zalecany (~1,6 GB)",
+            "large-v3-turbo — recommended (~1.6 GB)",
+        ): "large-v3-turbo",
+        t(
+            "large-v3 — najdokładniejszy (~3,1 GB)",
+            "large-v3 — most accurate (~3.1 GB)",
+        ): "large-v3",
     }
     device_values: dict[str, Any] = {
-        "Automatycznie (zalecane)": "auto",
-        "Procesor (CPU)": "cpu",
-        "Karta NVIDIA (CUDA)": "cuda",
+        t("Automatycznie (zalecane)", "Automatic (recommended)"): "auto",
+        t("Procesor (CPU)", "Processor (CPU)"): "cpu",
+        t("Karta NVIDIA (CUDA)", "NVIDIA GPU (CUDA)"): "cuda",
     }
     language_values: dict[str, Any] = {
+        t("Polski", "Polish"): "pl",
+        t("Angielski", "English"): "en",
+        t("Niemiecki", "German"): "de",
+        t("Francuski", "French"): "fr",
+        t("Hiszpański", "Spanish"): "es",
+        t("Ukraiński", "Ukrainian"): "uk",
+        t("Wykryj automatycznie", "Detect automatically"): "auto",
+    }
+    ui_language_values: dict[str, Any] = {
+        t("Automatycznie (Windows)", "Automatic (Windows)"): "auto",
         "Polski": "pl",
-        "Angielski": "en",
-        "Niemiecki": "de",
-        "Francuski": "fr",
-        "Hiszpański": "es",
-        "Ukraiński": "uk",
-        "Wykryj automatycznie": "auto",
+        "English": "en",
     }
     microphone_values: dict[str, Any] = {}
 
     def display_for_value(
-        mapping: dict[str, Any], value: Any, custom_prefix: str = "Niestandardowe"
+        mapping: dict[str, Any],
+        value: Any,
+        custom_prefix: Optional[str] = None,
     ) -> str:
         for label, stored in mapping.items():
             if stored == value:
                 return label
+        custom_prefix = custom_prefix or t("Niestandardowe", "Custom")
         label = f"{custom_prefix}: {value}"
         mapping[label] = value
         return label
+
+    def localized_trigger_display_name(trigger: str, compact: bool = False) -> str:
+        trigger_type, name = split_trigger(trigger)
+        if trigger_type == "mouse":
+            if compact and name in {"x1", "x2"}:
+                return t("Mysz {name}", "Mouse {name}", name=name.upper())
+            mouse_labels = {
+                "left": t("lewy przycisk", "left button"),
+                "right": t("prawy przycisk", "right button"),
+                "middle": t("środkowy przycisk", "middle button"),
+                "x1": t("boczny przycisk X1", "side button X1"),
+                "x2": t("boczny przycisk X2", "side button X2"),
+            }
+            label = mouse_labels.get(name, name.upper())
+            return t("Mysz: {name}", "Mouse: {name}", name=label)
+
+        key_labels = {
+            "pause": "Pause/Break",
+            "scroll_lock": "Scroll Lock",
+            "caps_lock": "Caps Lock",
+            "space": t("Spacja", "Space"),
+            "tab": "Tab",
+            "insert": "Insert",
+            "delete": "Delete",
+            "home": "Home",
+            "end": "End",
+            "page_up": "Page Up",
+            "page_down": "Page Down",
+            "ctrl": "Ctrl",
+            "ctrl_l": t("Lewy Ctrl", "Left Ctrl"),
+            "ctrl_r": t("Prawy Ctrl", "Right Ctrl"),
+            "alt": "Alt",
+            "alt_l": t("Lewy Alt", "Left Alt"),
+            "alt_r": t("Prawy Alt", "Right Alt"),
+            "shift": "Shift",
+            "shift_l": t("Lewy Shift", "Left Shift"),
+            "shift_r": t("Prawy Shift", "Right Shift"),
+            "cmd": "Windows",
+            "cmd_l": t("Lewy Windows", "Left Windows"),
+            "cmd_r": t("Prawy Windows", "Right Windows"),
+        }
+        if name in key_labels:
+            label = key_labels[name]
+        elif len(name) == 1:
+            label = name.upper()
+        elif re.fullmatch(r"f\d{1,2}", name):
+            label = name.upper()
+        elif name.startswith("vk") and name[2:].isdigit():
+            label = t(
+                "klawisz VK {number}",
+                "VK key {number}",
+                number=name[2:],
+            )
+        else:
+            label = name.replace("_", " ").title()
+        if compact:
+            return label
+        return t("Klawiatura: {name}", "Keyboard: {name}", name=label)
 
     def ensure_trigger_display(value: Any) -> str:
         trigger = str(value or "keyboard:f8").strip().lower()
@@ -1437,9 +1856,13 @@ def run_settings_window() -> int:
             if stored == trigger:
                 return label
         try:
-            label = trigger_display_name(trigger)
+            label = localized_trigger_display_name(trigger)
         except AppError:
-            label = f"Niestandardowe: {trigger}"
+            label = t(
+                "Niestandardowe: {trigger}",
+                "Custom: {trigger}",
+                trigger=trigger,
+            )
         trigger_values[label] = trigger
         return label
 
@@ -1453,7 +1876,13 @@ def run_settings_window() -> int:
         value=display_for_value(device_values, config.get("device", "auto"))
     )
     language_var = tk.StringVar(
-        value=display_for_value(language_values, config.get("language", "pl"))
+        value=display_for_value(language_values, config.get("language", "auto"))
+    )
+    ui_language_var = tk.StringVar(
+        value=display_for_value(
+            ui_language_values,
+            config.get("ui_language", "auto"),
+        )
     )
     cpu_threads_var = tk.StringVar(value=str(config.get("cpu_threads", 0)))
     beam_size_var = tk.StringVar(value=str(config.get("beam_size", 2)))
@@ -1524,24 +1953,40 @@ def run_settings_window() -> int:
         value=str(ollama.get("timeout_seconds", 45))
     )
 
-    status_var = tk.StringVar(value="Wszystko gotowe — ustawienia są zapisane.")
+    status_var = tk.StringVar(
+        value=t(
+            "Wszystko gotowe — ustawienia są zapisane.",
+            "Everything is ready — settings are saved.",
+        )
+    )
+    status_level = {"value": "success"}
     shortcut_summary_var = tk.StringVar()
 
+    def set_status(message: str, level: str = "success") -> None:
+        status_level["value"] = level
+        status_var.set(message)
+
     def refresh_shortcut_summary(*args) -> None:
-        label = trigger_var.get().replace(" (domyślnie)", "")
-        if "(X1)" in label:
-            label = "Mysz X1"
-        elif "(X2)" in label:
-            label = "Mysz X2"
-        elif label.startswith("Klawiatura: "):
-            label = label.removeprefix("Klawiatura: ")
-        shortcut_summary_var.set(label)
+        trigger = str(
+            trigger_values.get(
+                trigger_var.get(),
+                config.get("trigger", "keyboard:f8"),
+            )
+        )
+        try:
+            summary = localized_trigger_display_name(trigger, compact=True)
+        except AppError:
+            summary = trigger_var.get()
+        shortcut_summary_var.set(summary)
 
     trigger_var.trace_add("write", refresh_shortcut_summary)
     refresh_shortcut_summary()
-    page_title_var = tk.StringVar(value="Start")
+    page_title_var = tk.StringVar(value=t("Start", "Home"))
     page_subtitle_var = tk.StringVar(
-        value="Najważniejsze informacje i szybki dostęp do ustawień dyktowania."
+        value=t(
+            "Najważniejsze informacje i szybki dostęp do ustawień dyktowania.",
+            "Key information and quick access to dictation settings.",
+        )
     )
 
     shell = ttk.Frame(root, style="App.TFrame")
@@ -1551,19 +1996,19 @@ def run_settings_window() -> int:
     shell.rowconfigure(0, weight=1)
     shell.columnconfigure(1, weight=1)
 
-    sidebar = ttk.Frame(shell, style="Sidebar.TFrame", width=224)
+    sidebar = ttk.Frame(shell, style="Sidebar.TFrame", width=216)
     sidebar.grid(row=0, column=0, sticky="ns")
     sidebar.grid_propagate(False)
     sidebar.columnconfigure(0, weight=1)
     sidebar.rowconfigure(20, weight=1)
 
-    brand = ttk.Frame(sidebar, style="Sidebar.TFrame", padding=(18, 22, 18, 16))
+    brand = ttk.Frame(sidebar, style="Sidebar.TFrame", padding=(18, 24, 18, 18))
     brand.grid(row=0, column=0, sticky="ew")
     brand.columnconfigure(1, weight=1)
     try:
         from PIL import ImageTk
 
-        brand_image = make_tray_image("processing").resize((38, 38))
+        brand_image = make_tray_image("brand").resize((38, 38))
         root._mowik_brand_icon = ImageTk.PhotoImage(brand_image)  # type: ignore[attr-defined]
         ttk.Label(
             brand,
@@ -1577,16 +2022,16 @@ def run_settings_window() -> int:
     )
     ttk.Label(
         brand,
-        text="Centrum ustawień",
+        text=t("Centrum ustawień", "Settings Center"),
         style="SidebarMeta.TLabel",
     ).grid(row=1, column=1, sticky="nw")
 
     privacy_badge = tk.Label(
         sidebar,
-        text="●  DZIAŁA LOKALNIE",
-        background="#173A45",
-        foreground="#7DE2B8",
-        font=("Segoe UI", 8, "bold"),
+        text=t("●  DZIAŁA LOKALNIE", "●  RUNS LOCALLY"),
+        background=colors["sidebar_success"],
+        foreground=colors["sidebar_success_text"],
+        font=(ui_font_family, 9, "bold"),
         padx=12,
         pady=7,
         anchor="w",
@@ -1598,7 +2043,7 @@ def run_settings_window() -> int:
     main.rowconfigure(2, weight=1)
     main.columnconfigure(0, weight=1)
 
-    header = ttk.Frame(main, style="Surface.TFrame", padding=(30, 22, 30, 17))
+    header = ttk.Frame(main, style="Surface.TFrame", padding=(32, 24, 32, 18))
     header.grid(row=0, column=0, sticky="ew")
     header.columnconfigure(0, weight=1)
     ttk.Label(header, textvariable=page_title_var, style="Title.TLabel").grid(
@@ -1612,17 +2057,17 @@ def run_settings_window() -> int:
     ).grid(row=1, column=0, sticky="w", pady=(3, 0))
     local_chip = tk.Label(
         header,
-        text="Prywatnie i offline",
+        text=t("Prywatnie i offline", "Private and offline"),
         background=colors["success_soft"],
         foreground=colors["success"],
-        font=("Segoe UI", 9, "bold"),
+        font=(ui_font_family, 9, "bold"),
         padx=11,
         pady=6,
     )
     local_chip.grid(row=0, column=1, rowspan=2, sticky="e", padx=(18, 0))
     ttk.Separator(main).grid(row=1, column=0, sticky="ew")
 
-    page_host = ttk.Frame(main, style="Surface.TFrame", padding=(30, 0, 20, 0))
+    page_host = ttk.Frame(main, style="Surface.TFrame", padding=(32, 0, 22, 0))
     page_host.grid(row=2, column=0, sticky="nsew")
     page_host.rowconfigure(0, weight=1)
     page_host.columnconfigure(0, weight=1)
@@ -1691,32 +2136,53 @@ def run_settings_window() -> int:
     }
     page_meta = {
         "start": (
-            "Start",
-            "Najważniejsze informacje i szybki dostęp do ustawień dyktowania.",
+            t("Start", "Home"),
+            t(
+                "Najważniejsze informacje i szybki dostęp do ustawień dyktowania.",
+                "Key information and quick access to dictation settings.",
+            ),
         ),
         "dictation": (
-            "Dyktowanie",
-            "Skrót, mikrofon, język oraz profil szybkości i dokładności.",
+            t("Dyktowanie", "Dictation"),
+            t(
+                "Skrót, mikrofon, język oraz profil szybkości i dokładności.",
+                "Choose the shortcut, microphone, language, speed, and accuracy.",
+            ),
         ),
         "audio": (
-            "Mikrofon i wykrywanie mowy",
-            "Dopasuj czułość i bufory tylko wtedy, gdy nagrania są ucinane.",
+            t("Mikrofon i wykrywanie mowy", "Microphone and speech detection"),
+            t(
+                "Dopasuj czułość i bufory tylko wtedy, gdy nagrania są ucinane.",
+                "Adjust sensitivity and buffers only if recordings are clipped.",
+            ),
         ),
         "text": (
-            "Tekst i słownik",
-            "Zdecyduj, gdzie trafia transkrypcja i podpowiedz Mówikowi własne nazwy.",
+            t("Tekst i słownik", "Text and dictionary"),
+            t(
+                "Zdecyduj, gdzie trafia transkrypcja i podpowiedz Mówikowi własne nazwy.",
+                "Choose where transcripts go and teach Mówik your preferred names.",
+            ),
         ),
         "sounds": (
-            "Dźwięki i powiadomienia",
-            "Wybierz dyskretną informację zwrotną na każdym etapie dyktowania.",
+            t("Dźwięki i powiadomienia", "Sounds and notifications"),
+            t(
+                "Wybierz dyskretną informację zwrotną na każdym etapie dyktowania.",
+                "Choose subtle feedback for each stage of dictation.",
+            ),
         ),
         "integrations": (
-            "Integracje",
-            "Opcjonalna, lokalna korekta tekstu przez Ollamę.",
+            t("Integracje", "Integrations"),
+            t(
+                "Opcjonalna, lokalna korekta tekstu przez Ollamę.",
+                "Optional local text correction with Ollama.",
+            ),
         ),
         "help": (
-            "Pomoc i diagnostyka",
-            "Szybki dostęp do konfiguracji, danych aplikacji i logów.",
+            t("Pomoc i diagnostyka", "Help and diagnostics"),
+            t(
+                "Szybki dostęp do konfiguracji, danych aplikacji i logów.",
+                "Quick access to configuration, application data, and logs.",
+            ),
         ),
     }
     for page in page_frames.values():
@@ -1747,19 +2213,22 @@ def run_settings_window() -> int:
 
     nav_row = 2
     for section, items in (
-        ("CENTRUM", (("start", "Start"),)),
+        (t("CENTRUM", "CENTER"), (("start", t("Start", "Home")),)),
         (
-            "USTAWIENIA",
+            t("USTAWIENIA", "SETTINGS"),
             (
-                ("dictation", "Dyktowanie"),
-                ("audio", "Mikrofon i mowa"),
-                ("text", "Tekst i słownik"),
-                ("sounds", "Dźwięki"),
+                ("dictation", t("Dyktowanie", "Dictation")),
+                ("audio", t("Mikrofon i mowa", "Microphone and speech")),
+                ("text", t("Tekst i słownik", "Text and dictionary")),
+                ("sounds", t("Dźwięki", "Sounds")),
             ),
         ),
         (
-            "WIĘCEJ",
-            (("integrations", "Integracje"), ("help", "Pomoc i diagnostyka")),
+            t("WIĘCEJ", "MORE"),
+            (
+                ("integrations", t("Integracje", "Integrations")),
+                ("help", t("Pomoc i diagnostyka", "Help and diagnostics")),
+            ),
         ),
     ):
         ttk.Label(sidebar, text=section, style="SidebarSection.TLabel").grid(
@@ -1789,7 +2258,7 @@ def run_settings_window() -> int:
     ).grid(row=21, column=0, sticky="sw", padx=19, pady=18)
 
     ttk.Separator(main).grid(row=3, column=0, sticky="ew")
-    footer = ttk.Frame(main, style="Surface.TFrame", padding=(30, 13, 30, 15))
+    footer = ttk.Frame(main, style="Surface.TFrame", padding=(32, 14, 32, 16))
     footer.grid(row=4, column=0, sticky="ew")
     footer.columnconfigure(1, weight=1)
 
@@ -1799,7 +2268,7 @@ def run_settings_window() -> int:
     hero = tk.Frame(
         start_tab,
         background=colors["primary_soft"],
-        highlightbackground="#C9D9FF",
+        highlightbackground=colors["primary_border"],
         highlightthickness=1,
         padx=24,
         pady=22,
@@ -1808,29 +2277,34 @@ def run_settings_window() -> int:
     hero.columnconfigure(0, weight=1)
     tk.Label(
         hero,
-        text="GOTOWY DO DYKTOWANIA",
+        text=t("GOTOWY DO DYKTOWANIA", "READY TO DICTATE"),
         background=colors["primary_soft"],
         foreground=colors["primary"],
-        font=("Segoe UI", 9, "bold"),
+        font=(ui_font_family, 9, "bold"),
     ).grid(row=0, column=0, sticky="w")
     tk.Label(
         hero,
-        text="Przytrzymaj skrót, powiedz zdanie i puść",
+        text=t(
+            "Przytrzymaj skrót, powiedz zdanie i puść",
+            "Hold the shortcut, speak, then release",
+        ),
         background=colors["primary_soft"],
         foreground=colors["text"],
-        font=("Segoe UI", 18, "bold"),
+        font=(display_font_family, 18, "bold"),
         justify="left",
         wraplength=470,
     ).grid(row=1, column=0, sticky="w", pady=(5, 5))
     tk.Label(
         hero,
-        text=(
+        text=t(
             "Mówik rozpozna głos lokalnie i wklei tekst do aktywnego okna. "
-            "Nie wysyła nagrań do chmury."
+            "Nie wysyła nagrań do chmury.",
+            "Mówik recognizes speech locally and pastes text into the active "
+            "window. Recordings are never sent to the cloud.",
         ),
         background=colors["primary_soft"],
         foreground=colors["muted"],
-        font=("Segoe UI", 10),
+        font=(ui_font_family, 10),
         justify="left",
         wraplength=470,
     ).grid(row=2, column=0, sticky="w")
@@ -1839,7 +2313,7 @@ def run_settings_window() -> int:
         textvariable=shortcut_summary_var,
         background=colors["surface"],
         foreground=colors["text"],
-        font=("Segoe UI", 12, "bold"),
+        font=(ui_font_family, 12, "bold"),
         relief="solid",
         borderwidth=1,
         padx=18,
@@ -1848,7 +2322,7 @@ def run_settings_window() -> int:
     shortcut_keycap.grid(row=0, column=1, rowspan=2, sticky="e", padx=(20, 0))
     ttk.Button(
         hero,
-        text="Zmień skrót",
+        text=t("Zmień skrót", "Change shortcut"),
         command=lambda: show_page("dictation"),
     ).grid(row=2, column=1, sticky="e", padx=(20, 0), pady=(10, 0))
 
@@ -1879,14 +2353,14 @@ def run_settings_window() -> int:
             text=eyebrow,
             background=colors["surface_alt"],
             foreground=colors["muted"],
-            font=("Segoe UI", 8, "bold"),
+            font=(ui_font_family, 9, "bold"),
         ).pack(anchor="w")
         tk.Label(
             card,
             textvariable=value_var,
             background=colors["surface_alt"],
             foreground=colors["text"],
-            font=("Segoe UI", 10, "bold"),
+            font=(ui_font_family, 10, "bold"),
             justify="left",
             anchor="w",
             wraplength=190,
@@ -1896,20 +2370,38 @@ def run_settings_window() -> int:
             text=description,
             background=colors["surface_alt"],
             foreground=colors["muted"],
-            font=("Segoe UI", 8),
+            font=(ui_font_family, 9),
             justify="left",
             anchor="w",
             wraplength=190,
         ).pack(anchor="w", fill="x")
 
-    add_overview_card(overview, 0, "SKRÓT", trigger_var, "Przytrzymaj podczas mówienia")
-    add_overview_card(overview, 1, "MIKROFON", microphone_var, "Aktywne źródło dźwięku")
-    add_overview_card(overview, 2, "MODEL", model_var, "Rozpoznawanie lokalne")
+    add_overview_card(
+        overview,
+        0,
+        t("SKRÓT", "SHORTCUT"),
+        trigger_var,
+        t("Przytrzymaj podczas mówienia", "Hold while speaking"),
+    )
+    add_overview_card(
+        overview,
+        1,
+        t("MIKROFON", "MICROPHONE"),
+        microphone_var,
+        t("Aktywne źródło dźwięku", "Active audio source"),
+    )
+    add_overview_card(
+        overview,
+        2,
+        t("MODEL", "MODEL"),
+        model_var,
+        t("Rozpoznawanie lokalne", "Local recognition"),
+    )
 
     privacy_panel = tk.Frame(
         start_tab,
         background=colors["success_soft"],
-        highlightbackground="#BFE8D5",
+        highlightbackground=colors["success_border"],
         highlightthickness=1,
         padx=18,
         pady=14,
@@ -1917,43 +2409,75 @@ def run_settings_window() -> int:
     privacy_panel.grid(row=2, column=0, sticky="ew", pady=(0, 16))
     tk.Label(
         privacy_panel,
-        text="Prywatność jest ustawieniem domyślnym",
+        text=t(
+            "Prywatność jest ustawieniem domyślnym",
+            "Privacy is the default",
+        ),
         background=colors["success_soft"],
         foreground=colors["success"],
-        font=("Segoe UI", 10, "bold"),
+        font=(ui_font_family, 10, "bold"),
     ).pack(anchor="w")
     tk.Label(
         privacy_panel,
-        text=(
+        text=t(
             "Dźwięk istnieje tylko chwilowo w pamięci RAM. Nagrania nie są "
-            "zapisywane, a treść dyktowania nie trafia do logów."
+            "zapisywane, a treść dyktowania nie trafia do logów.",
+            "Audio exists only briefly in memory. Recordings are not saved, "
+            "and dictated content is never written to logs.",
         ),
         background=colors["success_soft"],
-        foreground="#356B57",
-        font=("Segoe UI", 9),
+        foreground=colors["success"],
+        font=(ui_font_family, 9),
         justify="left",
         wraplength=700,
     ).pack(anchor="w", pady=(4, 0))
 
-    quick_actions = ttk.LabelFrame(start_tab, text="Szybkie działania", padding=16)
-    quick_actions.grid(row=3, column=0, sticky="ew")
+    quick_actions = ttk.LabelFrame(
+        start_tab,
+        text=t("Szybkie działania", "Quick actions"),
+        padding=16,
+    )
+    quick_actions.grid(row=4, column=0, sticky="ew", pady=(16, 0))
     for column in range(3):
         quick_actions.columnconfigure(column, weight=1)
     ttk.Button(
         quick_actions,
-        text="Ustaw dyktowanie",
+        text=t("Ustaw dyktowanie", "Set up dictation"),
         command=lambda: show_page("dictation"),
     ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
     ttk.Button(
         quick_actions,
-        text="Otwórz słownik",
+        text=t("Otwórz słownik", "Open dictionary"),
         command=lambda: show_page("text"),
     ).grid(row=0, column=1, sticky="ew", padx=5)
     ttk.Button(
         quick_actions,
-        text="Diagnostyka",
+        text=t("Diagnostyka", "Diagnostics"),
         command=lambda: show_page("help"),
     ).grid(row=0, column=2, sticky="ew", padx=(5, 0))
+
+    ui_language_frame = ttk.LabelFrame(
+        start_tab,
+        text=t("Język interfejsu", "Interface language"),
+        padding=16,
+    )
+    ui_language_frame.grid(row=3, column=0, sticky="ew")
+    ui_language_frame.columnconfigure(0, weight=1)
+    ttk.Combobox(
+        ui_language_frame,
+        textvariable=ui_language_var,
+        values=list(ui_language_values.keys()),
+        state="readonly",
+    ).grid(row=0, column=0, sticky="ew")
+    ttk.Label(
+        ui_language_frame,
+        text=t(
+            "Zmiana będzie widoczna po zastosowaniu ustawień i ponownym uruchomieniu Mówika.",
+            "The change takes effect after applying settings and restarting Mówik.",
+        ),
+        style="Muted.TLabel",
+        wraplength=700,
+    ).grid(row=1, column=0, sticky="w", pady=(7, 0))
 
     for tab in (
         general_tab,
@@ -1965,12 +2489,21 @@ def run_settings_window() -> int:
     ):
         tab.columnconfigure(1, weight=1)
 
-    presets = ttk.LabelFrame(general_tab, text="Profil jakości", padding=14)
+    presets = ttk.LabelFrame(
+        general_tab,
+        text=t("Profil jakości", "Quality profile"),
+        padding=16,
+    )
     presets.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     for column in range(3):
         presets.columnconfigure(column, weight=1)
 
     profile_buttons: dict[str, ttk.Button] = {}
+    profile_labels = {
+        "light": t("Szybki", "Fast"),
+        "balanced": t("Zalecany", "Recommended"),
+        "accurate": t("Najdokładniejszy", "Most accurate"),
+    }
 
     def refresh_profile_buttons(*args) -> None:
         selected_model = str(model_values.get(model_var.get(), model_var.get()))
@@ -1994,16 +2527,39 @@ def run_settings_window() -> int:
         model_var.set(display_for_value(model_values, changes["model"]))
         device_var.set(display_for_value(device_values, changes["device"]))
         beam_size_var.set(str(changes["beam_size"]))
-        status_var.set(
-            f"Wybrano profil „{profile['label']}”. Zastosuj zmiany, aby go uruchomić."
+        set_status(
+            t(
+                "Wybrano profil „{profile}”. Zastosuj zmiany, aby go uruchomić.",
+                "Selected the “{profile}” profile. Apply changes to activate it.",
+                profile=profile_labels[profile_name],
+            ),
+            "warning",
         )
         refresh_profile_buttons()
 
     for column, (profile_name, button_text) in enumerate(
         (
-            ("light", "Szybki\nsmall · najmniejsze obciążenie"),
-            ("balanced", "Zalecany\nTurbo · dobry balans"),
-            ("accurate", "Najdokładniejszy\nlarge-v3 · najwyższa jakość"),
+            (
+                "light",
+                t(
+                    "Szybki\nsmall · najmniejsze obciążenie",
+                    "Fast\nsmall · lowest load",
+                ),
+            ),
+            (
+                "balanced",
+                t(
+                    "Zalecany\nTurbo · dobry balans",
+                    "Recommended\nTurbo · balanced",
+                ),
+            ),
+            (
+                "accurate",
+                t(
+                    "Najdokładniejszy\nlarge-v3 · najwyższa jakość",
+                    "Most accurate\nlarge-v3 · highest quality",
+                ),
+            ),
         )
     ):
         button = ttk.Button(
@@ -2057,7 +2613,13 @@ def run_settings_window() -> int:
 
     def capture_trigger() -> None:
         dialog = tk.Toplevel(root)
-        dialog.title(f"{APP_DISPLAY_NAME} — wykrywanie przycisku")
+        dialog.title(
+            t(
+                "{app} — wykrywanie przycisku",
+                "{app} — Detect shortcut",
+                app=APP_DISPLAY_NAME,
+            )
+        )
         dialog.resizable(False, False)
         dialog.transient(root)
         dialog.grab_set()
@@ -2070,23 +2632,31 @@ def run_settings_window() -> int:
         frame.grid(row=0, column=0, sticky="nsew")
         ttk.Label(
             frame,
-            text="Naciśnij wybrany klawisz albo przycisk myszy",
-            font=("Segoe UI", 12, "bold"),
+            text=t(
+                "Naciśnij wybrany klawisz albo przycisk myszy",
+                "Press the desired key or mouse button",
+            ),
+            font=(display_font_family, 12, "bold"),
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             frame,
-            text=(
+            text=t(
                 "Nasłuchiwanie zacznie się za chwilę, aby nie przechwycić "
                 "kliknięcia tego okna. Esc anuluje. Najwygodniejszy jest "
-                "klawisz funkcyjny albo boczny przycisk myszy."
+                "klawisz funkcyjny albo boczny przycisk myszy.",
+                "Listening starts shortly so this window's click is not "
+                "captured. Press Esc to cancel. A function key or side mouse "
+                "button is usually most convenient.",
             ),
             wraplength=500,
         ).grid(row=1, column=0, sticky="ew", pady=(8, 14))
-        capture_status_var = tk.StringVar(value="Przygotowanie…")
+        capture_status_var = tk.StringVar(
+            value=t("Przygotowanie…", "Preparing…")
+        )
         ttk.Label(
             frame,
             textvariable=capture_status_var,
-            font=("Segoe UI", 11),
+            font=(ui_font_family, 11),
         ).grid(row=2, column=0, sticky="w")
 
         captured_events: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -2124,10 +2694,24 @@ def run_settings_window() -> int:
             label = ensure_trigger_display(trigger)
             trigger_combo["values"] = list(trigger_values.keys())
             trigger_var.set(label)
-            note = f"Ustawiono {trigger_display_name(trigger)}."
+            note = t(
+                "Ustawiono {trigger}.",
+                "Set to {trigger}.",
+                trigger=localized_trigger_display_name(trigger),
+            )
             if trigger in {"mouse:left", "mouse:right"}:
-                note += " Ten przycisk może kolidować ze zwykłą obsługą Windows."
-            status_var.set(note + " Kliknij „Zastosuj zmiany”.")
+                note += t(
+                    " Ten przycisk może kolidować ze zwykłą obsługą Windows.",
+                    " This button may interfere with normal Windows operation.",
+                )
+            set_status(
+                note
+                + t(
+                    " Kliknij „Zastosuj zmiany”.",
+                    " Click “Apply changes”.",
+                ),
+                "warning",
+            )
             try:
                 dialog.grab_release()
             except tk.TclError:
@@ -2163,8 +2747,16 @@ def run_settings_window() -> int:
         def begin_capture_listening() -> None:
             if finished.is_set() or not dialog.winfo_exists():
                 return
-            capture_status_var.set("Nasłuchuję — naciśnij teraz wybrany przycisk…")
-            cancel_button.configure(state="disabled", text="Anuluj: Esc")
+            capture_status_var.set(
+                t(
+                    "Nasłuchuję — naciśnij teraz wybrany przycisk…",
+                    "Listening — press the desired button now…",
+                )
+            )
+            cancel_button.configure(
+                state="disabled",
+                text=t("Anuluj: Esc", "Cancel: Esc"),
+            )
             listeners["keyboard"] = keyboard.Listener(
                 on_press=on_capture_key,
                 suppress=True,
@@ -2177,7 +2769,11 @@ def run_settings_window() -> int:
             listeners["mouse"].start()
             poll_capture_queue()
 
-        cancel_button = ttk.Button(frame, text="Anuluj", command=close_capture)
+        cancel_button = ttk.Button(
+            frame,
+            text=t("Anuluj", "Cancel"),
+            command=close_capture,
+        )
         cancel_button.grid(row=3, column=0, sticky="e", pady=(18, 0))
         dialog.protocol("WM_DELETE_WINDOW", close_capture)
         dialog.after(650, begin_capture_listening)
@@ -2188,15 +2784,18 @@ def run_settings_window() -> int:
 
     ttk.Button(
         trigger_row,
-        text="Wykryj…",
+        text=t("Wykryj…", "Detect…"),
         command=capture_trigger,
     ).grid(row=0, column=1, padx=(8, 0))
     add_field(
         general_tab,
         1,
-        "Przycisk dyktowania",
+        t("Przycisk dyktowania", "Dictation shortcut"),
         trigger_row,
-        "Kliknij „Wykryj…”, a potem naciśnij dowolny klawisz lub przycisk myszy.",
+        t(
+            "Kliknij „Wykryj…”, a potem naciśnij dowolny klawisz lub przycisk myszy.",
+            "Click “Detect…”, then press any key or mouse button.",
+        ),
     )
 
     microphone_row = ttk.Frame(general_tab)
@@ -2212,13 +2811,24 @@ def run_settings_window() -> int:
         if selected is None and microphone_var.get() in microphone_values:
             selected = microphone_values[microphone_var.get()]
         microphone_values.clear()
-        microphone_values["Domyślny mikrofon Windows"] = None
+        microphone_values[
+            t("Domyślny mikrofon Windows", "Default Windows microphone")
+        ] = None
         try:
             devices = sd.query_devices()
             for index, info in enumerate(devices):
                 if int(info.get("max_input_channels", 0)) <= 0:
                     continue
-                name = str(info.get("name", f"Urządzenie {index}"))
+                name = str(
+                    info.get(
+                        "name",
+                        t(
+                            "Urządzenie {index}",
+                            "Device {index}",
+                            index=index,
+                        ),
+                    )
+                )
                 microphone_values[f"{index}: {name}"] = index
         except Exception as exc:
             logging.warning("Nie udało się pobrać listy mikrofonów: %s", exc)
@@ -2227,17 +2837,17 @@ def run_settings_window() -> int:
             display_for_value(
                 microphone_values,
                 selected,
-                custom_prefix="Zapisane urządzenie",
+                custom_prefix=t("Zapisane urządzenie", "Saved device"),
             )
         )
         microphone_combo["values"] = list(microphone_values.keys())
 
     ttk.Button(
         microphone_row,
-        text="Odśwież",
+        text=t("Odśwież", "Refresh"),
         command=lambda: refresh_microphones(),
     ).grid(row=0, column=1, padx=(8, 0))
-    add_field(general_tab, 2, "Mikrofon", microphone_row)
+    add_field(general_tab, 2, t("Mikrofon", "Microphone"), microphone_row)
     microphone_row.grid_configure(columnspan=2)
     refresh_microphones(config.get("microphone"))
 
@@ -2250,9 +2860,12 @@ def run_settings_window() -> int:
     add_field(
         general_tab,
         3,
-        "Model mowy",
+        t("Model mowy", "Speech model"),
         model_combo,
-        "Nowy model może zostać pobrany przy zastosowaniu zmian.",
+        t(
+            "Nowy model może zostać pobrany przy zastosowaniu zmian.",
+            "A new model may be downloaded when changes are applied.",
+        ),
     )
     device_combo = ttk.Combobox(
         general_tab,
@@ -2263,9 +2876,12 @@ def run_settings_window() -> int:
     add_field(
         general_tab,
         4,
-        "Miejsce przetwarzania",
+        t("Miejsce przetwarzania", "Processing device"),
         device_combo,
-        "Automatyczny wybór jest najlepszy dla większości komputerów.",
+        t(
+            "Automatyczny wybór jest najlepszy dla większości komputerów.",
+            "Automatic selection is best for most computers.",
+        ),
     )
     language_combo = ttk.Combobox(
         general_tab,
@@ -2273,16 +2889,24 @@ def run_settings_window() -> int:
         values=list(language_values.keys()),
         state="readonly",
     )
-    add_field(general_tab, 5, "Język dyktowania", language_combo)
+    add_field(
+        general_tab,
+        5,
+        t("Język dyktowania", "Dictation language"),
+        language_combo,
+    )
     beam_spin = ttk.Spinbox(
         general_tab, from_=1, to=10, textvariable=beam_size_var, width=8
     )
     add_field(
         general_tab,
         6,
-        "Dokładność rozpoznawania",
+        t("Dokładność rozpoznawania", "Recognition accuracy"),
         beam_spin,
-        "1 = najszybciej; 5 = dokładniej, ale wolniej.",
+        t(
+            "1 = najszybciej; 5 = dokładniej, ale wolniej.",
+            "1 = fastest; 5 = more accurate, but slower.",
+        ),
     )
     threads_spin = ttk.Spinbox(
         general_tab, from_=0, to=256, textvariable=cpu_threads_var, width=8
@@ -2290,34 +2914,36 @@ def run_settings_window() -> int:
     add_field(
         general_tab,
         7,
-        "Liczba wątków CPU",
+        t("Liczba wątków CPU", "CPU thread count"),
         threads_spin,
-        "0 oznacza automatyczny dobór.",
+        t("0 oznacza automatyczny dobór.", "0 selects automatically."),
     )
 
     capture_frame = ttk.LabelFrame(
-        audio_tab, text="Bufor i czułość mikrofonu", padding=14
+        audio_tab,
+        text=t("Bufor i czułość mikrofonu", "Microphone buffer and sensitivity"),
+        padding=16,
     )
     capture_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     capture_frame.columnconfigure(1, weight=1)
     add_field(
         capture_frame,
         0,
-        "Bufor przed naciśnięciem (ms)",
+        t("Bufor przed naciśnięciem (ms)", "Pre-roll buffer (ms)"),
         ttk.Spinbox(capture_frame, from_=0, to=2000, textvariable=pre_roll_var),
-        "Chroni początek pierwszego słowa.",
+        t("Chroni początek pierwszego słowa.", "Protects the first word's start."),
     )
     add_field(
         capture_frame,
         1,
-        "Bufor po puszczeniu (ms)",
+        t("Bufor po puszczeniu (ms)", "Post-release buffer (ms)"),
         ttk.Spinbox(capture_frame, from_=0, to=2000, textvariable=post_roll_var),
-        "Chroni końcówkę ostatniego słowa.",
+        t("Chroni końcówkę ostatniego słowa.", "Protects the last word's ending."),
     )
     add_field(
         capture_frame,
         2,
-        "Minimalne nagranie (ms)",
+        t("Minimalne nagranie (ms)", "Minimum recording (ms)"),
         ttk.Spinbox(
             capture_frame,
             from_=0,
@@ -2328,19 +2954,30 @@ def run_settings_window() -> int:
     add_field(
         capture_frame,
         3,
-        "Minimalny poziom dźwięku",
+        t("Minimalny poziom dźwięku", "Minimum audio level"),
         ttk.Entry(capture_frame, textvariable=minimum_rms_var),
-        "Niższa wartość zwiększa czułość na cichy głos.",
+        t(
+            "Niższa wartość zwiększa czułość na cichy głos.",
+            "A lower value increases sensitivity to quiet speech.",
+        ),
     )
 
     vad_frame = ttk.LabelFrame(
-        audio_tab, text="Wykrywanie ciszy — ustawienia zaawansowane", padding=14
+        audio_tab,
+        text=t(
+            "Wykrywanie ciszy — ustawienia zaawansowane",
+            "Silence detection — advanced settings",
+        ),
+        padding=16,
     )
     vad_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
     vad_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         vad_frame,
-        text="Automatycznie pomijaj ciszę i dźwięki bez wyraźnej mowy",
+        text=t(
+            "Automatycznie pomijaj ciszę i dźwięki bez wyraźnej mowy",
+            "Automatically skip silence and audio without clear speech",
+        ),
         variable=vad_enabled_var,
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
     vad_controls: list[ttk.Widget] = []
@@ -2349,9 +2986,12 @@ def run_settings_window() -> int:
     add_field(
         vad_frame,
         1,
-        "Czułość wykrywania",
+        t("Czułość wykrywania", "Detection sensitivity"),
         vad_threshold_entry,
-        "Zakres 0–1; wyższa wartość mocniej odrzuca szum.",
+        t(
+            "Zakres 0–1; wyższa wartość mocniej odrzuca szum.",
+            "Range 0–1; a higher value rejects more noise.",
+        ),
     )
     vad_speech_spin = ttk.Spinbox(
         vad_frame, from_=0, to=10000, textvariable=vad_min_speech_var
@@ -2360,7 +3000,7 @@ def run_settings_window() -> int:
     add_field(
         vad_frame,
         2,
-        "Minimalna długość mowy (ms)",
+        t("Minimalna długość mowy (ms)", "Minimum speech length (ms)"),
         vad_speech_spin,
     )
     vad_silence_spin = ttk.Spinbox(
@@ -2370,7 +3010,7 @@ def run_settings_window() -> int:
     add_field(
         vad_frame,
         3,
-        "Minimalna długość ciszy (ms)",
+        t("Minimalna długość ciszy (ms)", "Minimum silence length (ms)"),
         vad_silence_spin,
     )
     vad_pad_spin = ttk.Spinbox(
@@ -2380,7 +3020,7 @@ def run_settings_window() -> int:
     add_field(
         vad_frame,
         4,
-        "Margines mowy (ms)",
+        t("Margines mowy (ms)", "Speech padding (ms)"),
         vad_pad_spin,
     )
 
@@ -2392,28 +3032,44 @@ def run_settings_window() -> int:
     vad_enabled_var.trace_add("write", sync_vad_controls)
     sync_vad_controls()
 
-    text_frame = ttk.LabelFrame(text_tab, text="Miejsce docelowe i format", padding=14)
+    text_frame = ttk.LabelFrame(
+        text_tab,
+        text=t("Miejsce docelowe i format", "Destination and formatting"),
+        padding=16,
+    )
     text_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     text_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         text_frame,
-        text="Automatycznie wklejaj tekst do aktywnego okna",
+        text=t(
+            "Automatycznie wklejaj tekst do aktywnego okna",
+            "Automatically paste text into the active window",
+        ),
         variable=paste_enabled_var,
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=4)
     ttk.Checkbutton(
         text_frame,
-        text="Kopiuj rozpoznany tekst również do schowka",
+        text=t(
+            "Kopiuj rozpoznany tekst również do schowka",
+            "Also copy recognized text to the clipboard",
+        ),
         variable=copy_to_clipboard_var,
     ).grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
     append_space_check = ttk.Checkbutton(
         text_frame,
-        text="Dodawaj spację po wklejonym zdaniu",
+        text=t(
+            "Dodawaj spację po wklejonym zdaniu",
+            "Add a space after the pasted sentence",
+        ),
         variable=append_space_var,
     )
     append_space_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
     ttk.Checkbutton(
         text_frame,
-        text="Rozpoznawaj komendy „nowa linia” i „nowy akapit”",
+        text=t(
+            "Rozpoznawaj komendy akapitu (PL: „nowa linia”, „nowy akapit”; EN: „new line”, „new paragraph”)",
+            "Recognize paragraph commands (EN: “new line”, “new paragraph”; PL: “nowa linia”, “nowy akapit”)",
+        ),
         variable=voice_commands_var,
     ).grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
     paste_delay_spin = ttk.Spinbox(
@@ -2422,15 +3078,20 @@ def run_settings_window() -> int:
     add_field(
         text_frame,
         4,
-        "Opóźnienie wklejania (ms)",
+        t("Opóźnienie wklejania (ms)", "Paste delay (ms)"),
         paste_delay_spin,
-        "Zwiększ tylko wtedy, gdy aplikacja docelowa pomija tekst.",
+        t(
+            "Zwiększ tylko wtedy, gdy aplikacja docelowa pomija tekst.",
+            "Increase only if the target application misses the pasted text.",
+        ),
     )
     ttk.Label(
         text_frame,
-        text=(
+        text=t(
             "Gdy schowek jest włączony, pozostaje w nim dokładna transkrypcja "
-            "bez automatycznie dodanej spacji."
+            "bez automatycznie dodanej spacji.",
+            "When clipboard copying is enabled, it keeps the exact transcript "
+            "without the automatically appended space.",
         ),
         style="Muted.TLabel",
         wraplength=760,
@@ -2445,19 +3106,27 @@ def run_settings_window() -> int:
     sync_paste_controls()
 
     dictionary_frame = ttk.LabelFrame(
-        text_tab, text="Prywatny słownik nazw i terminów", padding=14
+        text_tab,
+        text=t(
+            "Prywatny słownik nazw i terminów",
+            "Private dictionary of names and terms",
+        ),
+        padding=16,
     )
     dictionary_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
     dictionary_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         dictionary_frame,
-        text="Podpowiadaj modelowi zapis własnych nazw, marek i skrótów",
+        text=t(
+            "Podpowiadaj modelowi zapis własnych nazw, marek i skrótów",
+            "Suggest preferred spellings of names, brands, and abbreviations",
+        ),
         variable=dictionary_enabled_var,
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=4)
     add_field(
         dictionary_frame,
         1,
-        "Maksymalna liczba haseł",
+        t("Maksymalna liczba haseł", "Maximum number of entries"),
         ttk.Spinbox(
             dictionary_frame,
             from_=0,
@@ -2470,29 +3139,45 @@ def run_settings_window() -> int:
         try:
             os.startfile(path)  # type: ignore[attr-defined]
         except Exception as exc:
-            messagebox.showerror(APP_DISPLAY_NAME, f"Nie udało się otworzyć:\n{path}\n\n{exc}")
+            messagebox.showerror(
+                APP_DISPLAY_NAME,
+                t(
+                    "Nie udało się otworzyć:\n{path}\n\n{error}",
+                    "Could not open:\n{path}\n\n{error}",
+                    path=path,
+                    error=exc,
+                ),
+                parent=root,
+            )
 
     ttk.Button(
         dictionary_frame,
-        text="Edytuj słownik…",
+        text=t("Edytuj słownik…", "Edit dictionary…"),
         command=lambda: open_path(DICTIONARY_PATH),
     ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
     feedback_frame = ttk.LabelFrame(
-        sounds_tab, text="Informacje zwrotne", padding=14
+        sounds_tab,
+        text=t("Informacje zwrotne", "Feedback"),
+        padding=16,
     )
     feedback_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     ttk.Checkbutton(
-        feedback_frame, text="Sygnały dźwiękowe", variable=sounds_var
+        feedback_frame,
+        text=t("Sygnały dźwiękowe", "Sound cues"),
+        variable=sounds_var,
     ).grid(row=0, column=0, sticky="w", padx=(0, 25), pady=4)
     ttk.Checkbutton(
         feedback_frame,
-        text="Powiadomienia Windows",
+        text=t("Powiadomienia Windows", "Windows notifications"),
         variable=notifications_var,
     ).grid(row=0, column=1, sticky="w", pady=4)
     loop_sound_check = ttk.Checkbutton(
         feedback_frame,
-        text="Zapętlaj własny dźwięk nagrywania podczas trzymania przycisku",
+        text=t(
+            "Zapętlaj własny dźwięk nagrywania podczas trzymania przycisku",
+            "Loop the custom recording sound while the shortcut is held",
+        ),
         variable=loop_recording_sound_var,
     )
     loop_sound_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
@@ -2504,37 +3189,62 @@ def run_settings_window() -> int:
     sync_sound_controls()
 
     sound_labels = {
-        "start": "Naciśnięcie / trzymanie",
-        "stop": "Puszczenie przycisku",
-        "done": "Tekst gotowy",
-        "error": "Błąd lub brak mowy",
+        "start": t("Naciśnięcie / trzymanie", "Press / hold"),
+        "stop": t("Puszczenie przycisku", "Release"),
+        "done": t("Tekst gotowy", "Text ready"),
+        "error": t("Błąd lub brak mowy", "Error or no speech"),
     }
+
     def choose_sound(kind: str) -> None:
         current = resolve_sound_path(sound_path_vars[kind].get())
         initial_dir = str(current.parent) if current is not None else str(Path.home())
         selected = filedialog.askopenfilename(
             parent=root,
-            title=f"Wybierz dźwięk: {sound_labels[kind]}",
+            title=t(
+                "Wybierz dźwięk: {sound}",
+                "Choose sound: {sound}",
+                sound=sound_labels[kind],
+            ),
             initialdir=initial_dir,
-            filetypes=(("Dźwięk WAV", "*.wav"), ("Wszystkie pliki", "*.*")),
+            filetypes=(
+                (t("Dźwięk WAV", "WAV audio"), "*.wav"),
+                (t("Wszystkie pliki", "All files"), "*.*"),
+            ),
         )
         if not selected:
             return
         try:
-            validate_wave_file(Path(selected))
-        except AppError as exc:
-            messagebox.showerror(APP_DISPLAY_NAME, str(exc), parent=root)
+            validate_wave_file(Path(selected), translator)
+        except AppError:
+            messagebox.showerror(
+                APP_DISPLAY_NAME,
+                t(
+                    "Nie można użyć wybranego pliku. Wybierz prawidłowy plik WAV "
+                    "mniejszy niż 50 MB.",
+                    "The selected file cannot be used. Choose a valid WAV file "
+                    "smaller than 50 MB.",
+                ),
+                parent=root,
+            )
             return
         sound_path_vars[kind].set(selected)
-        status_var.set(
-            f"Wybrano dźwięk „{Path(selected).name}”. Zapis skopiuje go do folderu Mówika."
+        set_status(
+            t(
+                "Wybrano dźwięk „{name}”. Zapis skopiuje go do folderu Mówika.",
+                "Selected “{name}”. Saving will copy it to the Mówik folder.",
+                name=Path(selected).name,
+            ),
+            "warning",
         )
 
     def preview_sound(kind: str) -> None:
         if os.name != "nt":
             messagebox.showerror(
                 APP_DISPLAY_NAME,
-                "Odsłuch jest dostępny na Windowsie.",
+                t(
+                    "Odsłuch jest dostępny na Windowsie.",
+                    "Sound preview is available on Windows.",
+                ),
                 parent=root,
             )
             return
@@ -2543,7 +3253,7 @@ def run_settings_window() -> int:
 
             path = resolve_sound_path(sound_path_vars[kind].get())
             if path is not None:
-                validate_wave_file(path)
+                validate_wave_file(path, translator)
                 winsound.PlaySound(
                     str(path),
                     winsound.SND_FILENAME
@@ -2555,22 +3265,28 @@ def run_settings_window() -> int:
         except Exception as exc:
             messagebox.showerror(
                 APP_DISPLAY_NAME,
-                f"Nie udało się odtworzyć dźwięku:\n\n{exc}",
+                t(
+                    "Nie udało się odtworzyć dźwięku:\n\n{error}",
+                    "Could not play the sound:\n\n{error}",
+                    error=exc,
+                ),
                 parent=root,
             )
 
     custom_sound_frame = ttk.LabelFrame(
         sounds_tab,
-        text="Własne dźwięki WAV",
-        padding=14,
+        text=t("Własne dźwięki WAV", "Custom WAV sounds"),
+        padding=16,
     )
     custom_sound_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
     custom_sound_frame.columnconfigure(0, weight=1)
     ttk.Label(
         custom_sound_frame,
-        text=(
+        text=t(
             "Pozostaw puste, aby używać krótkiego sygnału wbudowanego. "
-            "Wybrany plik zostanie skopiowany do %APPDATA%\\Mowik\\sounds."
+            "Wybrany plik zostanie skopiowany do %APPDATA%\\Mowik\\sounds.",
+            "Leave empty to use the short built-in cue. The selected file is "
+            "copied to %APPDATA%\\Mowik\\sounds.",
         ),
         style="Muted.TLabel",
         wraplength=760,
@@ -2596,17 +3312,17 @@ def run_settings_window() -> int:
         buttons.grid(row=1, column=1, sticky="e", padx=(8, 0))
         ttk.Button(
             buttons,
-            text="Wybierz…",
+            text=t("Wybierz…", "Choose…"),
             command=lambda selected_kind=kind: choose_sound(selected_kind),
         ).grid(row=0, column=0, padx=(0, 4))
         ttk.Button(
             buttons,
-            text="Odsłuch",
+            text=t("Odsłuch", "Preview"),
             command=lambda selected_kind=kind: preview_sound(selected_kind),
         ).grid(row=0, column=1, padx=4)
         ttk.Button(
             buttons,
-            text="Wbudowany",
+            text=t("Wbudowany", "Built-in"),
             command=lambda selected_kind=kind: sound_path_vars[selected_kind].set(""),
         ).grid(row=0, column=2, padx=(4, 0))
 
@@ -2614,14 +3330,14 @@ def run_settings_window() -> int:
     sounds_footer.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
     ttk.Button(
         sounds_footer,
-        text="Otwórz folder dźwięków",
+        text=t("Otwórz folder dźwięków", "Open sounds folder"),
         command=lambda: open_path(SOUNDS_DIR),
     ).grid(row=0, column=0)
 
     ollama_intro = tk.Frame(
         ollama_tab,
         background=colors["primary_soft"],
-        highlightbackground="#C9D9FF",
+        highlightbackground=colors["primary_border"],
         highlightthickness=1,
         padx=18,
         pady=14,
@@ -2629,48 +3345,58 @@ def run_settings_window() -> int:
     ollama_intro.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     tk.Label(
         ollama_intro,
-        text="Funkcja opcjonalna",
+        text=t("Funkcja opcjonalna", "Optional feature"),
         background=colors["primary_soft"],
         foreground=colors["primary"],
-        font=("Segoe UI", 9, "bold"),
+        font=(ui_font_family, 9, "bold"),
     ).pack(anchor="w")
     tk.Label(
         ollama_intro,
-        text=(
+        text=t(
             "Mówik rozpoznaje mowę bez Ollamy. Lokalny model językowy może "
-            "jedynie poprawić interpunkcję i oczywiste literówki."
+            "jedynie poprawić interpunkcję i oczywiste literówki.",
+            "Mówik recognizes speech without Ollama. A local language model "
+            "can only improve punctuation and obvious spelling mistakes.",
         ),
         background=colors["primary_soft"],
         foreground=colors["muted"],
-        font=("Segoe UI", 9),
+        font=(ui_font_family, 9),
         justify="left",
         wraplength=720,
     ).pack(anchor="w", pady=(4, 0))
 
     ollama_frame = ttk.LabelFrame(
-        ollama_tab, text="Lokalna korekta tekstu", padding=14
+        ollama_tab,
+        text=t("Lokalna korekta tekstu", "Local text correction"),
+        padding=16,
     )
     ollama_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
     ollama_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         ollama_frame,
-        text="Włącz lokalną korektę przez Ollamę",
+        text=t(
+            "Włącz lokalną korektę przez Ollamę",
+            "Enable local correction with Ollama",
+        ),
         variable=ollama_enabled_var,
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 7))
     ollama_url_entry = ttk.Entry(ollama_frame, textvariable=ollama_url_var)
     add_field(
         ollama_frame,
         1,
-        "Adres Ollamy",
+        t("Adres Ollamy", "Ollama address"),
         ollama_url_entry,
     )
     ollama_model_entry = ttk.Entry(ollama_frame, textvariable=ollama_model_var)
     add_field(
         ollama_frame,
         2,
-        "Nazwa modelu",
+        t("Nazwa modelu", "Model name"),
         ollama_model_entry,
-        "Wpisz nazwę modelu pobranego wcześniej w Ollamie.",
+        t(
+            "Wpisz nazwę modelu pobranego wcześniej w Ollamie.",
+            "Enter the name of a model already downloaded in Ollama.",
+        ),
     )
     ollama_timeout_spin = ttk.Spinbox(
         ollama_frame, from_=1, to=600, textvariable=ollama_timeout_var
@@ -2678,14 +3404,16 @@ def run_settings_window() -> int:
     add_field(
         ollama_frame,
         3,
-        "Limit czasu (s)",
+        t("Limit czasu (s)", "Timeout (s)"),
         ollama_timeout_spin,
     )
     ttk.Label(
         ollama_frame,
-        text=(
+        text=t(
             "Włączenie korektora wydłuży oczekiwanie. Mówik odrzuca korektę, "
-            "jeżeli za mocno zmienia tekst, liczby lub negacje."
+            "jeżeli za mocno zmienia tekst, liczby lub negacje.",
+            "Enabling correction increases processing time. Mówik rejects a "
+            "correction if it changes the text, numbers, or negations too much.",
         ),
         style="Muted.TLabel",
         wraplength=720,
@@ -2709,7 +3437,7 @@ def run_settings_window() -> int:
     diagnostics_intro = tk.Frame(
         files_tab,
         background=colors["success_soft"],
-        highlightbackground="#BFE8D5",
+        highlightbackground=colors["success_border"],
         highlightthickness=1,
         padx=18,
         pady=14,
@@ -2717,26 +3445,34 @@ def run_settings_window() -> int:
     diagnostics_intro.grid(row=0, column=0, sticky="ew", pady=(0, 14))
     tk.Label(
         diagnostics_intro,
-        text=f"Mówik {APP_VERSION} · dane pozostają na tym komputerze",
+        text=t(
+            "Mówik {version} · dane pozostają na tym komputerze",
+            "Mówik {version} · data stays on this computer",
+            version=APP_VERSION,
+        ),
         background=colors["success_soft"],
         foreground=colors["success"],
-        font=("Segoe UI", 10, "bold"),
+        font=(ui_font_family, 10, "bold"),
     ).pack(anchor="w")
     tk.Label(
         diagnostics_intro,
-        text=(
+        text=t(
             "Jeżeli coś nie działa, zacznij od logu. Nie zawiera on treści "
-            "dyktowanych zdań."
+            "dyktowanych zdań.",
+            "If something is not working, start with the log. It never contains "
+            "the content of dictated sentences.",
         ),
         background=colors["success_soft"],
-        foreground="#356B57",
-        font=("Segoe UI", 9),
+        foreground=colors["success"],
+        font=(ui_font_family, 9),
         justify="left",
         wraplength=700,
     ).pack(anchor="w", pady=(4, 0))
 
     config_card = ttk.LabelFrame(
-        files_tab, text="Konfiguracja zaawansowana", padding=14
+        files_tab,
+        text=t("Konfiguracja zaawansowana", "Advanced configuration"),
+        padding=16,
     )
     config_card.grid(row=1, column=0, sticky="ew", pady=(0, 14))
     config_card.columnconfigure(0, weight=1)
@@ -2748,11 +3484,15 @@ def run_settings_window() -> int:
     ).grid(row=0, column=0, sticky="ew", pady=(0, 9))
     ttk.Button(
         config_card,
-        text="Otwórz config.json…",
+        text=t("Otwórz config.json…", "Open config.json…"),
         command=lambda: open_path(CONFIG_PATH),
     ).grid(row=1, column=0, sticky="w")
 
-    data_card = ttk.LabelFrame(files_tab, text="Dane, modele i diagnostyka", padding=14)
+    data_card = ttk.LabelFrame(
+        files_tab,
+        text=t("Dane, modele i diagnostyka", "Data, models, and diagnostics"),
+        padding=16,
+    )
     data_card.grid(row=2, column=0, sticky="ew")
     data_card.columnconfigure(0, weight=1)
     ttk.Label(
@@ -2765,12 +3505,12 @@ def run_settings_window() -> int:
     files_buttons.grid(row=1, column=0, sticky="w")
     ttk.Button(
         files_buttons,
-        text="Otwórz folder danych",
+        text=t("Otwórz folder danych", "Open data folder"),
         command=lambda: open_path(LOCALDATA_DIR),
     ).grid(row=0, column=0, padx=(0, 8))
     ttk.Button(
         files_buttons,
-        text="Otwórz log diagnostyczny",
+        text=t("Otwórz log diagnostyczny", "Open diagnostic log"),
         command=lambda: open_path(LOG_PATH),
     ).grid(row=0, column=1)
 
@@ -2780,10 +3520,22 @@ def run_settings_window() -> int:
         try:
             value = int(variable.get().strip())
         except ValueError as exc:
-            raise AppError(f"Pole „{label}” musi być liczbą całkowitą.") from exc
+            raise AppError(
+                t(
+                    "Pole „{label}” musi być liczbą całkowitą.",
+                    "The “{label}” field must be an integer.",
+                    label=label,
+                )
+            ) from exc
         if not minimum <= value <= maximum:
             raise AppError(
-                f"Pole „{label}” musi być w zakresie {minimum}–{maximum}."
+                t(
+                    "Pole „{label}” musi być w zakresie {minimum}–{maximum}.",
+                    "The “{label}” field must be between {minimum} and {maximum}.",
+                    label=label,
+                    minimum=minimum,
+                    maximum=maximum,
+                )
             )
         return value
 
@@ -2793,53 +3545,111 @@ def run_settings_window() -> int:
         try:
             value = float(variable.get().strip().replace(",", "."))
         except ValueError as exc:
-            raise AppError(f"Pole „{label}” musi być liczbą.") from exc
+            raise AppError(
+                t(
+                    "Pole „{label}” musi być liczbą.",
+                    "The “{label}” field must be a number.",
+                    label=label,
+                )
+            ) from exc
         if not minimum <= value <= maximum:
             raise AppError(
-                f"Pole „{label}” musi być w zakresie {minimum}–{maximum}."
+                t(
+                    "Pole „{label}” musi być w zakresie {minimum}–{maximum}.",
+                    "The “{label}” field must be between {minimum} and {maximum}.",
+                    label=label,
+                    minimum=minimum,
+                    maximum=maximum,
+                )
             )
         return value
 
     def collect_config() -> dict[str, Any]:
         updated = load_config()
         trigger = str(trigger_values.get(trigger_var.get(), trigger_var.get()))
-        split_trigger(trigger)
+        try:
+            split_trigger(trigger)
+        except AppError as exc:
+            raise AppError(
+                t(
+                    "Wybierz prawidłowy przycisk dyktowania.",
+                    "Choose a valid dictation shortcut.",
+                )
+            ) from exc
         model = str(model_values.get(model_var.get(), model_var.get())).strip()
         device = str(device_values.get(device_var.get(), device_var.get())).strip()
         language = str(
             language_values.get(language_var.get(), language_var.get())
         ).strip()
+        ui_language = str(
+            ui_language_values.get(
+                ui_language_var.get(),
+                ui_language_var.get(),
+            )
+        ).strip()
         if not model:
-            raise AppError("Wybierz model mowy.")
+            raise AppError(t("Wybierz model mowy.", "Choose a speech model."))
         if device not in {"auto", "cpu", "cuda"}:
-            raise AppError("Urządzenie musi mieć wartość auto, cpu albo cuda.")
+            raise AppError(
+                t(
+                    "Urządzenie musi mieć wartość auto, cpu albo cuda.",
+                    "The processing device must be auto, cpu, or cuda.",
+                )
+            )
         if not language:
-            raise AppError("Wybierz język dyktowania.")
+            raise AppError(
+                t("Wybierz język dyktowania.", "Choose a dictation language.")
+            )
+        if ui_language not in {"auto", "pl", "en"}:
+            raise AppError(
+                t(
+                    "Wybierz język interfejsu.",
+                    "Choose an interface language.",
+                )
+            )
         if microphone_var.get() not in microphone_values:
-            raise AppError("Wybierz mikrofon z listy.")
+            raise AppError(
+                t("Wybierz mikrofon z listy.", "Choose a microphone from the list.")
+            )
 
         updated["trigger"] = trigger
         updated["model"] = model
         updated["device"] = device
         updated["language"] = language
+        updated["ui_language"] = ui_language
         updated["microphone"] = microphone_values[microphone_var.get()]
         updated["cpu_threads"] = parse_int(
-            cpu_threads_var, "Wątki CPU", 0, 256
+            cpu_threads_var, t("Wątki CPU", "CPU threads"), 0, 256
         )
         updated["beam_size"] = parse_int(
-            beam_size_var, "Dokładność rozpoznawania", 1, 10
+            beam_size_var,
+            t("Dokładność rozpoznawania", "Recognition accuracy"),
+            1,
+            10,
         )
         updated["pre_roll_ms"] = parse_int(
-            pre_roll_var, "Bufor przed naciśnięciem", 0, 2000
+            pre_roll_var,
+            t("Bufor przed naciśnięciem", "Pre-roll buffer"),
+            0,
+            2000,
         )
         updated["post_roll_ms"] = parse_int(
-            post_roll_var, "Bufor po puszczeniu", 0, 2000
+            post_roll_var,
+            t("Bufor po puszczeniu", "Post-release buffer"),
+            0,
+            2000,
         )
         updated["minimum_recording_ms"] = parse_int(
-            minimum_recording_var, "Minimalne nagranie", 0, 10000
+            minimum_recording_var,
+            t("Minimalne nagranie", "Minimum recording"),
+            0,
+            10000,
         )
         updated["minimum_rms"] = parse_float(
-            minimum_rms_var, "Minimalna głośność RMS", 0.0, 1.0
+            minimum_rms_var,
+            t("Minimalna głośność RMS", "Minimum RMS level"),
+            0.0,
+            1.0,
         )
 
         updated.setdefault("vad", {})
@@ -2847,16 +3657,28 @@ def run_settings_window() -> int:
             {
                 "enabled": bool(vad_enabled_var.get()),
                 "threshold": parse_float(
-                    vad_threshold_var, "Próg VAD", 0.0, 1.0
+                    vad_threshold_var,
+                    t("Próg VAD", "VAD threshold"),
+                    0.0,
+                    1.0,
                 ),
                 "min_speech_duration_ms": parse_int(
-                    vad_min_speech_var, "Minimalna mowa", 0, 10000
+                    vad_min_speech_var,
+                    t("Minimalna mowa", "Minimum speech"),
+                    0,
+                    10000,
                 ),
                 "min_silence_duration_ms": parse_int(
-                    vad_min_silence_var, "Minimalna cisza", 0, 10000
+                    vad_min_silence_var,
+                    t("Minimalna cisza", "Minimum silence"),
+                    0,
+                    10000,
                 ),
                 "speech_pad_ms": parse_int(
-                    vad_speech_pad_var, "Margines mowy", 0, 3000
+                    vad_speech_pad_var,
+                    t("Margines mowy", "Speech padding"),
+                    0,
+                    3000,
                 ),
             }
         )
@@ -2865,7 +3687,10 @@ def run_settings_window() -> int:
             {
                 "enabled": bool(dictionary_enabled_var.get()),
                 "max_terms": parse_int(
-                    dictionary_max_terms_var, "Maksymalna liczba haseł", 0, 5000
+                    dictionary_max_terms_var,
+                    t("Maksymalna liczba haseł", "Maximum number of entries"),
+                    0,
+                    5000,
                 ),
             }
         )
@@ -2874,7 +3699,10 @@ def run_settings_window() -> int:
         copy_to_clipboard = bool(copy_to_clipboard_var.get())
         if not paste_enabled and not copy_to_clipboard:
             raise AppError(
-                "Włącz automatyczne wklejanie albo kopiowanie do schowka."
+                t(
+                    "Włącz automatyczne wklejanie albo kopiowanie do schowka.",
+                    "Enable automatic pasting or copying to the clipboard.",
+                )
             )
         updated["paste"].update(
             {
@@ -2882,7 +3710,10 @@ def run_settings_window() -> int:
                 "copy_to_clipboard": copy_to_clipboard,
                 "append_space": bool(append_space_var.get()),
                 "delay_ms": parse_int(
-                    paste_delay_var, "Opóźnienie przed Ctrl+V", 0, 5000
+                    paste_delay_var,
+                    t("Opóźnienie przed Ctrl+V", "Delay before Ctrl+V"),
+                    0,
+                    5000,
                 ),
             }
         )
@@ -2903,7 +3734,10 @@ def run_settings_window() -> int:
                 "url": ollama_url_var.get().strip() or "http://127.0.0.1:11434",
                 "model": ollama_model_var.get().strip(),
                 "timeout_seconds": parse_int(
-                    ollama_timeout_var, "Limit czasu Ollamy", 1, 600
+                    ollama_timeout_var,
+                    t("Limit czasu Ollamy", "Ollama timeout"),
+                    1,
+                    600,
                 ),
             }
         )
@@ -2911,10 +3745,17 @@ def run_settings_window() -> int:
             "ollama_cleanup"
         ]["model"]:
             raise AppError(
-                "Korekta Ollama jest włączona, ale pole „Nazwa modelu” jest puste."
+                t(
+                    "Korekta Ollama jest włączona, ale pole „Nazwa modelu” jest puste.",
+                    "Ollama correction is enabled, but the “Model name” field is empty.",
+                )
             )
         updated["feedback"]["custom_sounds"] = {
-            kind: import_custom_sound(kind, sound_path_vars[kind].get())
+            kind: import_custom_sound(
+                kind,
+                sound_path_vars[kind].get(),
+                translator,
+            )
             for kind in ("start", "stop", "done", "error")
         }
         return updated
@@ -2924,6 +3765,7 @@ def run_settings_window() -> int:
         model_var,
         device_var,
         language_var,
+        ui_language_var,
         cpu_threads_var,
         beam_size_var,
         microphone_var,
@@ -2962,7 +3804,7 @@ def run_settings_window() -> int:
         text="●",
         background=colors["surface"],
         foreground=colors["success"],
-        font=("Segoe UI", 10, "bold"),
+        font=(ui_font_family, 10, "bold"),
     )
     status_dot.grid(row=0, column=0, sticky="w")
     ttk.Label(
@@ -2974,11 +3816,10 @@ def run_settings_window() -> int:
     footer.columnconfigure(1, weight=1)
 
     def update_status_indicator(*args) -> None:
-        status = status_var.get().casefold()
-        if "błąd" in status:
+        if status_level["value"] == "error":
             color = colors["danger"]
-        elif dirty_state["dirty"]:
-            color = "#C56A10"
+        elif dirty_state["dirty"] or status_level["value"] == "warning":
+            color = colors["warning"]
         else:
             color = colors["success"]
         status_dot.configure(foreground=color)
@@ -2988,9 +3829,20 @@ def run_settings_window() -> int:
         was_dirty = bool(dirty_state["dirty"])
         dirty_state["dirty"] = current != dirty_state["baseline"]
         if dirty_state["dirty"] and not was_dirty:
-            status_var.set("Masz niezapisane zmiany.")
+            set_status(
+                t("Masz niezapisane zmiany.", "You have unsaved changes."),
+                "warning",
+            )
         elif not dirty_state["dirty"] and was_dirty:
-            status_var.set("Wszystko gotowe — ustawienia są zapisane.")
+            set_status(
+                t(
+                    "Wszystko gotowe — ustawienia są zapisane.",
+                    "Everything is ready — settings are saved.",
+                )
+            )
+        apply_button.configure(
+            state="normal" if dirty_state["dirty"] else "disabled"
+        )
         update_status_indicator()
 
     for variable in tracked_variables:
@@ -3007,18 +3859,38 @@ def run_settings_window() -> int:
                 variable.get() for variable in tracked_variables
             )
             dirty_state["dirty"] = False
+            apply_button.configure(state="disabled")
             if apply_now:
                 request_app_restart()
-                status_var.set("Zapisano — Mówik stosuje zmiany…")
+                set_status(
+                    t(
+                        "Zapisano — Mówik stosuje zmiany…",
+                        "Saved — Mówik is applying changes…",
+                    )
+                )
                 root.after(180, root.destroy)
             else:
-                status_var.set(
-                    "Zapisano. Zmiany zaczną działać po ponownym uruchomieniu Mówika."
+                set_status(
+                    t(
+                        "Zapisano. Zmiany zaczną działać po ponownym uruchomieniu Mówika.",
+                        "Saved. Changes take effect after Mówik is restarted.",
+                    )
                 )
         except Exception as exc:
             logging.exception("Nie udało się zapisać ustawień")
+            set_status(
+                t(
+                    "Błąd zapisywania ustawień.",
+                    "Could not save settings.",
+                ),
+                "error",
+            )
             messagebox.showerror(
-                f"{APP_DISPLAY_NAME} — błąd ustawień",
+                t(
+                    "{app} — błąd ustawień",
+                    "{app} — Settings error",
+                    app=APP_DISPLAY_NAME,
+                ),
                 str(exc),
                 parent=root,
             )
@@ -3029,6 +3901,12 @@ def run_settings_window() -> int:
         device_var.set(display_for_value(device_values, DEFAULT_CONFIG["device"]))
         language_var.set(
             display_for_value(language_values, DEFAULT_CONFIG["language"])
+        )
+        ui_language_var.set(
+            display_for_value(
+                ui_language_values,
+                DEFAULT_CONFIG["ui_language"],
+            )
         )
         cpu_threads_var.set(str(DEFAULT_CONFIG["cpu_threads"]))
         beam_size_var.set(str(DEFAULT_CONFIG["beam_size"]))
@@ -3066,12 +3944,26 @@ def run_settings_window() -> int:
         ollama_model_var.set(str(default_ollama["model"]))
         ollama_timeout_var.set(str(default_ollama["timeout_seconds"]))
         dirty_state["dirty"] = True
-        status_var.set("Przywrócono wartości domyślne. Zastosuj, aby je zapisać.")
+        apply_button.configure(state="normal")
+        set_status(
+            t(
+                "Przywrócono wartości domyślne. Zastosuj, aby je zapisać.",
+                "Defaults restored. Apply changes to save them.",
+            ),
+            "warning",
+        )
 
     def close_window() -> None:
         if dirty_state["dirty"] and not messagebox.askyesno(
-            f"{APP_DISPLAY_NAME} — niezapisane zmiany",
-            "Zamknąć okno i odrzucić niezapisane zmiany?",
+            t(
+                "{app} — niezapisane zmiany",
+                "{app} — Unsaved changes",
+                app=APP_DISPLAY_NAME,
+            ),
+            t(
+                "Zamknąć okno i odrzucić niezapisane zmiany?",
+                "Close the window and discard unsaved changes?",
+            ),
             parent=root,
         ):
             return
@@ -3079,24 +3971,34 @@ def run_settings_window() -> int:
 
     ttk.Button(
         footer,
-        text="Przywróć domyślne",
+        text=t("Przywróć domyślne", "Restore defaults"),
         command=restore_defaults,
     ).grid(row=0, column=2, padx=4)
-    ttk.Button(footer, text="Zamknij", command=close_window).grid(
-        row=0, column=3, padx=4
-    )
     ttk.Button(
         footer,
-        text="Zastosuj zmiany",
+        text=t("Zamknij", "Close"),
+        command=close_window,
+    ).grid(
+        row=0, column=3, padx=4
+    )
+    apply_button = ttk.Button(
+        footer,
+        text=t("Zastosuj zmiany", "Apply changes"),
         style="Primary.TButton",
         command=lambda: save_from_window(True),
-    ).grid(row=0, column=4, padx=(4, 0))
+        state="disabled",
+    )
+    apply_button.grid(row=0, column=4, padx=(4, 0))
 
     root.bind("<Control-s>", lambda event: save_from_window(False))
-    root.bind("<Control-Return>", lambda event: save_from_window(True))
+    root.bind(
+        "<Control-Return>",
+        lambda event: save_from_window(True) if dirty_state["dirty"] else None,
+    )
     root.bind("<Escape>", lambda event: close_window())
     root.protocol("WM_DELETE_WINDOW", close_window)
     show_page("start")
+    refresh_dirty_state()
     update_status_indicator()
     root.mainloop()
     return 0
@@ -3179,7 +4081,13 @@ class ContinuousRecorder:
                     exc,
                 )
 
-        raise AppError(f"Nie udało się otworzyć mikrofonu: {last_error}")
+        raise AppError(
+            Translator.from_config(self.config).t(
+                "Nie udało się otworzyć mikrofonu: {error}",
+                "Could not open the microphone: {error}",
+                error=last_error,
+            )
+        )
 
     def close(self) -> None:
         stream = self._stream
@@ -3238,7 +4146,11 @@ class ContinuousRecorder:
 class MowikApp:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
-        self.trigger_type, self.trigger_name = split_trigger(str(config["trigger"]))
+        self.translator = Translator.from_config(config)
+        self.trigger_type, self.trigger_name = split_trigger(
+            str(config["trigger"]),
+            self.translator,
+        )
         self.stop_event = threading.Event()
         self.model_ready = threading.Event()
         self.busy_lock = threading.Lock()
@@ -3254,7 +4166,7 @@ class MowikApp:
         self.mouse_listener: Optional[mouse.Listener] = None
         self.jobs: queue.Queue[Optional[np.ndarray]] = queue.Queue()
         self.tray: Optional[pystray.Icon] = None
-        self.status = "Start…"
+        self.status = self.translator.t("Uruchamianie…", "Starting…")
         self.tray_state = "idle"
         self._status_lock = threading.Lock()
         self._restart_lock = threading.Lock()
@@ -3265,6 +4177,16 @@ class MowikApp:
         self.control_worker = threading.Thread(
             target=self._control_watcher, name="ControlWatcher", daemon=True
         )
+
+    def _error_notification(self) -> str:
+        return self.translator.t(
+            "Szczegóły zapisano w logu: {path}",
+            "Details were saved to the log: {path}",
+            path=LOG_PATH,
+        )
+
+    def _model_status(self, status: str) -> None:
+        self.set_status(status, state="processing")
 
     def start(self) -> None:
         self.worker.start()
@@ -3284,7 +4206,13 @@ class MowikApp:
                 ).strip()
                 RESTART_REQUEST_PATH.unlink(missing_ok=True)
                 logging.info("Odebrano prośbę o restart ustawień: %s", request_text)
-                self.set_status("Stosuję nowe ustawienia…")
+                self.set_status(
+                    self.translator.t(
+                        "Stosuję nowe ustawienia…",
+                        "Applying new settings…",
+                    ),
+                    state="processing",
+                )
                 self.restart()
                 return
             except Exception:
@@ -3305,26 +4233,53 @@ class MowikApp:
 
     def _load_runtime(self) -> None:
         try:
-            self.set_status("Przygotowuję mikrofon…")
+            self.set_status(
+                self.translator.t(
+                    "Przygotowuję mikrofon…",
+                    "Preparing the microphone…",
+                ),
+                state="processing",
+            )
             recorder = ContinuousRecorder(self.config)
             recorder.start()
             self.recorder = recorder
-            model, model_name, device = create_model(self.config, self.set_status)
+            model, model_name, device = create_model(
+                self.config,
+                self._model_status,
+            )
             self.model = model
             self.model_name = model_name
             self.model_device = device
             self.model_ready.set()
-            trigger_label = trigger_display_name(str(self.config["trigger"]))
+            trigger_label = trigger_display_name(
+                str(self.config["trigger"]),
+                self.translator,
+            )
             self.set_status(
-                f"Gotowy — {trigger_label}",
-                notify=(
-                    f"Model {model_name} działa na {device}. "
-                    f"Trzymaj {trigger_label} i mów."
+                self.translator.t(
+                    "Gotowy — {trigger_label}",
+                    "Ready — {trigger_label}",
+                    trigger_label=trigger_label,
                 ),
+                notify=self.translator.t(
+                    "Model {model_name} działa na {device}. "
+                    "Trzymaj {trigger_label} i mów.",
+                    "Model {model_name} is running on {device}. "
+                    "Hold {trigger_label} and speak.",
+                    model_name=model_name,
+                    device=device,
+                    trigger_label=trigger_label,
+                ),
+                state="ready",
             )
         except Exception as exc:
             logging.exception("Błąd inicjalizacji")
-            self.set_status("Błąd uruchomienia", notify=str(exc), error=True)
+            self.set_status(
+                self.translator.t("Błąd uruchomienia", "Startup error"),
+                notify=self._error_notification(),
+                error=True,
+                state="error",
+            )
 
     def _on_key_press(self, key) -> None:
         if self.stop_event.is_set() or self.trigger_type != "keyboard":
@@ -3359,12 +4314,24 @@ class MowikApp:
     def begin_dictation(self) -> None:
         if not self.model_ready.is_set() or self.recorder is None:
             self.beep("error")
-            self.set_status("Model jeszcze nie jest gotowy")
+            self.set_status(
+                self.translator.t(
+                    "Model jeszcze nie jest gotowy",
+                    "The model is not ready yet",
+                ),
+                state="idle",
+            )
             return
         with self.busy_lock:
             if self.busy:
                 self.beep("error")
-                self.set_status("Kończę poprzednią transkrypcję…")
+                self.set_status(
+                    self.translator.t(
+                        "Kończę poprzednią transkrypcję…",
+                        "Finishing the previous transcription…",
+                    ),
+                    state="processing",
+                )
                 return
             self.busy = True
         try:
@@ -3373,11 +4340,19 @@ class MowikApp:
         except Exception as exc:
             self._release_busy()
             logging.exception("Nie udało się rozpocząć nagrywania")
-            self.set_status("Błąd nagrywania", notify=str(exc), error=True)
+            self.set_status(
+                self.translator.t("Błąd nagrywania", "Recording error"),
+                notify=self._error_notification(),
+                error=True,
+                state="error",
+            )
             self.beep("error")
             return
         self.beep("start")
-        self.set_status("Nagrywanie…")
+        self.set_status(
+            self.translator.t("Nagrywanie…", "Recording…"),
+            state="recording",
+        )
 
     def end_dictation(self) -> None:
         if not self.capture_active:
@@ -3398,7 +4373,12 @@ class MowikApp:
         except Exception as exc:
             logging.exception("Nie udało się zakończyć nagrywania")
             self._release_busy()
-            self.set_status("Błąd nagrywania", notify=str(exc), error=True)
+            self.set_status(
+                self.translator.t("Błąd nagrywania", "Recording error"),
+                notify=self._error_notification(),
+                error=True,
+                state="error",
+            )
             self.beep("error")
 
     def _finish_dictation_after_tail(self) -> None:
@@ -3420,10 +4400,19 @@ class MowikApp:
             / 1000
         )
         if len(audio) < minimum_samples:
-            self.set_status("Nagranie było zbyt krótkie")
+            self.set_status(
+                self.translator.t(
+                    "Nagranie było zbyt krótkie",
+                    "The recording was too short",
+                ),
+                state="ready",
+            )
             self._release_busy()
             return
-        self.set_status("Rozpoznaję mowę…")
+        self.set_status(
+            self.translator.t("Rozpoznaję mowę…", "Transcribing…"),
+            state="processing",
+        )
         self.jobs.put(audio)
 
     def _job_worker(self) -> None:
@@ -3437,7 +4426,13 @@ class MowikApp:
             try:
                 text = self.transcribe(audio)
                 if not text:
-                    self.set_status("Nie wykryłem wyraźnej mowy")
+                    self.set_status(
+                        self.translator.t(
+                            "Nie wykryłem wyraźnej mowy",
+                            "No clear speech detected",
+                        ),
+                        state="ready",
+                    )
                     self.beep("error")
                     continue
                 paste_settings = self.config.get("paste", {})
@@ -3446,11 +4441,29 @@ class MowikApp:
                     paste_settings.get("copy_to_clipboard", True)
                 )
                 if paste_enabled and copy_enabled:
-                    self.set_status("Wklejam i kopiuję tekst…")
+                    self.set_status(
+                        self.translator.t(
+                            "Wklejam i kopiuję tekst…",
+                            "Pasting and copying text…",
+                        ),
+                        state="processing",
+                    )
                 elif paste_enabled:
-                    self.set_status("Wklejam tekst…")
+                    self.set_status(
+                        self.translator.t(
+                            "Wklejam tekst…",
+                            "Pasting text…",
+                        ),
+                        state="processing",
+                    )
                 else:
-                    self.set_status("Kopiuję tekst do schowka…")
+                    self.set_status(
+                        self.translator.t(
+                            "Kopiuję tekst do schowka…",
+                            "Copying text to the clipboard…",
+                        ),
+                        state="processing",
+                    )
                 paste_text(text, self.config)
                 logging.info(
                     "Dostarczono tekst (%d znaków; wklejanie=%s; schowek=%s)",
@@ -3464,12 +4477,28 @@ class MowikApp:
                         time.perf_counter() - self._release_started_at,
                     )
                 self.set_status(
-                    f"Gotowy — {trigger_display_name(str(self.config['trigger']))}"
+                    self.translator.t(
+                        "Gotowy — {trigger_label}",
+                        "Ready — {trigger_label}",
+                        trigger_label=trigger_display_name(
+                            str(self.config["trigger"]),
+                            self.translator,
+                        ),
+                    ),
+                    state="ready",
                 )
                 self.beep("done")
             except Exception as exc:
                 logging.exception("Błąd przetwarzania dyktowania")
-                self.set_status("Błąd dyktowania", notify=str(exc), error=True)
+                self.set_status(
+                    self.translator.t(
+                        "Błąd dyktowania",
+                        "Dictation error",
+                    ),
+                    notify=self._error_notification(),
+                    error=True,
+                    state="error",
+                )
                 self.beep("error")
             finally:
                 self._release_busy()
@@ -3479,7 +4508,12 @@ class MowikApp:
         pipeline_started = time.perf_counter()
         model = self.model
         if model is None:
-            raise AppError("Model nie jest załadowany.")
+            raise AppError(
+                self.translator.t(
+                    "Model nie jest załadowany.",
+                    "The model is not loaded.",
+                )
+            )
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         if audio.size == 0:
             return ""
@@ -3523,7 +4557,7 @@ class MowikApp:
             "speech_pad_ms": int(vad_settings.get("speech_pad_ms", 180)),
         }
 
-        configured_language = str(self.config.get("language", "pl")).strip()
+        configured_language = str(self.config.get("language", "auto")).strip()
         language: Optional[str] = None if configured_language.lower() == "auto" else configured_language
 
         whisper_started = time.perf_counter()
@@ -3620,12 +4654,20 @@ class MowikApp:
         status: str,
         notify: Optional[str] = None,
         error: bool = False,
+        state: Optional[str] = None,
     ) -> None:
-        tray_state = tray_state_for_status(status, error)
+        tray_state = state or tray_state_for_status(status, error)
+        if tray_state not in {"idle", "ready", "recording", "processing", "error"}:
+            tray_state = "error" if error else "idle"
         with self._status_lock:
             self.status = status
             self.tray_state = tray_state
-        logging.error(status) if error else logging.info(status)
+        log_status = logging.error if error else logging.info
+        log_status(
+            "Stan aplikacji: state=%s status=%s",
+            tray_state,
+            status,
+        )
         tray = self.tray
         if tray is not None:
             try:
@@ -3644,7 +4686,11 @@ class MowikApp:
 
     def tray_status_text(self, item=None) -> str:
         with self._status_lock:
-            return f"Status: {self.status}"
+            return self.translator.t(
+                "Status: {status}",
+                "Status: {status}",
+                status=self.status,
+            )
 
     def open_settings(self, icon=None, item=None) -> None:
         try:
@@ -3654,7 +4700,15 @@ class MowikApp:
             )
         except Exception as exc:
             logging.exception("Nie udało się otworzyć panelu ustawień")
-            self.set_status("Błąd otwierania ustawień", notify=str(exc), error=True)
+            self.set_status(
+                self.translator.t(
+                    "Błąd otwierania ustawień",
+                    "Could not open settings",
+                ),
+                notify=self._error_notification(),
+                error=True,
+                state="error",
+            )
 
     def open_config(self, icon=None, item=None) -> None:
         os.startfile(CONFIG_PATH)  # type: ignore[attr-defined]
@@ -3671,19 +4725,37 @@ class MowikApp:
     def apply_profile(self, profile_name: str) -> None:
         try:
             profile = QUICK_PROFILES[profile_name]
+            profile_display = profile["display"][self.translator.language]
             updated = apply_quick_profile(load_config(), profile_name)
             save_config(updated)
             self.set_status(
-                f"Włączam profil {profile['label']}…",
-                notify=(
-                    f"Profil {profile['label']}: {profile['description']}. "
-                    "Mówik uruchomi się ponownie."
+                self.translator.t(
+                    "Włączam profil {label}…",
+                    "Activating the {label} profile…",
+                    label=profile_display["label"],
                 ),
+                notify=self.translator.t(
+                    "Profil {label}: {description}. "
+                    "Mówik uruchomi się ponownie.",
+                    "{label} profile: {description}. "
+                    "Mówik will restart.",
+                    label=profile_display["label"],
+                    description=profile_display["description"],
+                ),
+                state="processing",
             )
             self.restart()
         except Exception as exc:
             logging.exception("Nie udało się zastosować profilu %s", profile_name)
-            self.set_status("Błąd zmiany profilu", notify=str(exc), error=True)
+            self.set_status(
+                self.translator.t(
+                    "Błąd zmiany profilu",
+                    "Could not change profile",
+                ),
+                notify=self._error_notification(),
+                error=True,
+                state="error",
+            )
 
     def apply_light_profile(self, icon=None, item=None) -> None:
         self.apply_profile("light")
@@ -3736,17 +4808,38 @@ class MowikApp:
             self.tray.stop()
 
     def run_tray(self) -> None:
+        light_display = QUICK_PROFILES["light"]["display"][
+            self.translator.language
+        ]
+        balanced_display = QUICK_PROFILES["balanced"]["display"][
+            self.translator.language
+        ]
+        accurate_display = QUICK_PROFILES["accurate"]["display"][
+            self.translator.language
+        ]
         profiles_menu = pystray.Menu(
             pystray.MenuItem(
-                "Szybki — small / dokładność 1",
+                self.translator.t(
+                    "{label} — small / dokładność 1",
+                    "{label} — small / accuracy 1",
+                    label=light_display["label"],
+                ),
                 self.apply_light_profile,
             ),
             pystray.MenuItem(
-                "Zalecany — Turbo / dokładność 2",
+                self.translator.t(
+                    "{label} — Turbo / dokładność 2",
+                    "{label} — Turbo / accuracy 2",
+                    label=balanced_display["label"],
+                ),
                 self.apply_balanced_profile,
             ),
             pystray.MenuItem(
-                "Najdokładniejszy — large-v3 / dokładność 5",
+                self.translator.t(
+                    "{label} — large-v3 / dokładność 5",
+                    "{label} — large-v3 / accuracy 5",
+                    label=accurate_display["label"],
+                ),
                 self.apply_accurate_profile,
             ),
         )
@@ -3754,32 +4847,59 @@ class MowikApp:
             pystray.MenuItem(self.tray_status_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "Panel ustawień…",
+                self.translator.t("Panel ustawień…", "Settings…"),
                 self.open_settings,
                 default=True,
             ),
-            pystray.MenuItem("Szybki profil", profiles_menu),
-            pystray.MenuItem("Otwórz słownik", self.open_dictionary),
-            pystray.MenuItem("Edytuj config.json", self.open_config),
-            pystray.MenuItem("Otwórz log", self.open_log),
-            pystray.MenuItem("Folder konfiguracji", self.open_app_folder),
+            pystray.MenuItem(
+                self.translator.t("Szybki profil", "Quick profile"),
+                profiles_menu,
+            ),
+            pystray.MenuItem(
+                self.translator.t("Otwórz słownik", "Open dictionary"),
+                self.open_dictionary,
+            ),
+            pystray.MenuItem(
+                self.translator.t("Edytuj config.json", "Edit config.json"),
+                self.open_config,
+            ),
+            pystray.MenuItem(
+                self.translator.t("Otwórz log", "Open log"),
+                self.open_log,
+            ),
+            pystray.MenuItem(
+                self.translator.t(
+                    "Folder konfiguracji",
+                    "Configuration folder",
+                ),
+                self.open_app_folder,
+            ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Uruchom ponownie", self.restart),
-            pystray.MenuItem("Zakończ", self.shutdown),
+            pystray.MenuItem(
+                self.translator.t("Uruchom ponownie", "Restart"),
+                self.restart,
+            ),
+            pystray.MenuItem(
+                self.translator.t("Zakończ", "Exit"),
+                self.shutdown,
+            ),
         )
         self.tray = pystray.Icon(
             APP_NAME,
             make_tray_image(self.tray_state),
-            f"{APP_DISPLAY_NAME} — Start…",
+            f"{APP_DISPLAY_NAME} — {self.status}",
             menu,
         )
         self.start()
         self.tray.run()
 
 
-def acquire_single_instance() -> Optional[int]:
+def acquire_single_instance(
+    translator: Optional[Translator] = None,
+) -> Optional[int]:
     if os.name != "nt":
         return None
+    translator = translator or Translator("pl")
     # use_last_error zachowuje kod błędu od razu po wywołaniu CreateMutexW;
     # zwykłe GetLastError może zostać nadpisane przez inne wywołania Win32.
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -3795,7 +4915,12 @@ def acquire_single_instance() -> Optional[int]:
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         ctypes.windll.user32.MessageBoxW(
             None,
-            "Mówik jest już uruchomiony. Poszukaj ikony mikrofonu przy zegarze.",
+            translator.t(
+                "Mówik jest już uruchomiony. "
+                "Poszukaj ikony mikrofonu przy zegarze.",
+                "Mówik is already running. "
+                "Look for the microphone icon in the system tray.",
+            ),
             APP_DISPLAY_NAME,
             0x40,
         )
@@ -3812,72 +4937,154 @@ def release_single_instance(handle: Optional[int]) -> None:
         kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
-def show_fatal_error(message: str) -> None:
-    logging.error(message)
+def show_fatal_error(
+    message: str,
+    translator: Optional[Translator] = None,
+) -> None:
+    translator = translator or Translator("auto")
+    display_message = translator.t(
+        "{message}\n\nSzczegóły: {path}",
+        "{message}\n\nDetails: {path}",
+        message=message,
+        path=LOG_PATH,
+    )
+    logging.error("Błąd krytyczny: %s", message)
     if os.name == "nt":
         ctypes.windll.user32.MessageBoxW(
             None,
-            message,
-            f"{APP_DISPLAY_NAME} — błąd",
+            display_message,
+            translator.t(
+                "{name} — błąd",
+                "{name} — error",
+                name=APP_DISPLAY_NAME,
+            ),
             0x10,
         )
     else:
-        print(message, file=sys.stderr)
+        print(display_message, file=sys.stderr)
 
 
-def list_devices() -> int:
+def list_devices(translator: Optional[Translator] = None) -> int:
+    translator = translator or Translator()
     print(sd.query_devices())
-    print(f"\nDomyślne urządzenia (wejście, wyjście): {sd.default.device}")
+    print(
+        translator.t(
+            "\nDomyślne urządzenia (wejście, wyjście): {devices}",
+            "\nDefault devices (input, output): {devices}",
+            devices=sd.default.device,
+        )
+    )
     return 0
 
 
 def download_model_command(config: dict[str, Any]) -> int:
+    translator = Translator.from_config(config)
+
     def status(text: str) -> None:
         print(text, flush=True)
 
     model, model_name, device = create_model(config, status)
     del model
-    print(f"\nGotowe. Model {model_name} jest zapisany lokalnie i działa na {device}.")
-    print(f"Folder modeli: {MODEL_DIR}")
+    print(
+        translator.t(
+            "\nGotowe. Model {model_name} jest zapisany lokalnie i działa na {device}.",
+            "\nDone. Model {model_name} is stored locally and runs on {device}.",
+            model_name=model_name,
+            device=device,
+        )
+    )
+    print(
+        translator.t(
+            "Folder modeli: {path}",
+            "Model folder: {path}",
+            path=MODEL_DIR,
+        )
+    )
     return 0
 
 
 def test_ollama_command(config: dict[str, Any]) -> int:
-    sample = "to jest test lokalnego korektora i on ma nie zmieniac sensu"
+    translator = Translator.from_config(config)
+    transcription_language = str(config.get("language", "auto")).lower().strip()
+    samples = {
+        "pl": "to jest test lokalnego korektora i on nie może zmienić sensu",
+        "en": "this is a test of the local proofreader and it must preserve meaning",
+        "de": "dies ist ein Test des lokalen Korrektors und er darf die Bedeutung nicht ändern",
+        "fr": "ceci est un test du correcteur local et il ne doit pas changer le sens",
+        "es": "esta es una prueba del corrector local y no debe cambiar el sentido",
+        "uk": "це тест локального коректора і він не повинен змінювати зміст",
+    }
+    if transcription_language == "auto":
+        transcription_language = "pl" if translator.is_polish else "en"
+    sample = samples.get(transcription_language, samples["en"])
     result = cleanup_with_ollama(sample, config, load_dictionary(config))
-    print("Wejście:", sample)
-    print("Wynik:  ", result)
+    print(translator.t("Wejście:", "Input:"), sample)
+    print(translator.t("Wynik:  ", "Result: "), result)
     if result == sample and config.get("ollama_cleanup", {}).get("enabled", False):
-        print("Uwaga: wynik nie został zmieniony; sprawdź log oraz konfigurację Ollama.")
+        print(
+            translator.t(
+                "Uwaga: wynik nie został zmieniony; sprawdź log oraz "
+                "konfigurację Ollama.",
+                "Warning: the result was unchanged; check the log and your "
+                "Ollama configuration.",
+            )
+        )
     return 0
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(translator: Optional[Translator] = None) -> argparse.Namespace:
+    translator = translator or Translator()
+    parser = argparse.ArgumentParser(
+        description=translator.t(
+            "Mówik — lokalne dyktowanie push-to-talk dla Windows.",
+            "Mówik — private local push-to-talk dictation for Windows.",
+        )
+    )
     parser.add_argument("--version", action="version", version=f"{APP_DISPLAY_NAME} {APP_VERSION}")
-    parser.add_argument("--list-devices", action="store_true", help="Pokaż mikrofony")
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help=translator.t("Pokaż mikrofony", "List microphones"),
+    )
     parser.add_argument(
         "--download-model",
         action="store_true",
-        help="Pobierz/załaduj model i zakończ",
+        help=translator.t(
+            "Pobierz/załaduj model i zakończ",
+            "Download/load the model and exit",
+        ),
     )
     parser.add_argument(
         "--create-config",
         action="store_true",
-        help="Utwórz domyślne pliki konfiguracji i zakończ",
+        help=translator.t(
+            "Utwórz domyślne pliki konfiguracji i zakończ",
+            "Create default configuration files and exit",
+        ),
     )
     parser.add_argument(
         "--settings",
         action="store_true",
-        help="Otwórz graficzny panel ustawień",
+        help=translator.t(
+            "Otwórz graficzny panel ustawień",
+            "Open the graphical settings panel",
+        ),
     )
     parser.add_argument(
         "--test-ollama",
         action="store_true",
-        help="Sprawdź opcjonalny lokalny korektor Ollama",
+        help=translator.t(
+            "Sprawdź opcjonalny lokalny korektor Ollama",
+            "Test the optional local Ollama proofreader",
+        ),
     )
     parser.add_argument(
-        "--console-log", action="store_true", help="Pokaż log również w konsoli"
+        "--console-log",
+        action="store_true",
+        help=translator.t(
+            "Pokaż log również w konsoli",
+            "Also show the log in the console",
+        ),
     )
     parser.add_argument(
         "--restart-delay",
@@ -3889,20 +5096,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
+    cli_translator = Translator()
+    args = parse_args(cli_translator)
     setup_logging(console=args.console_log or args.download_model or args.list_devices)
     create_default_files()
 
     if args.create_config:
-        print(f"Konfiguracja: {CONFIG_PATH}")
-        print(f"Słownik:       {DICTIONARY_PATH}")
+        print(
+            cli_translator.t(
+                "Konfiguracja: {path}",
+                "Configuration: {path}",
+                path=CONFIG_PATH,
+            )
+        )
+        print(
+            cli_translator.t(
+                "Słownik:       {path}",
+                "Dictionary:    {path}",
+                path=DICTIONARY_PATH,
+            )
+        )
         return 0
     if args.settings:
         return run_settings_window()
     if args.list_devices:
-        return list_devices()
+        return list_devices(cli_translator)
 
     config = load_config()
+    translator = Translator.from_config(config)
     if args.restart_delay > 0:
         time.sleep(min(args.restart_delay, 5.0))
     if args.download_model:
@@ -3911,7 +5132,12 @@ def main() -> int:
         return test_ollama_command(config)
 
     if os.name != "nt":
-        raise AppError("Aplikacja okienkowa Mówik jest przeznaczona dla Windows 10/11.")
+        raise AppError(
+            translator.t(
+                "Aplikacja okienkowa Mówik jest przeznaczona dla Windows 10/11.",
+                "The Mówik desktop application is designed for Windows 10/11.",
+            )
+        )
 
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
@@ -3920,7 +5146,7 @@ def main() -> int:
     except Exception:
         pass
 
-    mutex_handle = acquire_single_instance()
+    mutex_handle = acquire_single_instance(translator)
     if mutex_handle is None:
         return 0
     try:
@@ -3939,5 +5165,9 @@ if __name__ == "__main__":
     except Exception as exc:
         setup_logging(console=True)
         logging.error("Błąd krytyczny:\n%s", traceback.format_exc())
-        show_fatal_error(f"{exc}\n\nSzczegóły: {LOG_PATH}")
+        try:
+            fatal_translator = Translator.from_config(load_config())
+        except Exception:
+            fatal_translator = Translator()
+        show_fatal_error(str(exc), fatal_translator)
         raise SystemExit(1)

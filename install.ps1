@@ -189,7 +189,7 @@ try {
         throw "Brakuje pythonw.exe w srodowisku .venv."
     }
 
-    Set-Content -LiteralPath (Join-Path $Root ".installed") -Value "Mowik 2.3.0" -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Root ".installed") -Value "Mowik 2.4.0" -Encoding ASCII
     Write-Host ""
     Write-Host "INSTALACJA ZAKONCZONA POMYSLNIE" -ForegroundColor Green
     Write-Host "Przytrzymaj F8, powiedz zdanie i pusc F8."

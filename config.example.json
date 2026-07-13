@@ -1,6 +1,7 @@
 {
   "trigger": "keyboard:f8",
-  "language": "pl",
+  "ui_language": "auto",
+  "language": "auto",
   "model": "auto",
   "device": "auto",
   "cpu_threads": 0,
