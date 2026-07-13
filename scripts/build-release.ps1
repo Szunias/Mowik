@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.4.0',
+    [string]$Version = '2.5.0',
 
     [Parameter()]
     [switch]$SkipTests,
@@ -98,6 +98,22 @@ $BuiltVersion = (Get-Item -LiteralPath $AppExe).VersionInfo.ProductVersion
 if ($BuiltVersion -notlike "$Version*") {
     throw "Metadane Mowik.exe mają wersję '$BuiltVersion', oczekiwano '$Version'."
 }
+$DpiManifestProbe = @'
+import sys
+from PyInstaller.utils.win32.winmanifest import read_manifest_from_executable
+
+manifest = read_manifest_from_executable(sys.argv[1]).decode("utf-8")
+required = (
+    ">true</dpiAware>",
+    ">System</dpiAwareness>",
+    ">true</longPathAware>",
+)
+missing = [value for value in required if value not in manifest]
+if missing:
+    raise SystemExit(f"Mowik.exe manifest is missing: {', '.join(missing)}")
+print("Mowik.exe DPI manifest: SystemAware")
+'@
+Invoke-Checked $Python @('-c', $DpiManifestProbe, $AppExe)
 $SmokeProcess = Start-Process -FilePath $AppExe -ArgumentList '--version' -Wait -PassThru
 if ($SmokeProcess.ExitCode -ne 0) {
     throw "Test Mowik.exe --version zakończył się kodem $($SmokeProcess.ExitCode)."

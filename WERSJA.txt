@@ -1,2 +1,2 @@
-Mowik 2.4.0
-Dwujęzyczny interfejs PL/EN, odświeżone Centrum Mówika i lokalne dyktowanie CUDA/CPU.
+Mowik 2.5.0
+Prostsze Centrum Mówika z ustawieniami zaawansowanymi na żądanie, naturalną obsługą klawiatury i ostrym skalowaniem HiDPI.

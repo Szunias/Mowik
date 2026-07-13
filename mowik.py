@@ -38,6 +38,37 @@ _CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
 _CUDA_DLL_HANDLES: list[Any] = []
 
 
+def enable_windows_dpi_awareness() -> None:
+    """Włącz ostre renderowanie interfejsu na monitorach HiDPI.
+
+    Tk 8.6.12 nie skaluje niezawodnie układu po przeniesieniu okna między
+    monitorami, dlatego używamy stabilnego trybu SystemAware. Wywołanie musi
+    nastąpić przed utworzeniem pierwszego okna Tk; manifest ustawia ten sam
+    tryb w wersji spakowanej, a fallback obejmuje uruchamianie ze źródeł.
+    """
+    if os.name != "nt":
+        return
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        set_context = user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = ctypes.c_bool
+        ctypes.set_last_error(0)
+        if set_context(ctypes.c_void_p(-2)):  # DPI_AWARENESS_CONTEXT_SYSTEM_AWARE
+            return
+        # Manifest ustawia świadomość DPI przed startem Pythona. Windows
+        # zwraca wtedy ERROR_ACCESS_DENIED i starszych API nie należy wywoływać.
+        if ctypes.get_last_error() == 5:
+            return
+        logging.debug(
+            "Windows odrzucił ustawienie SystemAware (kod %s)",
+            ctypes.get_last_error(),
+        )
+    except (AttributeError, OSError):
+        logging.debug("Nie udało się włączyć obsługi DPI", exc_info=True)
+
+
 def configure_cuda_dll_search_paths() -> tuple[Path, ...]:
     """Udostępnij CTranslate2 biblioteki CUDA dołączone przez pakiety NVIDIA.
 
@@ -139,7 +170,7 @@ import pyperclip
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 MUTEX_NAME = r"Local\MowikLocalDictation"
 SAMPLE_RATE = 16_000
 
@@ -265,6 +296,37 @@ QUICK_PROFILES: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+
+def matching_quick_profile(
+    model: Any,
+    device: Any,
+    beam_size: Any,
+) -> Optional[str]:
+    """Zwróć profil odpowiadający ustawieniom runtime.
+
+    ``model=auto`` oznacza obecnie rekomendowany ``large-v3-turbo``. Ta
+    normalizacja służy wyłącznie prezentacji i nie zmienia zapisanej
+    konfiguracji użytkownika.
+    """
+    normalized_model = str(model).strip()
+    if normalized_model == "auto":
+        normalized_model = "large-v3-turbo"
+    normalized_device = str(device).strip()
+    try:
+        normalized_beam = int(beam_size)
+    except (TypeError, ValueError):
+        return None
+
+    for profile_name, profile in QUICK_PROFILES.items():
+        changes = profile["changes"]
+        if (
+            normalized_model == changes["model"]
+            and normalized_device == changes["device"]
+            and normalized_beam == changes["beam_size"]
+        ):
+            return profile_name
+    return None
 
 DICTIONARY_TEMPLATE = """# One name or phrase per line. / Jedna nazwa lub fraza w każdym wierszu.
 # Lines beginning with # are ignored. / Linie zaczynające się od # są ignorowane.
@@ -1396,6 +1458,7 @@ def run_settings_window() -> int:
     config = load_config()
     translator = Translator.from_config(config)
     t = translator.t
+    enable_windows_dpi_awareness()
 
     try:
         import tkinter as tk
@@ -1421,14 +1484,29 @@ def run_settings_window() -> int:
     )
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
-    window_width = min(1120, max(480, screen_width - 64))
-    window_height = min(780, max(420, screen_height - 96))
+    ui_scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
+    if os.name == "nt":
+        try:
+            get_dpi_for_window = ctypes.WinDLL("user32").GetDpiForWindow
+            get_dpi_for_window.argtypes = [ctypes.c_void_p]
+            get_dpi_for_window.restype = ctypes.c_uint
+            window_dpi = int(get_dpi_for_window(root.winfo_id()))
+            if window_dpi > 0:
+                ui_scale = max(1.0, window_dpi / 96.0)
+        except (AttributeError, OSError):
+            pass
+
+    def px(value: int | float) -> int:
+        return max(1, int(round(float(value) * ui_scale)))
+
+    window_width = min(px(1120), max(px(480), screen_width - px(64)))
+    window_height = min(px(780), max(px(420), screen_height - px(96)))
     window_x = max(0, (screen_width - window_width) // 2)
     window_y = max(0, (screen_height - window_height) // 2)
     root.geometry(
         f"{window_width}x{window_height}+{window_x}+{window_y}"
     )
-    root.minsize(min(960, window_width), min(660, window_height))
+    root.minsize(min(px(960), window_width), min(px(660), window_height))
     try:
         root.iconbitmap(default=str(RESOURCE_ROOT / "assets" / "Mowik.ico"))
     except tk.TclError:
@@ -1447,6 +1525,7 @@ def run_settings_window() -> int:
         "text": "#0F172A",
         "muted": "#5B667A",
         "border": "#D8E0EA",
+        "control_border": "#7F8DA3",
         "primary": "#2563EB",
         "primary_hover": "#1D4ED8",
         "primary_soft": "#EFF6FF",
@@ -1553,7 +1632,7 @@ def run_settings_window() -> int:
         lightcolor=colors["border"],
         darkcolor=colors["border"],
         relief="flat",
-        padding=(14, 9),
+        padding=(px(14), px(9)),
     )
     style.map(
         "TButton",
@@ -1571,7 +1650,7 @@ def run_settings_window() -> int:
         lightcolor=colors["primary"],
         darkcolor=colors["primary"],
         font=(ui_font_family, 10, "bold"),
-        padding=(17, 10),
+        padding=(px(17), px(10)),
     )
     style.map(
         "Primary.TButton",
@@ -1591,7 +1670,7 @@ def run_settings_window() -> int:
         lightcolor=colors["sidebar"],
         darkcolor=colors["sidebar"],
         anchor="w",
-        padding=(18, 11),
+        padding=(px(18), px(11)),
         font=(ui_font_family, 10),
     )
     style.map(
@@ -1608,7 +1687,7 @@ def run_settings_window() -> int:
         lightcolor=colors["sidebar_active"],
         darkcolor=colors["sidebar_active"],
         anchor="w",
-        padding=(18, 11),
+        padding=(px(18), px(11)),
         font=(ui_font_family, 10, "bold"),
     )
     style.map(
@@ -1620,7 +1699,7 @@ def run_settings_window() -> int:
     style.configure(
         "Profile.TButton",
         anchor="w",
-        padding=(14, 12),
+        padding=(px(14), px(12)),
         font=(ui_font_family, 9),
     )
     style.configure(
@@ -1631,7 +1710,7 @@ def run_settings_window() -> int:
         lightcolor=colors["primary_border"],
         darkcolor=colors["primary_border"],
         anchor="w",
-        padding=(14, 12),
+        padding=(px(14), px(12)),
         font=(ui_font_family, 9, "bold"),
     )
     style.map(
@@ -1640,25 +1719,63 @@ def run_settings_window() -> int:
         bordercolor=[("focus", colors["primary"])],
     )
     style.configure(
+        "Disclosure.TButton",
+        background=colors["surface_alt"],
+        foreground=colors["text"],
+        bordercolor=colors["surface_alt"],
+        lightcolor=colors["surface_alt"],
+        darkcolor=colors["surface_alt"],
+        anchor="w",
+        padding=(px(14), px(11)),
+        font=(ui_font_family, 10, "bold"),
+    )
+    style.map(
+        "Disclosure.TButton",
+        background=[("active", colors["surface_hover"])],
+        bordercolor=[("focus", colors["primary"])],
+    )
+    style.configure(
+        "DisclosureOpen.TButton",
+        background=colors["primary_soft"],
+        foreground=colors["primary_hover"],
+        bordercolor=colors["primary_soft"],
+        lightcolor=colors["primary_soft"],
+        darkcolor=colors["primary_soft"],
+        anchor="w",
+        padding=(px(14), px(11)),
+        font=(ui_font_family, 10, "bold"),
+    )
+    style.map(
+        "DisclosureOpen.TButton",
+        background=[("active", "#DDE9FF")],
+        bordercolor=[("focus", colors["primary"])],
+    )
+    style.configure(
         "TEntry",
         fieldbackground=colors["surface"],
         foreground=colors["text"],
-        bordercolor=colors["border"],
-        lightcolor=colors["border"],
-        darkcolor=colors["border"],
+        bordercolor=colors["control_border"],
+        lightcolor=colors["control_border"],
+        darkcolor=colors["control_border"],
         insertcolor=colors["text"],
-        padding=9,
+        padding=px(9),
+    )
+    style.map(
+        "TEntry",
+        bordercolor=[("focus", colors["primary"])],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "TCombobox",
         fieldbackground=colors["surface"],
         foreground=colors["text"],
         background=colors["surface_alt"],
-        bordercolor=colors["border"],
-        lightcolor=colors["border"],
-        darkcolor=colors["border"],
+        bordercolor=colors["control_border"],
+        lightcolor=colors["control_border"],
+        darkcolor=colors["control_border"],
         arrowcolor=colors["muted"],
-        padding=7,
+        padding=px(7),
     )
     style.map(
         "TCombobox",
@@ -1666,23 +1783,31 @@ def run_settings_window() -> int:
         selectbackground=[("readonly", colors["surface"])],
         selectforeground=[("readonly", colors["text"])],
         bordercolor=[("focus", colors["primary"])],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "TSpinbox",
         fieldbackground=colors["surface"],
         foreground=colors["text"],
         background=colors["surface_alt"],
-        bordercolor=colors["border"],
-        lightcolor=colors["border"],
-        darkcolor=colors["border"],
+        bordercolor=colors["control_border"],
+        lightcolor=colors["control_border"],
+        darkcolor=colors["control_border"],
         arrowcolor=colors["muted"],
-        padding=7,
+        padding=px(7),
+    )
+    style.map(
+        "TSpinbox",
+        bordercolor=[("focus", colors["primary"])],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "TCheckbutton",
         background=colors["surface"],
         foreground=colors["text"],
-        padding=(0, 4),
+        padding=(0, px(4)),
     )
     style.map(
         "TCheckbutton",
@@ -1703,7 +1828,7 @@ def run_settings_window() -> int:
         background=colors["surface"],
         foreground=colors["text"],
         font=(ui_font_family, 11, "bold"),
-        padding=(4, 0, 8, 0),
+        padding=(px(4), 0, px(8), 0),
     )
     style.configure(
         "Vertical.TScrollbar",
@@ -1711,7 +1836,29 @@ def run_settings_window() -> int:
         troughcolor=colors["surface"],
         bordercolor=colors["surface"],
         arrowcolor=colors["muted"],
+        gripcount=0,
+        width=px(10),
     )
+    try:
+        style.layout(
+            "Vertical.TScrollbar",
+            [
+                (
+                    "Vertical.Scrollbar.trough",
+                    {
+                        "sticky": "ns",
+                        "children": [
+                            (
+                                "Vertical.Scrollbar.thumb",
+                                {"expand": "1", "sticky": "nswe"},
+                            )
+                        ],
+                    },
+                )
+            ],
+        )
+    except tk.TclError:
+        logging.debug("Uproszczony scrollbar jest niedostępny")
     style.configure("TSeparator", background=colors["border"])
 
     try:
@@ -1764,13 +1911,13 @@ def run_settings_window() -> int:
         t("Karta NVIDIA (CUDA)", "NVIDIA GPU (CUDA)"): "cuda",
     }
     language_values: dict[str, Any] = {
+        t("Wykryj automatycznie", "Detect automatically"): "auto",
         t("Polski", "Polish"): "pl",
         t("Angielski", "English"): "en",
         t("Niemiecki", "German"): "de",
         t("Francuski", "French"): "fr",
         t("Hiszpański", "Spanish"): "es",
         t("Ukraiński", "Ukrainian"): "uk",
-        t("Wykryj automatycznie", "Detect automatically"): "auto",
     }
     ui_language_values: dict[str, Any] = {
         t("Automatycznie (Windows)", "Automatic (Windows)"): "auto",
@@ -1961,6 +2108,12 @@ def run_settings_window() -> int:
     )
     status_level = {"value": "success"}
     shortcut_summary_var = tk.StringVar()
+    quality_profile_var = tk.StringVar()
+    profile_labels = {
+        "light": t("Szybki", "Fast"),
+        "balanced": t("Zalecany", "Recommended"),
+        "accurate": t("Najdokładniejszy", "Most accurate"),
+    }
 
     def set_status(message: str, level: str = "success") -> None:
         status_level["value"] = level
@@ -1981,6 +2134,29 @@ def run_settings_window() -> int:
 
     trigger_var.trace_add("write", refresh_shortcut_summary)
     refresh_shortcut_summary()
+
+    def selected_profile_key() -> Optional[str]:
+        selected_model = str(model_values.get(model_var.get(), model_var.get()))
+        selected_device = str(
+            device_values.get(device_var.get(), device_var.get())
+        )
+        return matching_quick_profile(
+            selected_model,
+            selected_device,
+            beam_size_var.get(),
+        )
+
+    def refresh_quality_summary(*args) -> None:
+        profile_name = selected_profile_key()
+        quality_profile_var.set(
+            profile_labels[profile_name]
+            if profile_name is not None
+            else t("Niestandardowy", "Custom")
+        )
+
+    for profile_variable in (model_var, device_var, beam_size_var):
+        profile_variable.trace_add("write", refresh_quality_summary)
+    refresh_quality_summary()
     page_title_var = tk.StringVar(value=t("Start", "Home"))
     page_subtitle_var = tk.StringVar(
         value=t(
@@ -1996,25 +2172,29 @@ def run_settings_window() -> int:
     shell.rowconfigure(0, weight=1)
     shell.columnconfigure(1, weight=1)
 
-    sidebar = ttk.Frame(shell, style="Sidebar.TFrame", width=216)
+    sidebar = ttk.Frame(shell, style="Sidebar.TFrame", width=px(216))
     sidebar.grid(row=0, column=0, sticky="ns")
     sidebar.grid_propagate(False)
     sidebar.columnconfigure(0, weight=1)
     sidebar.rowconfigure(20, weight=1)
 
-    brand = ttk.Frame(sidebar, style="Sidebar.TFrame", padding=(18, 24, 18, 18))
+    brand = ttk.Frame(
+        sidebar,
+        style="Sidebar.TFrame",
+        padding=(px(18), px(24), px(18), px(18)),
+    )
     brand.grid(row=0, column=0, sticky="ew")
     brand.columnconfigure(1, weight=1)
     try:
         from PIL import ImageTk
 
-        brand_image = make_tray_image("brand").resize((38, 38))
+        brand_image = make_tray_image("brand").resize((px(38), px(38)))
         root._mowik_brand_icon = ImageTk.PhotoImage(brand_image)  # type: ignore[attr-defined]
         ttk.Label(
             brand,
             image=root._mowik_brand_icon,  # type: ignore[attr-defined]
             style="SidebarMeta.TLabel",
-        ).grid(row=0, column=0, rowspan=2, padx=(0, 11))
+        ).grid(row=0, column=0, rowspan=2, padx=(0, px(11)))
     except Exception:
         pass
     ttk.Label(brand, text="Mówik", style="SidebarBrand.TLabel").grid(
@@ -2032,18 +2212,28 @@ def run_settings_window() -> int:
         background=colors["sidebar_success"],
         foreground=colors["sidebar_success_text"],
         font=(ui_font_family, 9, "bold"),
-        padx=12,
-        pady=7,
+        padx=px(12),
+        pady=px(7),
         anchor="w",
     )
-    privacy_badge.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 20))
+    privacy_badge.grid(
+        row=1,
+        column=0,
+        sticky="ew",
+        padx=px(18),
+        pady=(0, px(20)),
+    )
 
     main = ttk.Frame(shell, style="Surface.TFrame")
     main.grid(row=0, column=1, sticky="nsew")
     main.rowconfigure(2, weight=1)
     main.columnconfigure(0, weight=1)
 
-    header = ttk.Frame(main, style="Surface.TFrame", padding=(32, 24, 32, 18))
+    header = ttk.Frame(
+        main,
+        style="Surface.TFrame",
+        padding=(px(32), px(24), px(32), px(18)),
+    )
     header.grid(row=0, column=0, sticky="ew")
     header.columnconfigure(0, weight=1)
     ttk.Label(header, textvariable=page_title_var, style="Title.TLabel").grid(
@@ -2053,21 +2243,31 @@ def run_settings_window() -> int:
         header,
         textvariable=page_subtitle_var,
         style="Subtitle.TLabel",
-        wraplength=650,
-    ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        wraplength=px(650),
+    ).grid(row=1, column=0, sticky="w", pady=(px(3), 0))
     local_chip = tk.Label(
         header,
         text=t("Prywatnie i offline", "Private and offline"),
         background=colors["success_soft"],
         foreground=colors["success"],
         font=(ui_font_family, 9, "bold"),
-        padx=11,
-        pady=6,
+        padx=px(11),
+        pady=px(6),
     )
-    local_chip.grid(row=0, column=1, rowspan=2, sticky="e", padx=(18, 0))
+    local_chip.grid(
+        row=0,
+        column=1,
+        rowspan=2,
+        sticky="e",
+        padx=(px(18), 0),
+    )
     ttk.Separator(main).grid(row=1, column=0, sticky="ew")
 
-    page_host = ttk.Frame(main, style="Surface.TFrame", padding=(32, 0, 22, 0))
+    page_host = ttk.Frame(
+        main,
+        style="Surface.TFrame",
+        padding=(px(32), 0, px(22), 0),
+    )
     page_host.grid(row=2, column=0, sticky="nsew")
     page_host.rowconfigure(0, weight=1)
     page_host.columnconfigure(0, weight=1)
@@ -2090,13 +2290,14 @@ def run_settings_window() -> int:
         )
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(px(8), 0))
         content = ttk.Frame(
             canvas,
             style="Surface.TFrame",
-            padding=(0, 16, 8, 28),
+            padding=(0, px(16), px(8), px(28)),
         )
         window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas._mowik_window_id = window_id  # type: ignore[attr-defined]
 
         def update_scroll_region(event=None) -> None:
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -2133,6 +2334,15 @@ def run_settings_window() -> int:
         "sounds": sounds_canvas,
         "integrations": ollama_canvas,
         "help": files_canvas,
+    }
+    page_contents = {
+        "start": start_tab,
+        "dictation": general_tab,
+        "audio": audio_tab,
+        "text": text_tab,
+        "sounds": sounds_tab,
+        "integrations": ollama_tab,
+        "help": files_tab,
     }
     page_meta = {
         "start": (
@@ -2187,9 +2397,57 @@ def run_settings_window() -> int:
     }
     for page in page_frames.values():
         page.grid(row=0, column=0, sticky="nsew")
+        page.grid_remove()
 
     nav_buttons: dict[str, ttk.Button] = {}
     active_page_key = {"value": "start"}
+
+    def widget_is_inside(widget, ancestor) -> bool:
+        current = widget
+        while current is not None:
+            if current == ancestor:
+                return True
+            current = getattr(current, "master", None)
+        return False
+
+    def keep_focused_control_visible(widget) -> None:
+        page_key = active_page_key["value"]
+        canvas = page_canvases[page_key]
+        content = page_contents[page_key]
+        try:
+            if (
+                not widget.winfo_exists()
+                or root.focus_get() != widget
+                or not widget_is_inside(widget, content)
+            ):
+                return
+            canvas.update_idletasks()
+            scroll_region = canvas.bbox("all")
+            if scroll_region is None:
+                return
+            content_top = content.winfo_rooty()
+            widget_top = widget.winfo_rooty() - content_top
+            widget_bottom = widget_top + widget.winfo_height()
+            viewport_top = canvas.canvasy(0)
+            viewport_height = max(1, canvas.winfo_height())
+            viewport_bottom = viewport_top + viewport_height
+            margin = px(14)
+            total_height = max(1, scroll_region[3] - scroll_region[1])
+            if widget_top < viewport_top + margin:
+                target = max(0, widget_top - margin)
+                canvas.yview_moveto(target / total_height)
+            elif widget_bottom > viewport_bottom - margin:
+                target = max(0, widget_bottom + margin - viewport_height)
+                canvas.yview_moveto(min(1, target / total_height))
+        except tk.TclError:
+            return
+
+    def handle_focus_in(event) -> None:
+        root.after_idle(
+            lambda target=event.widget: keep_focused_control_visible(target)
+        )
+
+    root.bind_all("<FocusIn>", handle_focus_in, add="+")
 
     def scroll_active_page(event) -> None:
         if event.delta:
@@ -2204,12 +2462,31 @@ def run_settings_window() -> int:
         active_page_key["value"] = page_key
         page_title_var.set(title)
         page_subtitle_var.set(subtitle)
-        page_frames[page_key].tkraise()
+        for key, page in page_frames.items():
+            if key == page_key:
+                page.grid()
+                page.tkraise()
+            else:
+                page.grid_remove()
         for key, button in nav_buttons.items():
             button.configure(
                 style="NavActive.TButton" if key == page_key else "Nav.TButton"
             )
-        root.after_idle(lambda: page_canvases[page_key].yview_moveto(0))
+        def finish_page_layout() -> None:
+            canvas = page_canvases[page_key]
+            content = page_contents[page_key]
+            canvas.update_idletasks()
+            canvas.itemconfigure(
+                canvas._mowik_window_id,  # type: ignore[attr-defined]
+                width=max(1, canvas.winfo_width()),
+            )
+            content.update_idletasks()
+            scroll_region = canvas.bbox("all")
+            if scroll_region is not None:
+                canvas.configure(scrollregion=scroll_region)
+            canvas.yview_moveto(0)
+
+        root.after_idle(finish_page_layout)
 
     nav_row = 2
     for section, items in (
@@ -2235,8 +2512,8 @@ def run_settings_window() -> int:
             row=nav_row,
             column=0,
             sticky="w",
-            padx=19,
-            pady=(7 if nav_row == 2 else 18, 6),
+            padx=px(19),
+            pady=(px(7) if nav_row == 2 else px(18), px(6)),
         )
         nav_row += 1
         for page_key, label in items:
@@ -2246,7 +2523,13 @@ def run_settings_window() -> int:
                 style="Nav.TButton",
                 command=lambda selected=page_key: show_page(selected),
             )
-            button.grid(row=nav_row, column=0, sticky="ew", padx=10, pady=1)
+            button.grid(
+                row=nav_row,
+                column=0,
+                sticky="ew",
+                padx=px(10),
+                pady=px(1),
+            )
             nav_buttons[page_key] = button
             nav_row += 1
 
@@ -2255,10 +2538,14 @@ def run_settings_window() -> int:
         text=f"Mówik {APP_VERSION}\nWindows 10/11",
         style="SidebarMeta.TLabel",
         justify="left",
-    ).grid(row=21, column=0, sticky="sw", padx=19, pady=18)
+    ).grid(row=21, column=0, sticky="sw", padx=px(19), pady=px(18))
 
     ttk.Separator(main).grid(row=3, column=0, sticky="ew")
-    footer = ttk.Frame(main, style="Surface.TFrame", padding=(32, 14, 32, 16))
+    footer = ttk.Frame(
+        main,
+        style="Surface.TFrame",
+        padding=(px(32), px(14), px(32), px(16)),
+    )
     footer.grid(row=4, column=0, sticky="ew")
     footer.columnconfigure(1, weight=1)
 
@@ -2270,10 +2557,10 @@ def run_settings_window() -> int:
         background=colors["primary_soft"],
         highlightbackground=colors["primary_border"],
         highlightthickness=1,
-        padx=24,
-        pady=22,
+        padx=px(24),
+        pady=px(22),
     )
-    hero.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+    hero.grid(row=0, column=0, sticky="ew", pady=(0, px(16)))
     hero.columnconfigure(0, weight=1)
     tk.Label(
         hero,
@@ -2292,8 +2579,8 @@ def run_settings_window() -> int:
         foreground=colors["text"],
         font=(display_font_family, 18, "bold"),
         justify="left",
-        wraplength=470,
-    ).grid(row=1, column=0, sticky="w", pady=(5, 5))
+        wraplength=px(470),
+    ).grid(row=1, column=0, sticky="w", pady=(px(5), px(5)))
     tk.Label(
         hero,
         text=t(
@@ -2306,7 +2593,7 @@ def run_settings_window() -> int:
         foreground=colors["muted"],
         font=(ui_font_family, 10),
         justify="left",
-        wraplength=470,
+        wraplength=px(470),
     ).grid(row=2, column=0, sticky="w")
     shortcut_keycap = tk.Label(
         hero,
@@ -2316,18 +2603,30 @@ def run_settings_window() -> int:
         font=(ui_font_family, 12, "bold"),
         relief="solid",
         borderwidth=1,
-        padx=18,
-        pady=10,
+        padx=px(18),
+        pady=px(10),
     )
-    shortcut_keycap.grid(row=0, column=1, rowspan=2, sticky="e", padx=(20, 0))
+    shortcut_keycap.grid(
+        row=0,
+        column=1,
+        rowspan=2,
+        sticky="e",
+        padx=(px(20), 0),
+    )
     ttk.Button(
         hero,
         text=t("Zmień skrót", "Change shortcut"),
         command=lambda: show_page("dictation"),
-    ).grid(row=2, column=1, sticky="e", padx=(20, 0), pady=(10, 0))
+    ).grid(
+        row=2,
+        column=1,
+        sticky="e",
+        padx=(px(20), 0),
+        pady=(px(10), 0),
+    )
 
     overview = ttk.Frame(start_tab, style="Surface.TFrame")
-    overview.grid(row=1, column=0, sticky="ew", pady=(0, 16))
+    overview.grid(row=1, column=0, sticky="ew", pady=(0, px(16)))
     for column in range(3):
         overview.columnconfigure(column, weight=1, uniform="overview")
 
@@ -2339,14 +2638,17 @@ def run_settings_window() -> int:
             background=colors["surface_alt"],
             highlightbackground=colors["border"],
             highlightthickness=1,
-            padx=16,
-            pady=14,
+            padx=px(16),
+            pady=px(14),
         )
         card.grid(
             row=0,
             column=column,
             sticky="nsew",
-            padx=(0 if column == 0 else 6, 0 if column == 2 else 6),
+            padx=(
+                0 if column == 0 else px(6),
+                0 if column == 2 else px(6),
+            ),
         )
         tk.Label(
             card,
@@ -2363,8 +2665,8 @@ def run_settings_window() -> int:
             font=(ui_font_family, 10, "bold"),
             justify="left",
             anchor="w",
-            wraplength=190,
-        ).pack(anchor="w", fill="x", pady=(5, 3))
+            wraplength=px(190),
+        ).pack(anchor="w", fill="x", pady=(px(5), px(3)))
         tk.Label(
             card,
             text=description,
@@ -2373,7 +2675,7 @@ def run_settings_window() -> int:
             font=(ui_font_family, 9),
             justify="left",
             anchor="w",
-            wraplength=190,
+            wraplength=px(190),
         ).pack(anchor="w", fill="x")
 
     add_overview_card(
@@ -2393,9 +2695,9 @@ def run_settings_window() -> int:
     add_overview_card(
         overview,
         2,
-        t("MODEL", "MODEL"),
-        model_var,
-        t("Rozpoznawanie lokalne", "Local recognition"),
+        t("PROFIL JAKOŚCI", "QUALITY PROFILE"),
+        quality_profile_var,
+        t("Balans szybkości i jakości", "Speed and accuracy balance"),
     )
 
     privacy_panel = tk.Frame(
@@ -2403,10 +2705,10 @@ def run_settings_window() -> int:
         background=colors["success_soft"],
         highlightbackground=colors["success_border"],
         highlightthickness=1,
-        padx=18,
-        pady=14,
+        padx=px(18),
+        pady=px(14),
     )
-    privacy_panel.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+    privacy_panel.grid(row=2, column=0, sticky="ew", pady=(0, px(16)))
     tk.Label(
         privacy_panel,
         text=t(
@@ -2429,55 +2731,32 @@ def run_settings_window() -> int:
         foreground=colors["success"],
         font=(ui_font_family, 9),
         justify="left",
-        wraplength=700,
-    ).pack(anchor="w", pady=(4, 0))
-
-    quick_actions = ttk.LabelFrame(
-        start_tab,
-        text=t("Szybkie działania", "Quick actions"),
-        padding=16,
-    )
-    quick_actions.grid(row=4, column=0, sticky="ew", pady=(16, 0))
-    for column in range(3):
-        quick_actions.columnconfigure(column, weight=1)
-    ttk.Button(
-        quick_actions,
-        text=t("Ustaw dyktowanie", "Set up dictation"),
-        command=lambda: show_page("dictation"),
-    ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
-    ttk.Button(
-        quick_actions,
-        text=t("Otwórz słownik", "Open dictionary"),
-        command=lambda: show_page("text"),
-    ).grid(row=0, column=1, sticky="ew", padx=5)
-    ttk.Button(
-        quick_actions,
-        text=t("Diagnostyka", "Diagnostics"),
-        command=lambda: show_page("help"),
-    ).grid(row=0, column=2, sticky="ew", padx=(5, 0))
+        wraplength=px(700),
+    ).pack(anchor="w", pady=(px(4), 0))
 
     ui_language_frame = ttk.LabelFrame(
         start_tab,
         text=t("Język interfejsu", "Interface language"),
-        padding=16,
+        padding=px(16),
     )
     ui_language_frame.grid(row=3, column=0, sticky="ew")
     ui_language_frame.columnconfigure(0, weight=1)
-    ttk.Combobox(
+    ui_language_combo = ttk.Combobox(
         ui_language_frame,
         textvariable=ui_language_var,
         values=list(ui_language_values.keys()),
         state="readonly",
-    ).grid(row=0, column=0, sticky="ew")
+    )
+    ui_language_combo.grid(row=0, column=0, sticky="ew")
     ttk.Label(
         ui_language_frame,
         text=t(
-            "Zmiana będzie widoczna po zastosowaniu ustawień i ponownym uruchomieniu Mówika.",
-            "The change takes effect after applying settings and restarting Mówik.",
+            "Zmiana będzie widoczna po wybraniu „Zapisz i uruchom ponownie”.",
+            "The change takes effect after choosing “Save and restart”.",
         ),
         style="Muted.TLabel",
-        wraplength=700,
-    ).grid(row=1, column=0, sticky="w", pady=(7, 0))
+        wraplength=px(700),
+    ).grid(row=1, column=0, sticky="w", pady=(px(7), 0))
 
     for tab in (
         general_tab,
@@ -2492,33 +2771,28 @@ def run_settings_window() -> int:
     presets = ttk.LabelFrame(
         general_tab,
         text=t("Profil jakości", "Quality profile"),
-        padding=16,
+        padding=px(16),
     )
-    presets.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+    presets.grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
     for column in range(3):
         presets.columnconfigure(column, weight=1)
 
     profile_buttons: dict[str, ttk.Button] = {}
-    profile_labels = {
-        "light": t("Szybki", "Fast"),
-        "balanced": t("Zalecany", "Recommended"),
-        "accurate": t("Najdokładniejszy", "Most accurate"),
-    }
-
     def refresh_profile_buttons(*args) -> None:
-        selected_model = str(model_values.get(model_var.get(), model_var.get()))
-        try:
-            selected_beam = int(beam_size_var.get())
-        except ValueError:
-            selected_beam = -1
+        selected_profile = selected_profile_key()
         for profile_name, button in profile_buttons.items():
-            changes = QUICK_PROFILES[profile_name]["changes"]
-            selected = (
-                selected_model == changes["model"]
-                and selected_beam == changes["beam_size"]
-            )
             button.configure(
-                style="SelectedProfile.TButton" if selected else "Profile.TButton"
+                style=(
+                    "SelectedProfile.TButton"
+                    if profile_name == selected_profile
+                    else "Profile.TButton"
+                )
             )
 
     def set_profile(profile_name: str) -> None:
@@ -2529,8 +2803,8 @@ def run_settings_window() -> int:
         beam_size_var.set(str(changes["beam_size"]))
         set_status(
             t(
-                "Wybrano profil „{profile}”. Zastosuj zmiany, aby go uruchomić.",
-                "Selected the “{profile}” profile. Apply changes to activate it.",
+                "Wybrano profil „{profile}”. Zapisz i uruchom ponownie, aby go aktywować.",
+                "Selected the “{profile}” profile. Save and restart to activate it.",
                 profile=profile_labels[profile_name],
             ),
             "warning",
@@ -2542,22 +2816,22 @@ def run_settings_window() -> int:
             (
                 "light",
                 t(
-                    "Szybki\nsmall · najmniejsze obciążenie",
-                    "Fast\nsmall · lowest load",
+                    "Szybki\nNajmniejsze opóźnienie",
+                    "Fast\nLowest latency",
                 ),
             ),
             (
                 "balanced",
                 t(
-                    "Zalecany\nTurbo · dobry balans",
-                    "Recommended\nTurbo · balanced",
+                    "Zalecany\nNajlepszy balans",
+                    "Recommended\nBest balance",
                 ),
             ),
             (
                 "accurate",
                 t(
-                    "Najdokładniejszy\nlarge-v3 · najwyższa jakość",
-                    "Most accurate\nlarge-v3 · highest quality",
+                    "Najdokładniejszy\nWyższa jakość, wolniej",
+                    "Most accurate\nHigher quality, slower",
                 ),
             ),
         )
@@ -2572,10 +2846,14 @@ def run_settings_window() -> int:
             row=0,
             column=column,
             sticky="nsew",
-            padx=(0 if column == 0 else 5, 0 if column == 2 else 5),
+            padx=(
+                0 if column == 0 else px(5),
+                0 if column == 2 else px(5),
+            ),
         )
         profile_buttons[profile_name] = button
     model_var.trace_add("write", refresh_profile_buttons)
+    device_var.trace_add("write", refresh_profile_buttons)
     beam_size_var.trace_add("write", refresh_profile_buttons)
     refresh_profile_buttons()
 
@@ -2587,21 +2865,152 @@ def run_settings_window() -> int:
         hint: Optional[str] = None,
     ) -> None:
         ttk.Label(parent, text=label, style="Field.TLabel").grid(
-            row=row, column=0, sticky="w", padx=(0, 14), pady=7
+            row=row,
+            column=0,
+            sticky="w",
+            padx=(0, px(14)),
+            pady=px(7),
         )
-        widget.grid(row=row, column=1, sticky="ew", pady=7)
+        widget.grid(row=row, column=1, sticky="ew", pady=px(7))
         if hint:
             ttk.Label(
                 parent,
                 text=hint,
                 style="Muted.TLabel",
-                wraplength=220,
+                wraplength=px(220),
                 justify="left",
             ).grid(
-                row=row, column=2, sticky="w", padx=(14, 0), pady=7
+                row=row,
+                column=2,
+                sticky="w",
+                padx=(px(14), 0),
+                pady=px(7),
             )
 
-    trigger_row = ttk.Frame(general_tab)
+    def create_disclosure(
+        parent,
+        row: int,
+        canvas: tk.Canvas,
+        summary: str,
+        *,
+        name: str,
+        initially_expanded: bool = False,
+        pady: tuple[int, int] = (0, 0),
+    ) -> dict[str, Any]:
+        container = tk.Frame(
+            parent,
+            name=name,
+            background=colors["surface_alt"],
+            highlightbackground=colors["border"],
+            highlightthickness=1,
+        )
+        container.grid(
+            row=row,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=pady,
+        )
+        container.columnconfigure(0, weight=1)
+        body = ttk.Frame(
+            container,
+            name="body",
+            style="Surface.TFrame",
+            padding=(px(14), px(8), px(14), px(14)),
+        )
+        body.columnconfigure(1, weight=1)
+        state = {"expanded": not initially_expanded}
+
+        def set_expanded(expanded: bool, focus_widget=None) -> None:
+            expanded = bool(expanded)
+            if not expanded:
+                current_focus = root.focus_get()
+                if current_focus is not None and widget_is_inside(
+                    current_focus, body
+                ):
+                    toggle_button.focus_set()
+            state["expanded"] = expanded
+            if expanded:
+                body.grid(row=2, column=0, sticky="ew")
+                toggle_button.configure(
+                    text=t(
+                        "▾  Ukryj ustawienia zaawansowane",
+                        "▾  Hide advanced settings",
+                    ),
+                    style="DisclosureOpen.TButton",
+                )
+            else:
+                body.grid_remove()
+                toggle_button.configure(
+                    text=t(
+                        "▸  Pokaż ustawienia zaawansowane",
+                        "▸  Show advanced settings",
+                    ),
+                    style="Disclosure.TButton",
+                )
+
+            def finish_layout() -> None:
+                scroll_region = canvas.bbox("all")
+                if scroll_region is not None:
+                    canvas.configure(scrollregion=scroll_region)
+                if focus_widget is not None and expanded:
+                    focus_widget.focus_set()
+
+            root.after_idle(finish_layout)
+
+        def toggle() -> None:
+            set_expanded(not state["expanded"])
+
+        toggle_button = ttk.Button(
+            container,
+            name="toggle",
+            command=toggle,
+            takefocus=True,
+        )
+        toggle_button.grid(row=0, column=0, sticky="ew")
+        tk.Label(
+            container,
+            text=summary,
+            background=colors["surface_alt"],
+            foreground=colors["muted"],
+            font=(ui_font_family, 9),
+            justify="left",
+            anchor="w",
+            wraplength=px(700),
+            padx=px(14),
+            pady=0,
+        ).grid(row=1, column=0, sticky="ew", pady=(0, px(11)))
+        toggle_button.bind(
+            "<Right>", lambda event: set_expanded(True) or "break"
+        )
+        toggle_button.bind(
+            "<Left>", lambda event: set_expanded(False) or "break"
+        )
+        set_expanded(initially_expanded)
+        return {
+            "container": container,
+            "body": body,
+            "button": toggle_button,
+            "set_expanded": set_expanded,
+            "reveal": lambda widget=None: set_expanded(True, widget),
+            "expanded": lambda: bool(state["expanded"]),
+        }
+
+    dictation_basics = ttk.LabelFrame(
+        general_tab,
+        text=t("Najważniejsze ustawienia", "Everyday settings"),
+        padding=px(16),
+    )
+    dictation_basics.grid(
+        row=1,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
+    dictation_basics.columnconfigure(1, weight=1)
+
+    trigger_row = ttk.Frame(dictation_basics)
     trigger_row.columnconfigure(0, weight=1)
     trigger_combo = ttk.Combobox(
         trigger_row,
@@ -2628,7 +3037,7 @@ def run_settings_window() -> int:
         except tk.TclError:
             pass
 
-        frame = ttk.Frame(dialog, padding=20)
+        frame = ttk.Frame(dialog, padding=px(20))
         frame.grid(row=0, column=0, sticky="nsew")
         ttk.Label(
             frame,
@@ -2648,8 +3057,13 @@ def run_settings_window() -> int:
                 "captured. Press Esc to cancel. A function key or side mouse "
                 "button is usually most convenient.",
             ),
-            wraplength=500,
-        ).grid(row=1, column=0, sticky="ew", pady=(8, 14))
+            wraplength=px(500),
+        ).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(px(8), px(14)),
+        )
         capture_status_var = tk.StringVar(
             value=t("Przygotowanie…", "Preparing…")
         )
@@ -2707,8 +3121,8 @@ def run_settings_window() -> int:
             set_status(
                 note
                 + t(
-                    " Kliknij „Zastosuj zmiany”.",
-                    " Click “Apply changes”.",
+                    " Kliknij „Zapisz i uruchom ponownie”.",
+                    " Click “Save and restart”.",
                 ),
                 "warning",
             )
@@ -2774,7 +3188,12 @@ def run_settings_window() -> int:
             text=t("Anuluj", "Cancel"),
             command=close_capture,
         )
-        cancel_button.grid(row=3, column=0, sticky="e", pady=(18, 0))
+        cancel_button.grid(
+            row=3,
+            column=0,
+            sticky="e",
+            pady=(px(18), 0),
+        )
         dialog.protocol("WM_DELETE_WINDOW", close_capture)
         dialog.after(650, begin_capture_listening)
         dialog.update_idletasks()
@@ -2786,10 +3205,10 @@ def run_settings_window() -> int:
         trigger_row,
         text=t("Wykryj…", "Detect…"),
         command=capture_trigger,
-    ).grid(row=0, column=1, padx=(8, 0))
+    ).grid(row=0, column=1, padx=(px(8), 0))
     add_field(
-        general_tab,
-        1,
+        dictation_basics,
+        0,
         t("Przycisk dyktowania", "Dictation shortcut"),
         trigger_row,
         t(
@@ -2798,7 +3217,7 @@ def run_settings_window() -> int:
         ),
     )
 
-    microphone_row = ttk.Frame(general_tab)
+    microphone_row = ttk.Frame(dictation_basics)
     microphone_row.columnconfigure(0, weight=1)
     microphone_combo = ttk.Combobox(
         microphone_row,
@@ -2846,36 +3265,67 @@ def run_settings_window() -> int:
         microphone_row,
         text=t("Odśwież", "Refresh"),
         command=lambda: refresh_microphones(),
-    ).grid(row=0, column=1, padx=(8, 0))
-    add_field(general_tab, 2, t("Mikrofon", "Microphone"), microphone_row)
+    ).grid(row=0, column=1, padx=(px(8), 0))
+    add_field(dictation_basics, 1, t("Mikrofon", "Microphone"), microphone_row)
     microphone_row.grid_configure(columnspan=2)
     refresh_microphones(config.get("microphone"))
 
-    model_combo = ttk.Combobox(
+    language_combo = ttk.Combobox(
+        dictation_basics,
+        textvariable=language_var,
+        values=list(language_values.keys()),
+        state="readonly",
+    )
+    add_field(
+        dictation_basics,
+        2,
+        t("Język dyktowania", "Dictation language"),
+        language_combo,
+    )
+    try:
+        custom_cpu_threads = int(cpu_threads_var.get()) != 0
+    except ValueError:
+        custom_cpu_threads = True
+    dictation_disclosure = create_disclosure(
         general_tab,
+        2,
+        general_canvas,
+        t(
+            "Konkretny model, wybór GPU/CPU, dokładność i liczba wątków.",
+            "Exact model, GPU/CPU selection, accuracy, and CPU thread count.",
+        ),
+        name="advanced_dictation",
+        initially_expanded=(
+            selected_profile_key() is None or custom_cpu_threads
+        ),
+    )
+    dictation_advanced = dictation_disclosure["body"]
+
+    model_combo = ttk.Combobox(
+        dictation_advanced,
         textvariable=model_var,
         values=list(model_values.keys()),
         state="readonly",
     )
     add_field(
-        general_tab,
-        3,
+        dictation_advanced,
+        0,
         t("Model mowy", "Speech model"),
         model_combo,
         t(
-            "Nowy model może zostać pobrany przy zastosowaniu zmian.",
-            "A new model may be downloaded when changes are applied.",
+            "Nowy model może zostać pobrany po zapisaniu ustawień.",
+            "A new model may be downloaded after the settings are saved.",
         ),
     )
     device_combo = ttk.Combobox(
-        general_tab,
+        dictation_advanced,
         textvariable=device_var,
         values=list(device_values.keys()),
         state="readonly",
     )
     add_field(
-        general_tab,
-        4,
+        dictation_advanced,
+        1,
         t("Miejsce przetwarzania", "Processing device"),
         device_combo,
         t(
@@ -2883,24 +3333,12 @@ def run_settings_window() -> int:
             "Automatic selection is best for most computers.",
         ),
     )
-    language_combo = ttk.Combobox(
-        general_tab,
-        textvariable=language_var,
-        values=list(language_values.keys()),
-        state="readonly",
-    )
-    add_field(
-        general_tab,
-        5,
-        t("Język dyktowania", "Dictation language"),
-        language_combo,
-    )
     beam_spin = ttk.Spinbox(
-        general_tab, from_=1, to=10, textvariable=beam_size_var, width=8
+        dictation_advanced, from_=1, to=10, textvariable=beam_size_var, width=8
     )
     add_field(
-        general_tab,
-        6,
+        dictation_advanced,
+        2,
         t("Dokładność rozpoznawania", "Recognition accuracy"),
         beam_spin,
         t(
@@ -2909,53 +3347,135 @@ def run_settings_window() -> int:
         ),
     )
     threads_spin = ttk.Spinbox(
-        general_tab, from_=0, to=256, textvariable=cpu_threads_var, width=8
+        dictation_advanced, from_=0, to=256, textvariable=cpu_threads_var, width=8
     )
     add_field(
-        general_tab,
-        7,
+        dictation_advanced,
+        3,
         t("Liczba wątków CPU", "CPU thread count"),
         threads_spin,
         t("0 oznacza automatyczny dobór.", "0 selects automatically."),
     )
 
-    capture_frame = ttk.LabelFrame(
+    speech_detection_frame = ttk.LabelFrame(
         audio_tab,
-        text=t("Bufor i czułość mikrofonu", "Microphone buffer and sensitivity"),
-        padding=16,
+        text=t("Automatyczne wykrywanie mowy", "Automatic speech detection"),
+        padding=px(16),
     )
-    capture_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+    speech_detection_frame.grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
+    ttk.Checkbutton(
+        speech_detection_frame,
+        text=t(
+            "Pomijaj ciszę i nagrania bez wyraźnej mowy",
+            "Skip silence and recordings without clear speech",
+        ),
+        variable=vad_enabled_var,
+    ).grid(row=0, column=0, sticky="w", pady=(0, px(4)))
+    ttk.Label(
+        speech_detection_frame,
+        text=t(
+            "Zalecane dla większości osób. Wyłącz tylko wtedy, gdy Mówik pomija bardzo cichy głos.",
+            "Recommended for most people. Turn it off only if Mówik skips very quiet speech.",
+        ),
+        style="Muted.TLabel",
+        wraplength=px(720),
+    ).grid(row=1, column=0, sticky="w")
+
+    default_vad = DEFAULT_CONFIG["vad"]
+    audio_has_custom_values = any(
+        (
+            str(pre_roll_var.get()) != str(DEFAULT_CONFIG["pre_roll_ms"]),
+            str(post_roll_var.get()) != str(DEFAULT_CONFIG["post_roll_ms"]),
+            str(minimum_recording_var.get())
+            != str(DEFAULT_CONFIG["minimum_recording_ms"]),
+            str(minimum_rms_var.get()) != str(DEFAULT_CONFIG["minimum_rms"]),
+            str(vad_threshold_var.get()) != str(default_vad["threshold"]),
+            str(vad_min_speech_var.get())
+            != str(default_vad["min_speech_duration_ms"]),
+            str(vad_min_silence_var.get())
+            != str(default_vad["min_silence_duration_ms"]),
+            str(vad_speech_pad_var.get()) != str(default_vad["speech_pad_ms"]),
+        )
+    )
+    audio_disclosure = create_disclosure(
+        audio_tab,
+        1,
+        audio_canvas,
+        t(
+            "Bufory początku i końca, czułość oraz precyzyjne parametry ciszy. Zmień je tylko, jeśli słowa są ucinane albo szum uruchamia rozpoznawanie.",
+            "Start/end buffers, sensitivity, and detailed silence controls. Change these only if words are clipped or noise triggers recognition.",
+        ),
+        name="advanced_microphone",
+        initially_expanded=audio_has_custom_values,
+    )
+    audio_advanced = audio_disclosure["body"]
+
+    capture_frame = ttk.LabelFrame(
+        audio_advanced,
+        text=t("Bufor i czułość mikrofonu", "Microphone buffer and sensitivity"),
+        padding=px(16),
+    )
+    capture_frame.grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
     capture_frame.columnconfigure(1, weight=1)
+    pre_roll_spin = ttk.Spinbox(
+        capture_frame,
+        from_=0,
+        to=2000,
+        textvariable=pre_roll_var,
+    )
     add_field(
         capture_frame,
         0,
         t("Bufor przed naciśnięciem (ms)", "Pre-roll buffer (ms)"),
-        ttk.Spinbox(capture_frame, from_=0, to=2000, textvariable=pre_roll_var),
+        pre_roll_spin,
         t("Chroni początek pierwszego słowa.", "Protects the first word's start."),
+    )
+    post_roll_spin = ttk.Spinbox(
+        capture_frame,
+        from_=0,
+        to=2000,
+        textvariable=post_roll_var,
     )
     add_field(
         capture_frame,
         1,
         t("Bufor po puszczeniu (ms)", "Post-release buffer (ms)"),
-        ttk.Spinbox(capture_frame, from_=0, to=2000, textvariable=post_roll_var),
+        post_roll_spin,
         t("Chroni końcówkę ostatniego słowa.", "Protects the last word's ending."),
+    )
+    minimum_recording_spin = ttk.Spinbox(
+        capture_frame,
+        from_=0,
+        to=10000,
+        textvariable=minimum_recording_var,
     )
     add_field(
         capture_frame,
         2,
         t("Minimalne nagranie (ms)", "Minimum recording (ms)"),
-        ttk.Spinbox(
-            capture_frame,
-            from_=0,
-            to=10000,
-            textvariable=minimum_recording_var,
-        ),
+        minimum_recording_spin,
+    )
+    minimum_rms_entry = ttk.Entry(
+        capture_frame,
+        textvariable=minimum_rms_var,
     )
     add_field(
         capture_frame,
         3,
         t("Minimalny poziom dźwięku", "Minimum audio level"),
-        ttk.Entry(capture_frame, textvariable=minimum_rms_var),
+        minimum_rms_entry,
         t(
             "Niższa wartość zwiększa czułość na cichy głos.",
             "A lower value increases sensitivity to quiet speech.",
@@ -2963,29 +3483,21 @@ def run_settings_window() -> int:
     )
 
     vad_frame = ttk.LabelFrame(
-        audio_tab,
+        audio_advanced,
         text=t(
-            "Wykrywanie ciszy — ustawienia zaawansowane",
-            "Silence detection — advanced settings",
+            "Precyzyjne wykrywanie ciszy",
+            "Fine-tune silence detection",
         ),
-        padding=16,
+        padding=px(16),
     )
     vad_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
     vad_frame.columnconfigure(1, weight=1)
-    ttk.Checkbutton(
-        vad_frame,
-        text=t(
-            "Automatycznie pomijaj ciszę i dźwięki bez wyraźnej mowy",
-            "Automatically skip silence and audio without clear speech",
-        ),
-        variable=vad_enabled_var,
-    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
     vad_controls: list[ttk.Widget] = []
     vad_threshold_entry = ttk.Entry(vad_frame, textvariable=vad_threshold_var)
     vad_controls.append(vad_threshold_entry)
     add_field(
         vad_frame,
-        1,
+        0,
         t("Czułość wykrywania", "Detection sensitivity"),
         vad_threshold_entry,
         t(
@@ -2999,7 +3511,7 @@ def run_settings_window() -> int:
     vad_controls.append(vad_speech_spin)
     add_field(
         vad_frame,
-        2,
+        1,
         t("Minimalna długość mowy (ms)", "Minimum speech length (ms)"),
         vad_speech_spin,
     )
@@ -3009,7 +3521,7 @@ def run_settings_window() -> int:
     vad_controls.append(vad_silence_spin)
     add_field(
         vad_frame,
-        3,
+        2,
         t("Minimalna długość ciszy (ms)", "Minimum silence length (ms)"),
         vad_silence_spin,
     )
@@ -3019,7 +3531,7 @@ def run_settings_window() -> int:
     vad_controls.append(vad_pad_spin)
     add_field(
         vad_frame,
-        4,
+        3,
         t("Margines mowy (ms)", "Speech padding (ms)"),
         vad_pad_spin,
     )
@@ -3035,26 +3547,46 @@ def run_settings_window() -> int:
     text_frame = ttk.LabelFrame(
         text_tab,
         text=t("Miejsce docelowe i format", "Destination and formatting"),
-        padding=16,
+        padding=px(16),
     )
-    text_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+    text_frame.grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
     text_frame.columnconfigure(1, weight=1)
-    ttk.Checkbutton(
+    paste_enabled_check = ttk.Checkbutton(
         text_frame,
         text=t(
             "Automatycznie wklejaj tekst do aktywnego okna",
             "Automatically paste text into the active window",
         ),
         variable=paste_enabled_var,
-    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=4)
-    ttk.Checkbutton(
+    )
+    paste_enabled_check.grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=px(4),
+    )
+    copy_to_clipboard_check = ttk.Checkbutton(
         text_frame,
         text=t(
             "Kopiuj rozpoznany tekst również do schowka",
             "Also copy recognized text to the clipboard",
         ),
         variable=copy_to_clipboard_var,
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+    )
+    copy_to_clipboard_check.grid(
+        row=1,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=px(4),
+    )
     append_space_check = ttk.Checkbutton(
         text_frame,
         text=t(
@@ -3063,28 +3595,48 @@ def run_settings_window() -> int:
         ),
         variable=append_space_var,
     )
-    append_space_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
+    append_space_check.grid(
+        row=2,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=px(4),
+    )
+    voice_commands_text_var = tk.StringVar()
+
+    def refresh_voice_commands_text(*args) -> None:
+        transcription_language = str(
+            language_values.get(language_var.get(), language_var.get())
+        )
+        if transcription_language == "pl":
+            voice_commands_text_var.set(
+                t(
+                    "Rozpoznawaj komendy „nowa linia” i „nowy akapit”",
+                    "Recognize the “nowa linia” and “nowy akapit” commands",
+                )
+            )
+        elif transcription_language == "en":
+            voice_commands_text_var.set(
+                t(
+                    "Rozpoznawaj komendy „new line” i „new paragraph”",
+                    "Recognize the “new line” and “new paragraph” commands",
+                )
+            )
+        else:
+            voice_commands_text_var.set(
+                t(
+                    "Rozpoznawaj komendy akapitu po polsku i angielsku",
+                    "Recognize paragraph commands in English and Polish",
+                )
+            )
+
     ttk.Checkbutton(
         text_frame,
-        text=t(
-            "Rozpoznawaj komendy akapitu (PL: „nowa linia”, „nowy akapit”; EN: „new line”, „new paragraph”)",
-            "Recognize paragraph commands (EN: “new line”, “new paragraph”; PL: “nowa linia”, “nowy akapit”)",
-        ),
+        textvariable=voice_commands_text_var,
         variable=voice_commands_var,
-    ).grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
-    paste_delay_spin = ttk.Spinbox(
-        text_frame, from_=0, to=5000, textvariable=paste_delay_var
-    )
-    add_field(
-        text_frame,
-        4,
-        t("Opóźnienie wklejania (ms)", "Paste delay (ms)"),
-        paste_delay_spin,
-        t(
-            "Zwiększ tylko wtedy, gdy aplikacja docelowa pomija tekst.",
-            "Increase only if the target application misses the pasted text.",
-        ),
-    )
+    ).grid(row=3, column=0, columnspan=3, sticky="w", pady=px(4))
+    language_var.trace_add("write", refresh_voice_commands_text)
+    refresh_voice_commands_text()
     ttk.Label(
         text_frame,
         text=t(
@@ -3094,16 +3646,14 @@ def run_settings_window() -> int:
             "without the automatically appended space.",
         ),
         style="Muted.TLabel",
-        wraplength=760,
-    ).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-
-    def sync_paste_controls(*args) -> None:
-        state = "normal" if paste_enabled_var.get() else "disabled"
-        append_space_check.configure(state=state)
-        paste_delay_spin.configure(state=state)
-
-    paste_enabled_var.trace_add("write", sync_paste_controls)
-    sync_paste_controls()
+        wraplength=px(760),
+    ).grid(
+        row=4,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(px(8), 0),
+    )
 
     dictionary_frame = ttk.LabelFrame(
         text_tab,
@@ -3111,9 +3661,15 @@ def run_settings_window() -> int:
             "Prywatny słownik nazw i terminów",
             "Private dictionary of names and terms",
         ),
-        padding=16,
+        padding=px(16),
     )
-    dictionary_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+    dictionary_frame.grid(
+        row=1,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
     dictionary_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         dictionary_frame,
@@ -3122,18 +3678,7 @@ def run_settings_window() -> int:
             "Suggest preferred spellings of names, brands, and abbreviations",
         ),
         variable=dictionary_enabled_var,
-    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=4)
-    add_field(
-        dictionary_frame,
-        1,
-        t("Maksymalna liczba haseł", "Maximum number of entries"),
-        ttk.Spinbox(
-            dictionary_frame,
-            from_=0,
-            to=5000,
-            textvariable=dictionary_max_terms_var,
-        ),
-    )
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=px(4))
 
     def open_path(path: Path) -> None:
         try:
@@ -3150,42 +3695,144 @@ def run_settings_window() -> int:
                 parent=root,
             )
 
-    ttk.Button(
+    dictionary_edit_button = ttk.Button(
         dictionary_frame,
         text=t("Edytuj słownik…", "Edit dictionary…"),
         command=lambda: open_path(DICTIONARY_PATH),
-    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
+    )
+    dictionary_edit_button.grid(
+        row=1,
+        column=0,
+        columnspan=2,
+        sticky="w",
+        pady=(px(8), px(2)),
+    )
+
+    text_disclosure = create_disclosure(
+        text_tab,
+        2,
+        text_canvas,
+        t(
+            "Opóźnienie wklejania i limit słownika. Domyślne wartości działają w większości aplikacji.",
+            "Paste delay and dictionary limit. The defaults work in most applications.",
+        ),
+        name="advanced_text",
+        initially_expanded=(
+            str(paste_delay_var.get()) != str(DEFAULT_CONFIG["paste"]["delay_ms"])
+            or str(dictionary_max_terms_var.get())
+            != str(DEFAULT_CONFIG["dictionary"]["max_terms"])
+        ),
+    )
+    text_advanced = text_disclosure["body"]
+    paste_delay_spin = ttk.Spinbox(
+        text_advanced, from_=0, to=5000, textvariable=paste_delay_var
+    )
+    add_field(
+        text_advanced,
+        0,
+        t("Opóźnienie wklejania (ms)", "Paste delay (ms)"),
+        paste_delay_spin,
+        t(
+            "Zwiększ tylko wtedy, gdy aplikacja docelowa pomija tekst.",
+            "Increase only if the target application misses the pasted text.",
+        ),
+    )
+    dictionary_limit_spin = ttk.Spinbox(
+        text_advanced,
+        from_=0,
+        to=5000,
+        textvariable=dictionary_max_terms_var,
+    )
+    add_field(
+        text_advanced,
+        1,
+        t("Maksymalna liczba haseł", "Maximum number of entries"),
+        dictionary_limit_spin,
+    )
+
+    def sync_paste_controls(*args) -> None:
+        state = "normal" if paste_enabled_var.get() else "disabled"
+        append_space_check.configure(state=state)
+        paste_delay_spin.configure(state=state)
+
+    paste_enabled_var.trace_add("write", sync_paste_controls)
+    sync_paste_controls()
+
+    def sync_dictionary_controls(*args) -> None:
+        state = "normal" if dictionary_enabled_var.get() else "disabled"
+        dictionary_limit_spin.configure(state=state)
+        dictionary_edit_button.configure(state=state)
+
+    dictionary_enabled_var.trace_add("write", sync_dictionary_controls)
+    sync_dictionary_controls()
 
     feedback_frame = ttk.LabelFrame(
         sounds_tab,
         text=t("Informacje zwrotne", "Feedback"),
-        padding=16,
+        padding=px(16),
     )
-    feedback_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+    feedback_frame.grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
     ttk.Checkbutton(
         feedback_frame,
         text=t("Sygnały dźwiękowe", "Sound cues"),
         variable=sounds_var,
-    ).grid(row=0, column=0, sticky="w", padx=(0, 25), pady=4)
+    ).grid(
+        row=0,
+        column=0,
+        sticky="w",
+        padx=(0, px(25)),
+        pady=px(4),
+    )
     ttk.Checkbutton(
         feedback_frame,
         text=t("Powiadomienia Windows", "Windows notifications"),
         variable=notifications_var,
-    ).grid(row=0, column=1, sticky="w", pady=4)
+    ).grid(row=0, column=1, sticky="w", pady=px(4))
+    sounds_have_custom_values = bool(loop_recording_sound_var.get()) or any(
+        bool(variable.get().strip()) for variable in sound_path_vars.values()
+    )
+    sounds_disclosure = create_disclosure(
+        sounds_tab,
+        1,
+        sounds_canvas,
+        t(
+            "Własne pliki WAV, odsłuch, zapętlanie i folder dźwięków.",
+            "Custom WAV files, previews, looping, and the sounds folder.",
+        ),
+        name="advanced_sounds",
+        initially_expanded=sounds_have_custom_values,
+    )
+    sounds_advanced = sounds_disclosure["body"]
+
     loop_sound_check = ttk.Checkbutton(
-        feedback_frame,
+        sounds_advanced,
         text=t(
             "Zapętlaj własny dźwięk nagrywania podczas trzymania przycisku",
             "Loop the custom recording sound while the shortcut is held",
         ),
         variable=loop_recording_sound_var,
     )
-    loop_sound_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+    loop_sound_check.grid(
+        row=0,
+        column=0,
+        sticky="w",
+        pady=(0, px(10)),
+    )
 
     def sync_sound_controls(*args) -> None:
-        loop_sound_check.configure(state="normal" if sounds_var.get() else "disabled")
+        can_loop = bool(sounds_var.get()) and bool(
+            sound_path_vars["start"].get().strip()
+        )
+        loop_sound_check.configure(state="normal" if can_loop else "disabled")
 
     sounds_var.trace_add("write", sync_sound_controls)
+    sound_path_vars["start"].trace_add("write", sync_sound_controls)
     sync_sound_controls()
 
     sound_labels = {
@@ -3274,60 +3921,94 @@ def run_settings_window() -> int:
             )
 
     custom_sound_frame = ttk.LabelFrame(
-        sounds_tab,
+        sounds_advanced,
         text=t("Własne dźwięki WAV", "Custom WAV sounds"),
-        padding=16,
+        padding=px(16),
     )
     custom_sound_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
     custom_sound_frame.columnconfigure(0, weight=1)
     ttk.Label(
         custom_sound_frame,
         text=t(
-            "Pozostaw puste, aby używać krótkiego sygnału wbudowanego. "
-            "Wybrany plik zostanie skopiowany do %APPDATA%\\Mowik\\sounds.",
-            "Leave empty to use the short built-in cue. The selected file is "
-            "copied to %APPDATA%\\Mowik\\sounds.",
+            "Stan „Wbudowany” oznacza krótki sygnał Mówika. Wybrany plik zostanie "
+            "skopiowany do %APPDATA%\\Mowik\\sounds.",
+            "“Built-in” uses Mówik's short default cue. A selected file is copied "
+            "to %APPDATA%\\Mowik\\sounds.",
         ),
         style="Muted.TLabel",
-        wraplength=760,
-    ).grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        wraplength=px(760),
+    ).grid(row=0, column=0, sticky="ew", pady=(0, px(10)))
+
+    sound_display_vars: dict[str, tk.StringVar] = {}
+
+    def refresh_sound_display(kind: str) -> None:
+        value = sound_path_vars[kind].get().strip()
+        sound_display_vars[kind].set(
+            value if value else t("Wbudowany", "Built-in")
+        )
+
+    def reset_sound(kind: str) -> None:
+        sound_path_vars[kind].set("")
+        if kind == "start":
+            loop_recording_sound_var.set(False)
 
     for row_index, kind in enumerate(("start", "stop", "done", "error"), start=1):
+        sound_display_vars[kind] = tk.StringVar()
+        sound_path_vars[kind].trace_add(
+            "write",
+            lambda *args, selected_kind=kind: refresh_sound_display(selected_kind),
+        )
+        refresh_sound_display(kind)
         sound_row = ttk.Frame(custom_sound_frame, style="Surface.TFrame")
         sound_row.grid(
-            row=row_index, column=0, sticky="ew", pady=(5, 7)
+            row=row_index,
+            column=0,
+            sticky="ew",
+            pady=(px(5), px(7)),
         )
         sound_row.columnconfigure(0, weight=1)
         ttk.Label(
             sound_row,
             text=sound_labels[kind],
             style="Field.TLabel",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 5))
+        ).grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, px(5)),
+        )
         ttk.Entry(
             sound_row,
-            textvariable=sound_path_vars[kind],
+            textvariable=sound_display_vars[kind],
             state="readonly",
         ).grid(row=1, column=0, sticky="ew")
         buttons = ttk.Frame(sound_row)
-        buttons.grid(row=1, column=1, sticky="e", padx=(8, 0))
+        buttons.grid(row=1, column=1, sticky="e", padx=(px(8), 0))
         ttk.Button(
             buttons,
             text=t("Wybierz…", "Choose…"),
             command=lambda selected_kind=kind: choose_sound(selected_kind),
-        ).grid(row=0, column=0, padx=(0, 4))
+        ).grid(row=0, column=0, padx=(0, px(4)))
         ttk.Button(
             buttons,
             text=t("Odsłuch", "Preview"),
             command=lambda selected_kind=kind: preview_sound(selected_kind),
-        ).grid(row=0, column=1, padx=4)
+        ).grid(row=0, column=1, padx=px(4))
         ttk.Button(
             buttons,
-            text=t("Wbudowany", "Built-in"),
-            command=lambda selected_kind=kind: sound_path_vars[selected_kind].set(""),
-        ).grid(row=0, column=2, padx=(4, 0))
+            text=t("Przywróć", "Reset"),
+            command=lambda selected_kind=kind: reset_sound(selected_kind),
+        ).grid(row=0, column=2, padx=(px(4), 0))
 
-    sounds_footer = ttk.Frame(sounds_tab)
-    sounds_footer.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+    sounds_footer = ttk.Frame(sounds_advanced)
+    sounds_footer.grid(
+        row=2,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(px(12), 0),
+    )
     ttk.Button(
         sounds_footer,
         text=t("Otwórz folder dźwięków", "Open sounds folder"),
@@ -3339,10 +4020,16 @@ def run_settings_window() -> int:
         background=colors["primary_soft"],
         highlightbackground=colors["primary_border"],
         highlightthickness=1,
-        padx=18,
-        pady=14,
+        padx=px(18),
+        pady=px(14),
     )
-    ollama_intro.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+    ollama_intro.grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
     tk.Label(
         ollama_intro,
         text=t("Funkcja opcjonalna", "Optional feature"),
@@ -3362,15 +4049,21 @@ def run_settings_window() -> int:
         foreground=colors["muted"],
         font=(ui_font_family, 9),
         justify="left",
-        wraplength=720,
-    ).pack(anchor="w", pady=(4, 0))
+        wraplength=px(720),
+    ).pack(anchor="w", pady=(px(4), 0))
 
     ollama_frame = ttk.LabelFrame(
         ollama_tab,
         text=t("Lokalna korekta tekstu", "Local text correction"),
-        padding=16,
+        padding=px(16),
     )
-    ollama_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+    ollama_frame.grid(
+        row=1,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
     ollama_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         ollama_frame,
@@ -3379,33 +4072,23 @@ def run_settings_window() -> int:
             "Enable local correction with Ollama",
         ),
         variable=ollama_enabled_var,
-    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 7))
-    ollama_url_entry = ttk.Entry(ollama_frame, textvariable=ollama_url_var)
-    add_field(
-        ollama_frame,
-        1,
-        t("Adres Ollamy", "Ollama address"),
-        ollama_url_entry,
+    ).grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(0, px(7)),
     )
     ollama_model_entry = ttk.Entry(ollama_frame, textvariable=ollama_model_var)
     add_field(
         ollama_frame,
-        2,
+        1,
         t("Nazwa modelu", "Model name"),
         ollama_model_entry,
         t(
             "Wpisz nazwę modelu pobranego wcześniej w Ollamie.",
             "Enter the name of a model already downloaded in Ollama.",
         ),
-    )
-    ollama_timeout_spin = ttk.Spinbox(
-        ollama_frame, from_=1, to=600, textvariable=ollama_timeout_var
-    )
-    add_field(
-        ollama_frame,
-        3,
-        t("Limit czasu (s)", "Timeout (s)"),
-        ollama_timeout_spin,
     )
     ttk.Label(
         ollama_frame,
@@ -3416,8 +4099,48 @@ def run_settings_window() -> int:
             "correction if it changes the text, numbers, or negations too much.",
         ),
         style="Muted.TLabel",
-        wraplength=720,
-    ).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        wraplength=px(720),
+    ).grid(
+        row=2,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(px(12), 0),
+    )
+
+    default_ollama = DEFAULT_CONFIG["ollama_cleanup"]
+    ollama_disclosure = create_disclosure(
+        ollama_tab,
+        2,
+        ollama_canvas,
+        t(
+            "Adres lokalnej usługi Ollama i limit oczekiwania na odpowiedź.",
+            "Local Ollama service address and response timeout.",
+        ),
+        name="advanced_ollama",
+        initially_expanded=(
+            str(ollama_url_var.get()) != str(default_ollama["url"])
+            or str(ollama_timeout_var.get())
+            != str(default_ollama["timeout_seconds"])
+        ),
+    )
+    ollama_advanced = ollama_disclosure["body"]
+    ollama_url_entry = ttk.Entry(ollama_advanced, textvariable=ollama_url_var)
+    add_field(
+        ollama_advanced,
+        0,
+        t("Adres Ollamy", "Ollama address"),
+        ollama_url_entry,
+    )
+    ollama_timeout_spin = ttk.Spinbox(
+        ollama_advanced, from_=1, to=600, textvariable=ollama_timeout_var
+    )
+    add_field(
+        ollama_advanced,
+        1,
+        t("Limit czasu (s)", "Timeout (s)"),
+        ollama_timeout_spin,
+    )
 
     ollama_controls = (
         ollama_url_entry,
@@ -3439,10 +4162,15 @@ def run_settings_window() -> int:
         background=colors["success_soft"],
         highlightbackground=colors["success_border"],
         highlightthickness=1,
-        padx=18,
-        pady=14,
+        padx=px(18),
+        pady=px(14),
     )
-    diagnostics_intro.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+    diagnostics_intro.grid(
+        row=0,
+        column=0,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
     tk.Label(
         diagnostics_intro,
         text=t(
@@ -3466,60 +4194,93 @@ def run_settings_window() -> int:
         foreground=colors["success"],
         font=(ui_font_family, 9),
         justify="left",
-        wraplength=700,
-    ).pack(anchor="w", pady=(4, 0))
+        wraplength=px(700),
+    ).pack(anchor="w", pady=(px(4), 0))
 
-    config_card = ttk.LabelFrame(
+    data_card = ttk.LabelFrame(
         files_tab,
-        text=t("Konfiguracja zaawansowana", "Advanced configuration"),
-        padding=16,
+        text=t("Diagnostyka i dane", "Diagnostics and data"),
+        padding=px(16),
     )
-    config_card.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+    data_card.grid(row=1, column=0, sticky="ew", pady=(0, px(14)))
+    data_card.columnconfigure(0, weight=1)
+    ttk.Label(
+        data_card,
+        text=str(LOG_PATH),
+        style="Muted.TLabel",
+        wraplength=px(700),
+    ).grid(row=0, column=0, sticky="ew", pady=(0, px(9)))
+    files_buttons = ttk.Frame(data_card)
+    files_buttons.grid(row=1, column=0, sticky="w")
+    ttk.Button(
+        files_buttons,
+        text=t("Otwórz log diagnostyczny", "Open diagnostic log"),
+        command=lambda: open_path(LOG_PATH),
+    ).grid(row=0, column=0, padx=(0, px(8)))
+    ttk.Button(
+        files_buttons,
+        text=t("Otwórz folder danych", "Open data folder"),
+        command=lambda: open_path(LOCALDATA_DIR),
+    ).grid(row=0, column=1)
+
+    help_disclosure = create_disclosure(
+        files_tab,
+        2,
+        files_canvas,
+        t(
+            "Bezpośrednia edycja pliku config.json — tylko do diagnostyki i niestandardowych zmian.",
+            "Direct config.json editing — only for diagnostics and custom changes.",
+        ),
+        name="advanced_help",
+    )
+    help_advanced = help_disclosure["body"]
+    config_card = ttk.LabelFrame(
+        help_advanced,
+        text=t("Plik konfiguracyjny", "Configuration file"),
+        padding=px(16),
+    )
+    config_card.grid(row=0, column=0, columnspan=3, sticky="ew")
     config_card.columnconfigure(0, weight=1)
     ttk.Label(
         config_card,
         text=str(CONFIG_PATH),
         style="Muted.TLabel",
-        wraplength=700,
-    ).grid(row=0, column=0, sticky="ew", pady=(0, 9))
+        wraplength=px(700),
+    ).grid(row=0, column=0, sticky="ew", pady=(0, px(9)))
     ttk.Button(
         config_card,
         text=t("Otwórz config.json…", "Open config.json…"),
         command=lambda: open_path(CONFIG_PATH),
     ).grid(row=1, column=0, sticky="w")
 
-    data_card = ttk.LabelFrame(
-        files_tab,
-        text=t("Dane, modele i diagnostyka", "Data, models, and diagnostics"),
-        padding=16,
-    )
-    data_card.grid(row=2, column=0, sticky="ew")
-    data_card.columnconfigure(0, weight=1)
-    ttk.Label(
-        data_card,
-        text=str(LOCALDATA_DIR),
-        style="Muted.TLabel",
-        wraplength=700,
-    ).grid(row=0, column=0, sticky="ew", pady=(0, 9))
-    files_buttons = ttk.Frame(data_card)
-    files_buttons.grid(row=1, column=0, sticky="w")
-    ttk.Button(
-        files_buttons,
-        text=t("Otwórz folder danych", "Open data folder"),
-        command=lambda: open_path(LOCALDATA_DIR),
-    ).grid(row=0, column=0, padx=(0, 8))
-    ttk.Button(
-        files_buttons,
-        text=t("Otwórz log diagnostyczny", "Open diagnostic log"),
-        command=lambda: open_path(LOG_PATH),
-    ).grid(row=0, column=1)
+    def reveal_validation_error(
+        page_key: str,
+        disclosure: dict[str, Any],
+        widget,
+    ) -> None:
+        show_page(page_key)
+        disclosure["reveal"](widget)
+
+    def validation_reveal(page_key: str, disclosure, widget):
+        return lambda: reveal_validation_error(page_key, disclosure, widget)
+
+    def focus_validation_error(page_key: str, widget) -> None:
+        show_page(page_key)
+        root.after_idle(widget.focus_set)
 
     def parse_int(
-        variable: tk.StringVar, label: str, minimum: int, maximum: int
+        variable: tk.StringVar,
+        label: str,
+        minimum: int,
+        maximum: int,
+        *,
+        on_error=None,
     ) -> int:
         try:
             value = int(variable.get().strip())
         except ValueError as exc:
+            if on_error is not None:
+                on_error()
             raise AppError(
                 t(
                     "Pole „{label}” musi być liczbą całkowitą.",
@@ -3528,6 +4289,8 @@ def run_settings_window() -> int:
                 )
             ) from exc
         if not minimum <= value <= maximum:
+            if on_error is not None:
+                on_error()
             raise AppError(
                 t(
                     "Pole „{label}” musi być w zakresie {minimum}–{maximum}.",
@@ -3540,11 +4303,18 @@ def run_settings_window() -> int:
         return value
 
     def parse_float(
-        variable: tk.StringVar, label: str, minimum: float, maximum: float
+        variable: tk.StringVar,
+        label: str,
+        minimum: float,
+        maximum: float,
+        *,
+        on_error=None,
     ) -> float:
         try:
             value = float(variable.get().strip().replace(",", "."))
         except ValueError as exc:
+            if on_error is not None:
+                on_error()
             raise AppError(
                 t(
                     "Pole „{label}” musi być liczbą.",
@@ -3553,6 +4323,8 @@ def run_settings_window() -> int:
                 )
             ) from exc
         if not minimum <= value <= maximum:
+            if on_error is not None:
+                on_error()
             raise AppError(
                 t(
                     "Pole „{label}” musi być w zakresie {minimum}–{maximum}.",
@@ -3564,12 +4336,75 @@ def run_settings_window() -> int:
             )
         return value
 
+    def parse_retained_int(
+        variable: tk.StringVar,
+        label: str,
+        minimum: int,
+        maximum: int,
+        *,
+        active: bool,
+        previous: Any,
+        fallback: int,
+        on_error,
+    ) -> int:
+        try:
+            return parse_int(
+                variable,
+                label,
+                minimum,
+                maximum,
+                on_error=on_error if active else None,
+            )
+        except AppError:
+            if active:
+                raise
+        for candidate in (previous, fallback):
+            try:
+                retained = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if minimum <= retained <= maximum:
+                return retained
+        return fallback
+
+    def parse_retained_float(
+        variable: tk.StringVar,
+        label: str,
+        minimum: float,
+        maximum: float,
+        *,
+        active: bool,
+        previous: Any,
+        fallback: float,
+        on_error,
+    ) -> float:
+        try:
+            return parse_float(
+                variable,
+                label,
+                minimum,
+                maximum,
+                on_error=on_error if active else None,
+            )
+        except AppError:
+            if active:
+                raise
+        for candidate in (previous, fallback):
+            try:
+                retained = float(str(candidate).replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+            if minimum <= retained <= maximum:
+                return retained
+        return fallback
+
     def collect_config() -> dict[str, Any]:
         updated = load_config()
         trigger = str(trigger_values.get(trigger_var.get(), trigger_var.get()))
         try:
             split_trigger(trigger)
         except AppError as exc:
+            focus_validation_error("dictation", trigger_combo)
             raise AppError(
                 t(
                     "Wybierz prawidłowy przycisk dyktowania.",
@@ -3588,8 +4423,14 @@ def run_settings_window() -> int:
             )
         ).strip()
         if not model:
+            reveal_validation_error(
+                "dictation", dictation_disclosure, model_combo
+            )
             raise AppError(t("Wybierz model mowy.", "Choose a speech model."))
         if device not in {"auto", "cpu", "cuda"}:
+            reveal_validation_error(
+                "dictation", dictation_disclosure, device_combo
+            )
             raise AppError(
                 t(
                     "Urządzenie musi mieć wartość auto, cpu albo cuda.",
@@ -3597,10 +4438,12 @@ def run_settings_window() -> int:
                 )
             )
         if not language:
+            focus_validation_error("dictation", language_combo)
             raise AppError(
                 t("Wybierz język dyktowania.", "Choose a dictation language.")
             )
         if ui_language not in {"auto", "pl", "en"}:
+            focus_validation_error("start", ui_language_combo)
             raise AppError(
                 t(
                     "Wybierz język interfejsu.",
@@ -3608,6 +4451,7 @@ def run_settings_window() -> int:
                 )
             )
         if microphone_var.get() not in microphone_values:
+            focus_validation_error("dictation", microphone_combo)
             raise AppError(
                 t("Wybierz mikrofon z listy.", "Choose a microphone from the list.")
             )
@@ -3619,78 +4463,135 @@ def run_settings_window() -> int:
         updated["ui_language"] = ui_language
         updated["microphone"] = microphone_values[microphone_var.get()]
         updated["cpu_threads"] = parse_int(
-            cpu_threads_var, t("Wątki CPU", "CPU threads"), 0, 256
+            cpu_threads_var,
+            t("Wątki CPU", "CPU threads"),
+            0,
+            256,
+            on_error=validation_reveal(
+                "dictation", dictation_disclosure, threads_spin
+            ),
         )
         updated["beam_size"] = parse_int(
             beam_size_var,
             t("Dokładność rozpoznawania", "Recognition accuracy"),
             1,
             10,
+            on_error=validation_reveal(
+                "dictation", dictation_disclosure, beam_spin
+            ),
         )
         updated["pre_roll_ms"] = parse_int(
             pre_roll_var,
             t("Bufor przed naciśnięciem", "Pre-roll buffer"),
             0,
             2000,
+            on_error=validation_reveal(
+                "audio", audio_disclosure, pre_roll_spin
+            ),
         )
         updated["post_roll_ms"] = parse_int(
             post_roll_var,
             t("Bufor po puszczeniu", "Post-release buffer"),
             0,
             2000,
+            on_error=validation_reveal(
+                "audio", audio_disclosure, post_roll_spin
+            ),
         )
         updated["minimum_recording_ms"] = parse_int(
             minimum_recording_var,
             t("Minimalne nagranie", "Minimum recording"),
             0,
             10000,
+            on_error=validation_reveal(
+                "audio", audio_disclosure, minimum_recording_spin
+            ),
         )
         updated["minimum_rms"] = parse_float(
             minimum_rms_var,
             t("Minimalna głośność RMS", "Minimum RMS level"),
             0.0,
             1.0,
+            on_error=validation_reveal(
+                "audio", audio_disclosure, minimum_rms_entry
+            ),
         )
 
         updated.setdefault("vad", {})
+        vad_active = bool(vad_enabled_var.get())
         updated["vad"].update(
             {
-                "enabled": bool(vad_enabled_var.get()),
-                "threshold": parse_float(
+                "enabled": vad_active,
+                "threshold": parse_retained_float(
                     vad_threshold_var,
                     t("Próg VAD", "VAD threshold"),
                     0.0,
                     1.0,
+                    active=vad_active,
+                    previous=updated["vad"].get("threshold"),
+                    fallback=float(DEFAULT_CONFIG["vad"]["threshold"]),
+                    on_error=validation_reveal(
+                        "audio", audio_disclosure, vad_threshold_entry
+                    ),
                 ),
-                "min_speech_duration_ms": parse_int(
+                "min_speech_duration_ms": parse_retained_int(
                     vad_min_speech_var,
                     t("Minimalna mowa", "Minimum speech"),
                     0,
                     10000,
+                    active=vad_active,
+                    previous=updated["vad"].get("min_speech_duration_ms"),
+                    fallback=int(
+                        DEFAULT_CONFIG["vad"]["min_speech_duration_ms"]
+                    ),
+                    on_error=validation_reveal(
+                        "audio", audio_disclosure, vad_speech_spin
+                    ),
                 ),
-                "min_silence_duration_ms": parse_int(
+                "min_silence_duration_ms": parse_retained_int(
                     vad_min_silence_var,
                     t("Minimalna cisza", "Minimum silence"),
                     0,
                     10000,
+                    active=vad_active,
+                    previous=updated["vad"].get("min_silence_duration_ms"),
+                    fallback=int(
+                        DEFAULT_CONFIG["vad"]["min_silence_duration_ms"]
+                    ),
+                    on_error=validation_reveal(
+                        "audio", audio_disclosure, vad_silence_spin
+                    ),
                 ),
-                "speech_pad_ms": parse_int(
+                "speech_pad_ms": parse_retained_int(
                     vad_speech_pad_var,
                     t("Margines mowy", "Speech padding"),
                     0,
                     3000,
+                    active=vad_active,
+                    previous=updated["vad"].get("speech_pad_ms"),
+                    fallback=int(DEFAULT_CONFIG["vad"]["speech_pad_ms"]),
+                    on_error=validation_reveal(
+                        "audio", audio_disclosure, vad_pad_spin
+                    ),
                 ),
             }
         )
         updated.setdefault("dictionary", {})
+        dictionary_active = bool(dictionary_enabled_var.get())
         updated["dictionary"].update(
             {
-                "enabled": bool(dictionary_enabled_var.get()),
-                "max_terms": parse_int(
+                "enabled": dictionary_active,
+                "max_terms": parse_retained_int(
                     dictionary_max_terms_var,
                     t("Maksymalna liczba haseł", "Maximum number of entries"),
                     0,
                     5000,
+                    active=dictionary_active,
+                    previous=updated["dictionary"].get("max_terms"),
+                    fallback=int(DEFAULT_CONFIG["dictionary"]["max_terms"]),
+                    on_error=validation_reveal(
+                        "text", text_disclosure, dictionary_limit_spin
+                    ),
                 ),
             }
         )
@@ -3698,6 +4599,7 @@ def run_settings_window() -> int:
         paste_enabled = bool(paste_enabled_var.get())
         copy_to_clipboard = bool(copy_to_clipboard_var.get())
         if not paste_enabled and not copy_to_clipboard:
+            focus_validation_error("text", paste_enabled_check)
             raise AppError(
                 t(
                     "Włącz automatyczne wklejanie albo kopiowanie do schowka.",
@@ -3709,11 +4611,17 @@ def run_settings_window() -> int:
                 "enabled": paste_enabled,
                 "copy_to_clipboard": copy_to_clipboard,
                 "append_space": bool(append_space_var.get()),
-                "delay_ms": parse_int(
+                "delay_ms": parse_retained_int(
                     paste_delay_var,
                     t("Opóźnienie przed Ctrl+V", "Delay before Ctrl+V"),
                     0,
                     5000,
+                    active=paste_enabled,
+                    previous=updated["paste"].get("delay_ms"),
+                    fallback=int(DEFAULT_CONFIG["paste"]["delay_ms"]),
+                    on_error=validation_reveal(
+                        "text", text_disclosure, paste_delay_spin
+                    ),
                 ),
             }
         )
@@ -3728,36 +4636,51 @@ def run_settings_window() -> int:
         updated.setdefault("voice_commands", {})
         updated["voice_commands"]["enabled"] = bool(voice_commands_var.get())
         updated.setdefault("ollama_cleanup", {})
+        ollama_active = bool(ollama_enabled_var.get())
         updated["ollama_cleanup"].update(
             {
-                "enabled": bool(ollama_enabled_var.get()),
+                "enabled": ollama_active,
                 "url": ollama_url_var.get().strip() or "http://127.0.0.1:11434",
                 "model": ollama_model_var.get().strip(),
-                "timeout_seconds": parse_int(
+                "timeout_seconds": parse_retained_int(
                     ollama_timeout_var,
                     t("Limit czasu Ollamy", "Ollama timeout"),
                     1,
                     600,
+                    active=ollama_active,
+                    previous=updated["ollama_cleanup"].get("timeout_seconds"),
+                    fallback=int(
+                        DEFAULT_CONFIG["ollama_cleanup"]["timeout_seconds"]
+                    ),
+                    on_error=validation_reveal(
+                        "integrations", ollama_disclosure, ollama_timeout_spin
+                    ),
                 ),
             }
         )
         if updated["ollama_cleanup"]["enabled"] and not updated[
             "ollama_cleanup"
         ]["model"]:
+            focus_validation_error("integrations", ollama_model_entry)
             raise AppError(
                 t(
                     "Korekta Ollama jest włączona, ale pole „Nazwa modelu” jest puste.",
                     "Ollama correction is enabled, but the “Model name” field is empty.",
                 )
             )
-        updated["feedback"]["custom_sounds"] = {
-            kind: import_custom_sound(
-                kind,
-                sound_path_vars[kind].get(),
-                translator,
-            )
-            for kind in ("start", "stop", "done", "error")
-        }
+        try:
+            updated["feedback"]["custom_sounds"] = {
+                kind: import_custom_sound(
+                    kind,
+                    sound_path_vars[kind].get(),
+                    translator,
+                )
+                for kind in ("start", "stop", "done", "error")
+            }
+        except Exception:
+            show_page("sounds")
+            sounds_disclosure["reveal"]()
+            raise
         return updated
 
     tracked_variables: list[tk.Variable] = [
@@ -3811,8 +4734,13 @@ def run_settings_window() -> int:
         footer,
         textvariable=status_var,
         style="Muted.TLabel",
-        wraplength=360,
-    ).grid(row=0, column=1, sticky="w", padx=(7, 12))
+        wraplength=px(360),
+    ).grid(
+        row=0,
+        column=1,
+        sticky="w",
+        padx=(px(7), px(12)),
+    )
     footer.columnconfigure(1, weight=1)
 
     def update_status_indicator(*args) -> None:
@@ -3943,15 +4871,40 @@ def run_settings_window() -> int:
         ollama_url_var.set(str(default_ollama["url"]))
         ollama_model_var.set(str(default_ollama["model"]))
         ollama_timeout_var.set(str(default_ollama["timeout_seconds"]))
-        dirty_state["dirty"] = True
-        apply_button.configure(state="normal")
-        set_status(
+        refresh_dirty_state()
+        if dirty_state["dirty"]:
+            set_status(
+                t(
+                    "Przywrócono wartości domyślne. Zapisz i uruchom ponownie, aby je zachować.",
+                    "Defaults restored. Save and restart to keep them.",
+                ),
+                "warning",
+            )
+        else:
+            set_status(
+                t(
+                    "Wszystkie ustawienia mają już wartości domyślne.",
+                    "All settings are already at their defaults.",
+                )
+            )
+
+    def confirm_restore_defaults() -> None:
+        if not messagebox.askyesno(
             t(
-                "Przywrócono wartości domyślne. Zastosuj, aby je zapisać.",
-                "Defaults restored. Apply changes to save them.",
+                "{app} — przywróć wszystkie ustawienia",
+                "{app} — Reset all settings",
+                app=APP_DISPLAY_NAME,
             ),
-            "warning",
-        )
+            t(
+                "Przywrócić wszystkie ustawienia, również zaawansowane? "
+                "Nic nie zostanie zapisane, dopóki nie wybierzesz „Zapisz i uruchom ponownie”.",
+                "Reset every setting, including advanced options? Nothing is saved "
+                "until you choose “Save and restart”.",
+            ),
+            parent=root,
+        ):
+            return
+        restore_defaults()
 
     def close_window() -> None:
         if dirty_state["dirty"] and not messagebox.askyesno(
@@ -3971,24 +4924,24 @@ def run_settings_window() -> int:
 
     ttk.Button(
         footer,
-        text=t("Przywróć domyślne", "Restore defaults"),
-        command=restore_defaults,
-    ).grid(row=0, column=2, padx=4)
+        text=t("Przywróć wszystko…", "Reset all…"),
+        command=confirm_restore_defaults,
+    ).grid(row=0, column=2, padx=px(4))
     ttk.Button(
         footer,
         text=t("Zamknij", "Close"),
         command=close_window,
     ).grid(
-        row=0, column=3, padx=4
+        row=0, column=3, padx=px(4)
     )
     apply_button = ttk.Button(
         footer,
-        text=t("Zastosuj zmiany", "Apply changes"),
+        text=t("Zapisz i uruchom ponownie", "Save and restart"),
         style="Primary.TButton",
         command=lambda: save_from_window(True),
         state="disabled",
     )
-    apply_button.grid(row=0, column=4, padx=(4, 0))
+    apply_button.grid(row=0, column=4, padx=(px(4), 0))
 
     root.bind("<Control-s>", lambda event: save_from_window(False))
     root.bind(

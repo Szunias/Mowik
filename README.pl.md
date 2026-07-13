@@ -25,7 +25,7 @@ Bez chmury, bez abonamentu i bez wysyłania głosu do internetu.
 - **Push-to-talk**: dyktujesz tylko wtedy, gdy trzymasz wybrany klawisz lub przycisk myszy.
 - **W pełni lokalnie**: rozpoznawanie mowy (faster-whisper) działa na Twoim komputerze; po jednorazowym pobraniu modelu internet nie jest potrzebny.
 - **Wykrywanie przycisku jednym kliknięciem**: wybierz `Wykryj…` i naciśnij dowolny klawisz albo przycisk myszy.
-- **Graficzny panel ustawień** w zasobniku systemowym: model, mikrofon, VAD, schowek, dźwięki i więcej, bez edytowania JSON-a.
+- **Czytelny panel ustawień** w zasobniku systemowym: na co dzień pokazuje tylko najważniejsze wybory, a model, GPU/CPU, VAD i szczegóły połączeń są dostępne na żądanie w **ustawieniach zaawansowanych**.
 - **Polski i angielski interfejs** z automatycznym dopasowaniem do języka Windows oraz trwałym przełącznikiem języka.
 - **Łagodne sygnały wbudowane i własne dźwięki WAV** dla startu nagrywania, puszczenia przycisku, gotowego tekstu i błędu, z odsłuchem i opcjonalnym zapętleniem.
 - **Elastyczne wyjście**: automatyczne wklejanie do aktywnego okna, kopiowanie do schowka albo jedno i drugie.
@@ -53,7 +53,7 @@ Bez chmury, bez abonamentu i bez wysyłania głosu do internetu.
 
 Instalator wymaga 64-bitowego Windows 10 w wersji 1809 lub nowszej albo Windows 11. Działa bez uprawnień administratora, dodaje Mówika do menu Start i tworzy normalny wpis w **Ustawienia → Aplikacje**. Opcjonalnie może dodać skrót na pulpicie i uruchamiać program po zalogowaniu. Pierwszy start jednorazowo pobiera lokalny model mowy do `%LOCALAPPDATA%\Mowik\models`; później rozpoznawanie działa offline.
 
-Instalator proponuje język zgodny z interfejsem Windows i pozwala go potwierdzić lub zmienić. Aplikacja domyślnie dopasowuje język automatycznie; w Centrum Mówika możesz niezależnie wybrać **Automatycznie**, **Polski** albo **English**. Zastosowanie zmiany uruchamia Mówika ponownie.
+Instalator proponuje język zgodny z interfejsem Windows i pozwala go potwierdzić lub zmienić. Aplikacja domyślnie dopasowuje język automatycznie; w Centrum Mówika możesz niezależnie wybrać **Automatycznie**, **Polski** albo **English**, a następnie **Zapisz i uruchom ponownie**.
 
 Obecne wydanie nie jest jeszcze podpisane płatnym certyfikatem Authenticode, dlatego Windows SmartScreen może pokazać komunikat „Nieznany wydawca”. Pobieraj instalator wyłącznie z oficjalnego wydania GitHub i w razie wątpliwości porównaj SHA-256 z dołączonym `SHA256SUMS.txt`.
 
@@ -65,17 +65,17 @@ Jeśli przechodzisz ze starej wersji ZIP 2.2.0 lub wcześniejszej, również uż
 
 ## Centrum Mówika
 
-Kliknij prawym przyciskiem ikonę mikrofonu przy zegarze Windows (czasem pod strzałką **Pokaż ukryte ikony**) i wybierz **Panel ustawień…**. Centrum Mówika ma ekran startowy z aktywnym skrótem, mikrofonem i modelem oraz boczną nawigację do pozostałych opcji.
+Kliknij prawym przyciskiem ikonę mikrofonu przy zegarze Windows (czasem pod strzałką **Pokaż ukryte ikony**) i wybierz **Panel ustawień…**. Centrum Mówika ma ekran startowy z aktywnym skrótem, mikrofonem i profilem jakości oraz boczną nawigację do pozostałych opcji. Parametry techniczne są schowane w rozwijanych **ustawieniach zaawansowanych**, dlatego domyślny widok zawiera tylko decyzje potrzebne na co dzień.
 
 | Sekcja | Zawartość |
 |---|---|
-| Start | aktywny skrót, mikrofon, model i najważniejsze informacje o prywatności |
-| Dyktowanie | przycisk dyktowania, mikrofon, model, miejsce przetwarzania, język i dokładność |
-| Mikrofon i mowa | bufory początku i końca nagrania, czułość i wykrywanie ciszy |
+| Start | aktywny skrót, mikrofon, profil jakości, język interfejsu i najważniejsze informacje o prywatności |
+| Dyktowanie | profil jakości, przycisk, mikrofon i język; model, GPU/CPU, dokładność i wątki w ustawieniach zaawansowanych |
+| Mikrofon i mowa | automatyczne wykrywanie mowy; bufory, czułość i szczegóły ciszy w ustawieniach zaawansowanych |
 | Tekst i słownik | wklejanie, kopiowanie, końcowa spacja, komendy głosowe i prywatny słownik |
-| Dźwięki | sygnały wbudowane, własne WAV-y, odsłuch, zapętlenie, powiadomienia |
-| Integracje | opcjonalny lokalny korektor LLM przez Ollamę |
-| Pomoc i diagnostyka | szybki dostęp do konfiguracji, bezpiecznego logu i folderu danych |
+| Dźwięki | sygnały i powiadomienia; własne WAV-y, odsłuch i zapętlenie w ustawieniach zaawansowanych |
+| Integracje | opcjonalny lokalny korektor LLM przez Ollamę, ze szczegółami połączenia w ustawieniach zaawansowanych |
+| Pomoc i diagnostyka | najpierw bezpieczny log i folder danych; `config.json` w ustawieniach zaawansowanych |
 
 Kolorowa plakietka ikony w zasobniku pokazuje bieżący stan: gotowość, nagrywanie, przetwarzanie albo błąd.
 
@@ -109,7 +109,7 @@ Nie można wyłączyć obu opcji naraz. Gdy kopiowanie jest włączone, schowek 
 
 ## Własne dźwięki
 
-W sekcji **Dźwięki** możesz przypisać osobny plik do każdego zdarzenia: naciśnięcie, puszczenie, gotowy tekst, błąd. Obsługiwane są nieskompresowane pliki `.wav` (PCM) do 50 MB. Po zapisaniu plik jest kopiowany do `%APPDATA%\Mowik\sounds`, więc działa nawet po usunięciu oryginału. Przycisk **Wbudowany** przywraca krótki ton programu.
+W sekcji **Dźwięki** rozwiń **ustawienia zaawansowane**, aby przypisać osobny plik do każdego zdarzenia: naciśnięcie, puszczenie, gotowy tekst, błąd. Obsługiwane są nieskompresowane pliki `.wav` (PCM) do 50 MB. Po zapisaniu plik jest kopiowany do `%APPDATA%\Mowik\sounds`, więc działa nawet po usunięciu oryginału. Pole pokazuje **Wbudowany**, gdy działa krótki ton programu; przycisk **Przywróć** wraca do tego dźwięku.
 
 ## Słownik nazw i terminów
 
