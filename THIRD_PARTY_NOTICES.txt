@@ -14,6 +14,7 @@ Najważniejsze komponenty:
 - pystray — LGPL-3.0 — https://github.com/moses-palmer/pystray
 - Pillow — HPND — https://github.com/python-pillow/Pillow
 - Pyperclip — BSD-3-Clause — https://github.com/asweigart/pyperclip
+- pywin32 — PSF-2.0 — https://github.com/mhammond/pywin32
 - PyAV / FFmpeg — BSD-3-Clause oraz licencje FFmpeg — https://github.com/PyAV-Org/PyAV
 - NVIDIA CUDA, cuBLAS i cuDNN — warunki NVIDIA Software License Agreement —
   https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/

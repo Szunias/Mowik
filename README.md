@@ -67,6 +67,7 @@ Mówik Center keeps everyday controls clear and moves technical options into exp
 - **English and Polish interface** with automatic Windows-language detection and a persistent language selector.
 - **Subtle built-in sound cues and custom WAV files** for recording start, key release, completed text, and errors, with previews and optional looping.
 - **Optional on-screen dictation indicator** with a green recording dot, a processing animation, a success check mark, and an error X.
+- **Jarvis-style custom commands** on a separate push-to-talk shortcut: insert saved text, open an app/file/website, or open a terminal in the active File Explorer folder with a safe clipboard draft.
 - **Flexible text output**: paste into the active window, copy to the clipboard, or do both.
 - **Private vocabulary**: provide names, brands, and specialist terms as hints for the speech model.
 - **Pre-roll audio buffer**: reduces clipped first syllables by keeping a short microphone buffer in RAM.
@@ -94,7 +95,7 @@ The installer requires 64-bit Windows 10 version 1809 or later, or Windows 11. I
 
 On first launch, Mówik downloads the selected local speech model to `%LOCALAPPDATA%\Mowik\models`. Transcription works offline after that download is complete.
 
-The current release is not yet signed with a paid Authenticode certificate, so Windows SmartScreen may display an “Unknown publisher” warning. Download the installer only from the official GitHub release. If in doubt, compare its SHA-256 checksum with the included `SHA256SUMS.txt`.
+Local developer builds are unsigned unless a trusted Authenticode certificate is supplied, so Windows SmartScreen may display an “Unknown publisher” warning. Public releases must be signed and timestamped by the release pipeline; still download only from the official GitHub release, check the displayed publisher, and compare SHA-256 with `SHA256SUMS.txt` when in doubt. A signature improves identity and reputation but cannot guarantee that a brand-new file hash will never trigger SmartScreen.
 
 ### Updating an existing installation
 
@@ -114,6 +115,7 @@ Mówik Center opens with an overview of the active push-to-talk key, microphone,
 | Dictation | Dyktowanie | quality profile, shortcut, microphone, and language; model, GPU/CPU, accuracy, and threads under Advanced settings |
 | Microphone and speech | Mikrofon i mowa | automatic speech detection; recording buffers, sensitivity, and detailed silence controls under Advanced settings |
 | Text and dictionary | Tekst i słownik | pasting, copying, trailing space, voice commands, and private vocabulary |
+| Custom commands | Własne komendy | separate shortcut, spoken phrases, text templates, app/file/website launchers, and safe “terminal here” drafts |
 | Sounds | Dźwięki | sound cues and notifications; custom WAV files, previews, and looping under Advanced settings |
 | Integrations | Integracje | optional local LLM correction through Ollama, with connection details under Advanced settings |
 | Help and diagnostics | Pomoc i diagnostyka | privacy-safe log and application data first; direct `config.json` access under Advanced settings |
@@ -154,7 +156,7 @@ When clipboard copying is enabled, the clipboard contains the exact transcriptio
 
 ## Visual feedback and custom sounds
 
-The optional **On-screen dictation indicator** under **Sounds → Feedback** provides immediate visual confirmation without taking focus from the application where you are typing. It shows a small green dot while recording, a compact animation while the recording is processed, a check mark after the text is delivered successfully, and an X if an error occurs. Clear the checkbox in Mówik Settings to hide the indicator; sound cues and Windows notifications can be configured independently.
+The optional **On-screen dictation indicator** under **Sounds → Feedback** provides immediate visual confirmation without taking focus from the application where you are typing. It shows a small green dot for regular dictation and a distinct violet indicator for custom commands. Both modes have their own processing animation and success check; errors use an X. Clear the checkbox in Mówik Settings to hide the indicator; sound cues and Windows notifications can be configured independently.
 
 In **Sounds** (**Dźwięki** in Polish), expand **Advanced settings** to assign a separate sound to each event: push-to-talk pressed, push-to-talk released, text ready, and error.
 
@@ -179,6 +181,30 @@ When voice commands are enabled under **Text and dictionary**, Mówik recognizes
 
 Voice commands are disabled by default so that ordinary sentences containing these phrases are not transformed unexpectedly.
 
+## Custom commands and actions
+
+Custom commands use a second push-to-talk shortcut, **F7** by default, while **F8** remains regular dictation. Open **Custom commands**, add a spoken phrase, and choose one of three actions:
+
+- **Insert text** — paste a saved block exactly as written. Multi-line text always requires confirmation because pasting it into a terminal could execute content.
+- **Open an app, file, or website** — launch an existing absolute local path or an HTTPS URL; confirmation is always required, while scripts, shortcuts, and network paths are blocked.
+- **Open terminal** — start Windows Terminal or a visible classic console in the folder captured from the active File Explorer window, a selected fixed folder, or the home folder.
+
+Terminal commands deliberately use a draft workflow. A command can match the exact phrase and only open the terminal, or treat the remainder of the utterance as a single-line draft. Mówik validates that draft, copies it to the clipboard, and never types it into the terminal or presses Enter. You review it, paste it with `Ctrl+V`, and submit it yourself. Arbitrary saved `cmd.exe` execution and legacy `run_command` entries are disabled.
+
+Exact matching is used for text and open actions. Terminal drafts use explicit prefix-and-tail matching: the configured phrase must be at the start on a complete token boundary, and the longest matching phrase wins. There is no fuzzy or substring execution. If an active-Explorer command was started from a virtual location, network path, missing folder, or an unidentifiable window, the action fails closed instead of falling back to another directory.
+
+Mówik captures the Explorer identity when F7 is pressed, not after transcription completes. Open and terminal actions are also blocked if Mówik is running with administrator privileges, preventing child programs from silently inheriting an elevated token. Multi-line insert actions are length-bounded so their confirmation shows the complete content. Command phrases and content remain plain local data in `%APPDATA%\Mowik\config.json`; do not store passwords, tokens, or other secrets there.
+
+The violet on-screen indicator distinguishes command capture from regular green dictation. It uses its own processing animation and success mark, and can be disabled under **Sounds → Feedback**.
+
+### Antivirus and SmartScreen transparency
+
+Mówik does not obfuscate code, disable antivirus protection, create Defender exclusions, hide command shells, or download executable updates. The Windows build is one-directory rather than a self-extracting one-file binary, uses an `asInvoker` manifest, keeps autostart opt-in, and does not execute terminal drafts. These choices reduce suspicious behavior but cannot replace Authenticode signing and normal reputation building. If a signed official artifact is falsely detected, report that exact final file to Microsoft as a software developer instead of weakening the user's security settings.
+
+Hold F7, speak the configured phrase, and release it. If no valid exact or terminal-prefix match is found, Mówik performs no action and never falls back to inserting the utterance as dictation. Command recognition also bypasses voice-command replacements and Ollama correction so the trigger phrase cannot be rewritten unexpectedly.
+
+Speech recognition remains local, but an action that opens a website or starts a network-aware program may of course use that program's internet connection.
+
 ## Optional LLM correction with Ollama
 
 Ollama is not required for speech recognition. It can optionally correct punctuation and obvious spelling mistakes after transcription:
@@ -192,6 +218,7 @@ Mówik rejects the corrected result if it changes the original text, numbers, or
 
 - Audio is kept temporarily in RAM and recordings are never saved.
 - Technical logs do not contain dictated text.
+- Custom-command phrases and payloads are not written to the technical log, but they are stored locally in `config.json` so they can be edited.
 - Transcription runs locally. Once the speech model has been downloaded, no internet connection is required.
 - If enabled, Ollama is contacted through the local address `127.0.0.1`.
 
@@ -226,10 +253,10 @@ Mówik cannot insert text into an application running as administrator unless M�
 ## Repair, startup, and building
 
 - Running the same installer again repairs application files without deleting user data.
-- Automatic startup can be selected in the setup wizard. Running the installer again allows you to change that option.
+- Automatic startup is an unchecked, explicit opt-in in the setup wizard. Running the installer again allows you to change that option.
 - The interface language can follow Windows automatically or be set explicitly to English or Polish in Mówik Center.
 - `BUDUJ_EXE.cmd` builds the application directory at `dist\Mowik`.
-- `BUDUJ_INSTALATOR.cmd` runs the tests, builds the application, and creates `release\Mowik-x.y.z-Setup.exe` together with its SHA-256 checksum.
+- `BUDUJ_INSTALATOR.cmd` runs the tests, builds the application, and creates the explicitly local-only `release\Mowik-x.y.z-Setup-UNSIGNED.exe` together with its SHA-256 checksum. Do not publish that developer artifact. The GitHub release workflow is the only path that produces the signed `Mowik-x.y.z-Setup.exe` name.
 - Reproducible release definitions are stored in `packaging`, and the GitHub Actions workflow is located at `.github/workflows/windows-release.yml`.
 
 ## License

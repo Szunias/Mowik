@@ -43,6 +43,12 @@
   "voice_commands": {
     "enabled": false
   },
+  "custom_commands": {
+    "schema_version": 1,
+    "enabled": false,
+    "trigger": "keyboard:f7",
+    "items": []
+  },
   "ollama_cleanup": {
     "enabled": false,
     "url": "http://127.0.0.1:11434",

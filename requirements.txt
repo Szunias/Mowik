@@ -1,8 +1,11 @@
 faster-whisper==1.2.1
 ctranslate2==4.8.1
-numpy>=1.26,<3
+# Exact direct dependency versions keep public build inputs auditable and
+# reduce needless binary/hash churn that resets download reputation.
+numpy==2.4.6
 sounddevice==0.5.5
-pynput>=1.7.7,<2
+pynput==1.8.2
 pystray==0.19.5
-Pillow>=10,<13
-pyperclip>=1.9,<2
+Pillow==12.3.0
+pyperclip==1.11.0
+pywin32==312
