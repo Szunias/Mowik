@@ -20,6 +20,27 @@ Bez chmury, bez abonamentu i bez wysyłania głosu do internetu.
 
 </div>
 
+## Podgląd interfejsu
+
+Centrum Mówika pokazuje na co dzień tylko najważniejsze ustawienia, a opcje techniczne przenosi do rozwijanych sekcji zaawansowanych. Kliknij podgląd, aby otworzyć go w pełnym rozmiarze.
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-home-pl.png">
+        <img src="assets/screenshots/mowik-home-pl.png" alt="Centrum Mówika — ekran Start w języku polskim" width="100%">
+      </a>
+      <br><sub><strong>Ekran startowy</strong> · polski interfejs</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-dictation-en.png">
+        <img src="assets/screenshots/mowik-dictation-en.png" alt="Centrum Mówika — ustawienia dyktowania w języku angielskim" width="100%">
+      </a>
+      <br><sub><strong>Dyktowanie i wydajność</strong> · angielski interfejs</sub>
+    </td>
+  </tr>
+</table>
+
 ## Możliwości
 
 - **Push-to-talk**: dyktujesz tylko wtedy, gdy trzymasz wybrany klawisz lub przycisk myszy.

@@ -23,6 +23,27 @@ No cloud, no subscription, and no voice uploads.
 > [!NOTE]
 > The application interface is available in English and Polish. By default, Mówik follows the Windows display language; you can override it in Mówik Center with **Save and restart**.
 
+## Interface preview
+
+Mówik Center keeps everyday controls clear and moves technical options into expandable advanced sections. Select either preview to open it at full size.
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-home-pl.png">
+        <img src="assets/screenshots/mowik-home-pl.png" alt="Mówik Center home screen in Polish" width="100%">
+      </a>
+      <br><sub><strong>Home overview</strong> · Polish interface</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-dictation-en.png">
+        <img src="assets/screenshots/mowik-dictation-en.png" alt="Mówik Center dictation settings in English" width="100%">
+      </a>
+      <br><sub><strong>Dictation and performance</strong> · English interface</sub>
+    </td>
+  </tr>
+</table>
+
 ## Features
 
 - **Push-to-talk**: Mówik transcribes a dictation only while you hold the selected keyboard key or mouse button.
