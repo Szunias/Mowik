@@ -4,7 +4,7 @@ cd /d "%~dp0"
 title Mowik - budowanie instalatora Windows
 set "PYTHONUTF8=1"
 
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-release.ps1" -Version "2.7.2"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build-release.ps1" -Version "2.7.3"
 if errorlevel 1 goto :fail
 
 echo.

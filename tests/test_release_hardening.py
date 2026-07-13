@@ -371,6 +371,17 @@ class ReleasePipelineHardeningTests(unittest.TestCase):
         self.assertIn("[Text.ASCIIEncoding]::new()", script)
         self.assertNotIn("[Text.ASCIIEncoding]::new($false)", script)
 
+    def test_artifact_gate_uses_named_powershell_parameters(self) -> None:
+        script = (ROOT / "scripts" / "build-release.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("$ArtifactTestArguments = @{", script)
+        self.assertIn("& $ArtifactTestScript @ArtifactTestArguments", script)
+        self.assertNotIn(
+            "Invoke-Checked (Join-Path $PSScriptRoot 'test-release-artifacts.ps1')",
+            script,
+        )
+
     def test_unsigned_installer_qa_requires_explicit_name_and_not_signed_state(self) -> None:
         script = (ROOT / "scripts" / "test-installer.ps1").read_text(
             encoding="utf-8"
@@ -575,7 +586,7 @@ class ReleasePowerShellBehaviorTests(unittest.TestCase):
             "WERSJA.txt",
             "install.ps1",
         )
-        command = "& $env:MOWIK_TEST_VERSION_SCRIPT -Version 2.7.2"
+        command = "& $env:MOWIK_TEST_VERSION_SCRIPT -Version 2.7.3"
         for scenario in ("stale-comment", "duplicate"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
                 project = Path(temp)
@@ -594,12 +605,12 @@ class ReleasePowerShellBehaviorTests(unittest.TestCase):
                 content = source_file.read_text(encoding="utf-8")
                 if scenario == "stale-comment":
                     content = content.replace(
-                        'APP_VERSION = "2.7.2"',
-                        'APP_VERSION = "9.9.9"\n# APP_VERSION = "2.7.2"',
+                        'APP_VERSION = "2.7.3"',
+                        'APP_VERSION = "9.9.9"\n# APP_VERSION = "2.7.3"',
                         1,
                     )
                 else:
-                    content += '\nAPP_VERSION = "2.7.2"\n'
+                    content += '\nAPP_VERSION = "2.7.3"\n'
                 source_file.write_text(content, encoding="utf-8")
                 self.run_powershell(
                     command, environment=environment, expect_success=False
