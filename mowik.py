@@ -170,7 +170,7 @@ import pyperclip
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 MUTEX_NAME = r"Local\MowikLocalDictation"
 SAMPLE_RATE = 16_000
 
@@ -224,6 +224,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "feedback": {
         "sounds": True,
         "notifications": True,
+        "floating_indicator": True,
         "loop_recording_sound": False,
         "custom_sounds": {
             "start": "",
@@ -1447,6 +1448,528 @@ def make_tray_image(state: str = "idle") -> Image.Image:
     return image
 
 
+STATUS_INDICATOR_STATES = frozenset(
+    {"hidden", "recording", "processing", "success", "error"}
+)
+STATUS_INDICATOR_SIZE = 56
+STATUS_INDICATOR_BOTTOM_MARGIN = 34
+STATUS_INDICATOR_MIN_PROCESSING_SECONDS = 0.25
+STATUS_INDICATOR_SUCCESS_SECONDS = 0.9
+STATUS_INDICATOR_ERROR_SECONDS = 1.1
+
+
+def status_indicator_window_position(
+    work_area: tuple[int, int, int, int],
+    size: int = STATUS_INDICATOR_SIZE,
+    bottom_margin: int = STATUS_INDICATOR_BOTTOM_MARGIN,
+) -> tuple[int, int]:
+    """Wycentruj wskaźnik nad dolną krawędzią obszaru roboczego monitora."""
+    left, top, right, bottom = (int(value) for value in work_area)
+    if right <= left or bottom <= top:
+        raise ValueError("The monitor work area must have a positive size")
+    size = max(1, int(size))
+    bottom_margin = max(0, int(bottom_margin))
+    max_x = max(left, right - size)
+    max_y = max(top, bottom - size)
+    x = left + (right - left - size) // 2
+    y = bottom - bottom_margin - size
+    return min(max(x, left), max_x), min(max(y, top), max_y)
+
+
+def render_status_indicator_frame(
+    state: str,
+    frame: int = 0,
+    size: int = STATUS_INDICATOR_SIZE,
+) -> Image.Image:
+    """Renderuj antyaliasowaną klatkę pływającego wskaźnika dyktowania."""
+    if state not in STATUS_INDICATOR_STATES:
+        raise ValueError(f"Unknown status indicator state: {state}")
+    size = max(16, int(size))
+    scale = 4
+    canvas_size = size * scale
+    image = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+    if state == "hidden":
+        return image.resize((size, size), Image.Resampling.LANCZOS)
+
+    draw = ImageDraw.Draw(image)
+    center = canvas_size // 2
+
+    def circle(radius: float) -> tuple[int, int, int, int]:
+        scaled_radius = int(round(radius * scale))
+        return (
+            center - scaled_radius,
+            center - scaled_radius,
+            center + scaled_radius,
+            center + scaled_radius,
+        )
+
+    backing_radius = size * 0.39
+    draw.ellipse(circle(backing_radius), fill=(15, 23, 42, 246))
+
+    if state == "recording":
+        pulse_step = abs((int(frame) % 20) - 10) / 10
+        ring_radius = size * (0.235 + 0.035 * pulse_step)
+        draw.ellipse(
+            circle(ring_radius),
+            outline=(134, 239, 172, 255),
+            width=max(scale * 2, 1),
+        )
+        draw.ellipse(circle(size * 0.125), fill=(34, 197, 94, 255))
+    elif state == "processing":
+        spinner_box = circle(size * 0.245)
+        draw.ellipse(
+            spinner_box,
+            outline=(51, 65, 85, 255),
+            width=max(scale * 3, 1),
+        )
+        start = (int(frame) * 18 - 90) % 360
+        draw.arc(
+            spinner_box,
+            start=start,
+            end=start + 245,
+            fill=(96, 165, 250, 255),
+            width=max(scale * 3, 1),
+        )
+    elif state == "success":
+        draw.ellipse(circle(size * 0.285), fill=(22, 163, 74, 255))
+        points = (
+            (center - int(size * 0.14 * scale), center),
+            (
+                center - int(size * 0.035 * scale),
+                center + int(size * 0.11 * scale),
+            ),
+            (
+                center + int(size * 0.16 * scale),
+                center - int(size * 0.13 * scale),
+            ),
+        )
+        draw.line(
+            points,
+            fill=(255, 255, 255, 255),
+            width=max(scale * 3, 1),
+            joint="curve",
+        )
+    else:
+        draw.ellipse(circle(size * 0.285), fill=(220, 38, 38, 255))
+        offset = int(size * 0.12 * scale)
+        width = max(scale * 3, 1)
+        draw.line(
+            (center - offset, center - offset, center + offset, center + offset),
+            fill=(255, 255, 255, 255),
+            width=width,
+        )
+        draw.line(
+            (center + offset, center - offset, center - offset, center + offset),
+            fill=(255, 255, 255, 255),
+            width=width,
+        )
+
+    return image.resize((size, size), Image.Resampling.LANCZOS)
+
+
+class _IndicatorRect(ctypes.Structure):
+    _fields_ = (
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    )
+
+
+class _IndicatorMonitorInfo(ctypes.Structure):
+    _fields_ = (
+        ("cbSize", ctypes.c_ulong),
+        ("rcMonitor", _IndicatorRect),
+        ("rcWork", _IndicatorRect),
+        ("dwFlags", ctypes.c_ulong),
+    )
+
+
+def active_monitor_work_area() -> Optional[tuple[int, int, int, int]]:
+    """Zwróć obszar roboczy monitora z aktualnie aktywnym oknem."""
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_IndicatorMonitorInfo),
+        ]
+        user32.GetMonitorInfoW.restype = ctypes.c_bool
+        window = user32.GetForegroundWindow()
+        monitor = user32.MonitorFromWindow(window, 2)  # nearest monitor
+        if not monitor:
+            return None
+        info = _IndicatorMonitorInfo()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+        work = info.rcWork
+        return work.left, work.top, work.right, work.bottom
+    except (AttributeError, OSError):
+        logging.debug(
+            "Nie udało się ustalić monitora dla wskaźnika",
+            exc_info=True,
+        )
+        return None
+
+
+class FloatingStatusIndicator:
+    """Nieaktywujące okno statusu sterowane bezpiecznie z dowolnego wątku."""
+
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = bool(enabled and os.name == "nt")
+        self._commands: queue.Queue[
+            Optional[tuple[str, Optional[tuple[int, int, int, int]]]]
+        ] = queue.Queue()
+        self._root = None
+        self._command_lock = threading.Lock()
+        self._closed = threading.Event()
+        self._failed = threading.Event()
+
+    def start(self) -> bool:
+        """Przygotuj Tk w głównym wątku przed uruchomieniem pętli zasobnika."""
+        if self._root is not None:
+            return True
+        if not self.enabled or self._closed.is_set() or self._failed.is_set():
+            return False
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("The status indicator must start on the main thread")
+        return self._prepare_window()
+
+    def show(self, state: str) -> None:
+        if state not in STATUS_INDICATOR_STATES - {"hidden"}:
+            raise ValueError(f"Unknown status indicator state: {state}")
+        with self._command_lock:
+            if not self.enabled or self._closed.is_set() or self._failed.is_set():
+                return
+            self._commands.put((state, active_monitor_work_area()))
+
+    def recording(self) -> None:
+        self.show("recording")
+
+    def processing(self) -> None:
+        self.show("processing")
+
+    def success(self) -> None:
+        self.show("success")
+
+    def error(self) -> None:
+        self.show("error")
+
+    def hide(self) -> None:
+        with self._command_lock:
+            if not self.enabled or self._closed.is_set() or self._failed.is_set():
+                return
+            self._commands.put(("hidden", None))
+
+    def close(self) -> None:
+        with self._command_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            self._commands.put(None)
+
+    def run(self) -> None:
+        """Uruchom pętlę wskaźnika w głównym wątku procesu."""
+        if self._root is None and not self.start():
+            return
+        root = self._root
+        if root is None:
+            return
+        try:
+            root.mainloop()
+        except Exception:
+            self._failed.set()
+            logging.exception("Błąd pętli wskaźnika dyktowania")
+        finally:
+            self._root = None
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _window_handle(root) -> int:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        user32.GetAncestor.restype = ctypes.c_void_p
+        widget = ctypes.c_void_p(int(root.winfo_id()))
+        return int(user32.GetAncestor(widget, 2) or widget.value or 0)
+
+    @classmethod
+    def _configure_no_activate(cls, root) -> int:
+        hwnd = cls._window_handle(root)
+        if not hwnd:
+            raise ctypes.WinError()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        long_ptr = (
+            ctypes.c_longlong
+            if ctypes.sizeof(ctypes.c_void_p) == 8
+            else ctypes.c_long
+        )
+        get_style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        set_style = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+        get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        get_style.restype = long_ptr
+        set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, long_ptr]
+        set_style.restype = long_ptr
+        ex_style = int(get_style(ctypes.c_void_p(hwnd), -20))
+        ex_style |= 0x00000020  # WS_EX_TRANSPARENT: clicks pass through
+        ex_style |= 0x00000080  # WS_EX_TOOLWINDOW: no taskbar / Alt+Tab
+        ex_style |= 0x08000000  # WS_EX_NOACTIVATE: preserve paste target
+        ctypes.set_last_error(0)
+        previous = set_style(ctypes.c_void_p(hwnd), -20, long_ptr(ex_style))
+        if previous == 0 and ctypes.get_last_error() != 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return hwnd
+
+    @staticmethod
+    def _show_no_activate(
+        root,
+        hwnd: int,
+        x: int,
+        y: int,
+        size: int,
+    ) -> None:
+        root.deiconify()
+        root.update_idletasks()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.ShowWindow.restype = ctypes.c_bool
+        user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = ctypes.c_bool
+        user32.ShowWindow(ctypes.c_void_p(hwnd), 4)  # SW_SHOWNOACTIVATE
+        positioned = user32.SetWindowPos(
+            ctypes.c_void_p(hwnd),
+            ctypes.c_void_p(-1),  # HWND_TOPMOST
+            x,
+            y,
+            size,
+            size,
+            0x0010 | 0x0040,  # SWP_NOACTIVATE | SWP_SHOWWINDOW
+        )
+        if not positioned:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _prepare_window(self) -> bool:
+        root = None
+        try:
+            import tkinter as tk
+            from PIL import ImageTk
+
+            transparent = "#010203"
+            root = tk.Tk(className=APP_NAME)
+            root.withdraw()
+            root.title(f"{APP_DISPLAY_NAME} status")
+            root.overrideredirect(True)
+            root.configure(background=transparent)
+            root.attributes("-topmost", True)
+            root.wm_attributes("-transparentcolor", transparent)
+
+            ui_scale = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
+            window_size = max(40, int(round(STATUS_INDICATOR_SIZE * ui_scale)))
+            bottom_margin = max(
+                0,
+                int(round(STATUS_INDICATOR_BOTTOM_MARGIN * ui_scale)),
+            )
+            root.geometry(f"{window_size}x{window_size}+0+0")
+            canvas = tk.Canvas(
+                root,
+                width=window_size,
+                height=window_size,
+                background=transparent,
+                borderwidth=0,
+                highlightthickness=0,
+            )
+            canvas.pack(fill="both", expand=True)
+            root.update_idletasks()
+            hwnd = self._configure_no_activate(root)
+
+            current_state = "hidden"
+            current_frame = 0
+            generation = 0
+            processing_started = 0.0
+            current_photo = None
+            poll_pending = False
+
+            def report_callback_exception(exc_type, exc, traceback) -> None:
+                self._failed.set()
+                logging.error(
+                    "Błąd obsługi wskaźnika dyktowania",
+                    exc_info=(exc_type, exc, traceback),
+                )
+                try:
+                    root.withdraw()
+                    schedule_poll(100)
+                except Exception:
+                    logging.exception(
+                        "Nie udało się bezpiecznie wyłączyć wskaźnika"
+                    )
+                    root.quit()
+
+            root.report_callback_exception = report_callback_exception
+
+            def fallback_work_area() -> tuple[int, int, int, int]:
+                return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+
+            def render_current() -> None:
+                nonlocal current_photo
+                if current_state == "hidden":
+                    return
+                frame_image = render_status_indicator_frame(
+                    current_state,
+                    current_frame,
+                    window_size,
+                )
+                current_photo = ImageTk.PhotoImage(frame_image, master=root)
+                canvas.delete("all")
+                canvas.create_image(
+                    window_size // 2,
+                    window_size // 2,
+                    image=current_photo,
+                )
+
+            def hide_if_current(token: int) -> None:
+                nonlocal current_state
+                if token != generation or self._failed.is_set():
+                    return
+                current_state = "hidden"
+                root.withdraw()
+
+            def show_terminal(
+                state: str,
+                work_area: Optional[tuple[int, int, int, int]],
+                token: int,
+            ) -> None:
+                nonlocal current_state, current_frame
+                if token != generation or self._failed.is_set():
+                    return
+                current_state = state
+                current_frame = 0
+                area = work_area or fallback_work_area()
+                x, y = status_indicator_window_position(
+                    area,
+                    window_size,
+                    bottom_margin,
+                )
+                root.geometry(f"{window_size}x{window_size}{x:+d}{y:+d}")
+                render_current()
+                self._show_no_activate(root, hwnd, x, y, window_size)
+                visible_seconds = (
+                    STATUS_INDICATOR_SUCCESS_SECONDS
+                    if state == "success"
+                    else STATUS_INDICATOR_ERROR_SECONDS
+                )
+                root.after(
+                    int(visible_seconds * 1000),
+                    lambda: hide_if_current(token),
+                )
+
+            def animate_if_current(token: int) -> None:
+                nonlocal current_frame
+                if (
+                    token != generation
+                    or self._failed.is_set()
+                    or current_state not in {"recording", "processing"}
+                ):
+                    return
+                current_frame += 1
+                render_current()
+                root.after(50, lambda: animate_if_current(token))
+
+            def apply_command(
+                state: str,
+                work_area: Optional[tuple[int, int, int, int]],
+            ) -> None:
+                nonlocal current_state, current_frame
+                nonlocal generation, processing_started
+                generation += 1
+                token = generation
+                if state == "hidden":
+                    current_state = "hidden"
+                    root.withdraw()
+                    return
+                if state in {"success", "error"} and current_state == "processing":
+                    elapsed = time.monotonic() - processing_started
+                    remaining = STATUS_INDICATOR_MIN_PROCESSING_SECONDS - elapsed
+                    if remaining > 0:
+                        root.after(
+                            max(1, int(remaining * 1000)),
+                            lambda: show_terminal(state, work_area, token),
+                        )
+                        root.after(50, lambda: animate_if_current(token))
+                        return
+                if state in {"success", "error"}:
+                    show_terminal(state, work_area, token)
+                    return
+                current_state = state
+                current_frame = 0
+                if state == "processing":
+                    processing_started = time.monotonic()
+                area = work_area or fallback_work_area()
+                x, y = status_indicator_window_position(
+                    area,
+                    window_size,
+                    bottom_margin,
+                )
+                root.geometry(f"{window_size}x{window_size}{x:+d}{y:+d}")
+                render_current()
+                self._show_no_activate(root, hwnd, x, y, window_size)
+                root.after(50, lambda: animate_if_current(token))
+
+            def schedule_poll(delay: int) -> None:
+                nonlocal poll_pending
+                if poll_pending:
+                    return
+                poll_pending = True
+                root.after(delay, poll_commands)
+
+            def poll_commands() -> None:
+                nonlocal poll_pending
+                poll_pending = False
+                try:
+                    while True:
+                        command = self._commands.get_nowait()
+                        if command is None:
+                            root.quit()
+                            return
+                        if not self._failed.is_set():
+                            apply_command(*command)
+                except queue.Empty:
+                    pass
+                if self._failed.is_set():
+                    schedule_poll(100)
+                else:
+                    delay = 25 if current_state != "hidden" else 60
+                    schedule_poll(delay)
+
+            schedule_poll(0)
+            self._root = root
+            return True
+        except Exception:
+            self._failed.set()
+            logging.exception("Nie udało się uruchomić wskaźnika dyktowania")
+            if root is not None:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            return False
+
+
 def settings_process_args() -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, "--settings"]
@@ -2073,6 +2596,9 @@ def run_settings_window() -> int:
     sounds_var = tk.BooleanVar(value=bool(feedback.get("sounds", True)))
     notifications_var = tk.BooleanVar(
         value=bool(feedback.get("notifications", True))
+    )
+    floating_indicator_var = tk.BooleanVar(
+        value=bool(feedback.get("floating_indicator", True))
     )
     loop_recording_sound_var = tk.BooleanVar(
         value=bool(feedback.get("loop_recording_sound", False))
@@ -3794,6 +4320,38 @@ def run_settings_window() -> int:
         text=t("Powiadomienia Windows", "Windows notifications"),
         variable=notifications_var,
     ).grid(row=0, column=1, sticky="w", pady=px(4))
+    ttk.Checkbutton(
+        feedback_frame,
+        text=t(
+            "Wskaźnik dyktowania na ekranie",
+            "On-screen dictation indicator",
+        ),
+        variable=floating_indicator_var,
+    ).grid(
+        row=1,
+        column=0,
+        columnspan=2,
+        sticky="w",
+        pady=(px(7), px(2)),
+    )
+    ttk.Label(
+        feedback_frame,
+        text=t(
+            "Pokazuje zieloną kropkę podczas nagrywania, animację podczas "
+            "przetwarzania i ✓ po zakończeniu.",
+            "Shows a green dot while recording, an animation while processing, "
+            "and ✓ when done.",
+        ),
+        style="Muted.TLabel",
+        wraplength=px(700),
+    ).grid(
+        row=2,
+        column=0,
+        columnspan=2,
+        sticky="w",
+        padx=(px(25), 0),
+        pady=(0, px(4)),
+    )
     sounds_have_custom_values = bool(loop_recording_sound_var.get()) or any(
         bool(variable.get().strip()) for variable in sound_path_vars.values()
     )
@@ -4630,6 +5188,7 @@ def run_settings_window() -> int:
             {
                 "sounds": bool(sounds_var.get()),
                 "notifications": bool(notifications_var.get()),
+                "floating_indicator": bool(floating_indicator_var.get()),
                 "loop_recording_sound": bool(loop_recording_sound_var.get()),
             }
         )
@@ -4709,6 +5268,7 @@ def run_settings_window() -> int:
         paste_delay_var,
         sounds_var,
         notifications_var,
+        floating_indicator_var,
         loop_recording_sound_var,
         voice_commands_var,
         ollama_enabled_var,
@@ -4860,6 +5420,9 @@ def run_settings_window() -> int:
         default_feedback = DEFAULT_CONFIG["feedback"]
         sounds_var.set(bool(default_feedback["sounds"]))
         notifications_var.set(bool(default_feedback["notifications"]))
+        floating_indicator_var.set(
+            bool(default_feedback["floating_indicator"])
+        )
         loop_recording_sound_var.set(
             bool(default_feedback["loop_recording_sound"])
         )
@@ -5122,6 +5685,10 @@ class MowikApp:
         self.status = self.translator.t("Uruchamianie…", "Starting…")
         self.tray_state = "idle"
         self._status_lock = threading.Lock()
+        feedback = config.get("feedback", {})
+        self.dictation_indicator = FloatingStatusIndicator(
+            bool(feedback.get("floating_indicator", True))
+        )
         self._restart_lock = threading.Lock()
         self._restart_started = False
         self.worker = threading.Thread(
@@ -5266,6 +5833,7 @@ class MowikApp:
 
     def begin_dictation(self) -> None:
         if not self.model_ready.is_set() or self.recorder is None:
+            self.dictation_indicator.error()
             self.beep("error")
             self.set_status(
                 self.translator.t(
@@ -5290,8 +5858,10 @@ class MowikApp:
         try:
             self.recorder.begin()
             self.capture_active = True
+            self.dictation_indicator.recording()
         except Exception as exc:
             self._release_busy()
+            self.dictation_indicator.error()
             logging.exception("Nie udało się rozpocząć nagrywania")
             self.set_status(
                 self.translator.t("Błąd nagrywania", "Recording error"),
@@ -5312,6 +5882,7 @@ class MowikApp:
             return
         self.capture_active = False
         self._release_started_at = time.perf_counter()
+        self.dictation_indicator.processing()
         # Kończymy także dłuższy, niezapętlony WAV przypisany do nagrywania.
         self.stop_feedback_sound()
         threading.Thread(
@@ -5326,6 +5897,7 @@ class MowikApp:
         except Exception as exc:
             logging.exception("Nie udało się zakończyć nagrywania")
             self._release_busy()
+            self.dictation_indicator.error()
             self.set_status(
                 self.translator.t("Błąd nagrywania", "Recording error"),
                 notify=self._error_notification(),
@@ -5340,10 +5912,12 @@ class MowikApp:
             time.sleep(post_roll)
         if self.stop_event.is_set():
             self._release_busy()
+            self.dictation_indicator.hide()
             return
         recorder = self.recorder
         if recorder is None:
             self._release_busy()
+            self.dictation_indicator.hide()
             return
         audio = recorder.finish()
         self.beep("stop")
@@ -5353,6 +5927,7 @@ class MowikApp:
             / 1000
         )
         if len(audio) < minimum_samples:
+            self.dictation_indicator.error()
             self.set_status(
                 self.translator.t(
                     "Nagranie było zbyt krótkie",
@@ -5379,6 +5954,7 @@ class MowikApp:
             try:
                 text = self.transcribe(audio)
                 if not text:
+                    self.dictation_indicator.error()
                     self.set_status(
                         self.translator.t(
                             "Nie wykryłem wyraźnej mowy",
@@ -5440,9 +6016,11 @@ class MowikApp:
                     ),
                     state="ready",
                 )
+                self.dictation_indicator.success()
                 self.beep("done")
             except Exception as exc:
                 logging.exception("Błąd przetwarzania dyktowania")
+                self.dictation_indicator.error()
                 self.set_status(
                     self.translator.t(
                         "Błąd dyktowania",
@@ -5746,6 +6324,7 @@ class MowikApp:
         if self.stop_event.is_set():
             return
         self.stop_event.set()
+        self.dictation_indicator.close()
         self.stop_feedback_sound()
         self.model_ready.clear()
         self.jobs.put(None)
@@ -5843,8 +6422,21 @@ class MowikApp:
             f"{APP_DISPLAY_NAME} — {self.status}",
             menu,
         )
-        self.start()
-        self.tray.run()
+        indicator_ready = self.dictation_indicator.start()
+        try:
+            self.start()
+            if indicator_ready:
+                self.tray.run_detached()
+                self.dictation_indicator.run()
+            else:
+                self.tray.run()
+        finally:
+            self.shutdown()
+            if indicator_ready:
+                # Jeśli start aplikacji nie doszedł do głównej pętli, ta krótka
+                # pętla przetworzy polecenie zamknięcia i zniszczy Tk w tym samym
+                # (głównym) wątku, w którym zostało utworzone.
+                self.dictation_indicator.run()
 
 
 def acquire_single_instance(
@@ -6092,6 +6684,7 @@ def main() -> int:
             )
         )
 
+    enable_windows_dpi_awareness()
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             "Mowik.LocalDictation"

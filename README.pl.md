@@ -20,6 +20,41 @@ Bez chmury, bez abonamentu i bez wysyłania głosu do internetu.
 
 </div>
 
+## Podgląd interfejsu
+
+Centrum Mówika pokazuje na co dzień tylko najważniejsze ustawienia, a opcje techniczne przenosi do rozwijanych sekcji zaawansowanych. Kliknij dowolny podgląd, aby otworzyć go w pełnym rozmiarze.
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-home-pl.png">
+        <img src="assets/screenshots/mowik-home-pl.png" alt="Centrum Mówika — ekran Start w języku polskim" width="100%">
+      </a>
+      <br><sub><strong>Ekran startowy</strong> · polski interfejs</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-dictation-en.png">
+        <img src="assets/screenshots/mowik-dictation-en.png" alt="Centrum Mówika — ustawienia dyktowania w języku angielskim" width="100%">
+      </a>
+      <br><sub><strong>Dyktowanie i wydajność</strong> · angielski interfejs</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-sounds-pl.png">
+        <img src="assets/screenshots/mowik-sounds-pl.png" alt="Centrum Mówika — ustawienia informacji zwrotnych po polsku" width="100%">
+      </a>
+      <br><sub><strong>Informacje zwrotne</strong> · polski interfejs</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-sounds-en.png">
+        <img src="assets/screenshots/mowik-sounds-en.png" alt="Centrum Mówika — ustawienia informacji zwrotnych po angielsku" width="100%">
+      </a>
+      <br><sub><strong>Informacje zwrotne</strong> · angielski interfejs</sub>
+    </td>
+  </tr>
+</table>
+
 ## Możliwości
 
 - **Push-to-talk**: dyktujesz tylko wtedy, gdy trzymasz wybrany klawisz lub przycisk myszy.
@@ -28,6 +63,7 @@ Bez chmury, bez abonamentu i bez wysyłania głosu do internetu.
 - **Czytelny panel ustawień** w zasobniku systemowym: na co dzień pokazuje tylko najważniejsze wybory, a model, GPU/CPU, VAD i szczegóły połączeń są dostępne na żądanie w **ustawieniach zaawansowanych**.
 - **Polski i angielski interfejs** z automatycznym dopasowaniem do języka Windows oraz trwałym przełącznikiem języka.
 - **Łagodne sygnały wbudowane i własne dźwięki WAV** dla startu nagrywania, puszczenia przycisku, gotowego tekstu i błędu, z odsłuchem i opcjonalnym zapętleniem.
+- **Opcjonalny ekranowy wskaźnik dyktowania** z zieloną kropką nagrywania, animacją przetwarzania, znacznikiem sukcesu i symbolem X przy błędzie.
 - **Elastyczne wyjście**: automatyczne wklejanie do aktywnego okna, kopiowanie do schowka albo jedno i drugie.
 - **Prywatny słownik**: nazwiska, marki i fachowe terminy jako podpowiedź dla modelu.
 - **Bufor sprzed naciśnięcia**: pierwsza sylaba nie jest ucinana, bo mikrofon trzyma krótki bufor w pamięci RAM.
@@ -107,7 +143,9 @@ Dwa niezależne ustawienia w sekcji **Tekst i słownik**:
 
 Nie można wyłączyć obu opcji naraz. Gdy kopiowanie jest włączone, schowek zawiera dokładną transkrypcję; opcjonalna końcowa spacja jest wysyłana osobno do aktywnego okna i nie trafia do kopiowanego tekstu.
 
-## Własne dźwięki
+## Informacje zwrotne i własne dźwięki
+
+Opcjonalny **Wskaźnik dyktowania na ekranie** w sekcji **Dźwięki → Informacje zwrotne** daje natychmiastowe potwierdzenie wizualne bez odbierania fokusu aplikacji, w której piszesz. Podczas nagrywania pokazuje małą zieloną kropkę, po puszczeniu przycisku — krótką animację przetwarzania, po pomyślnym przekazaniu tekstu — znacznik wyboru, a przy błędzie — symbol X. Wskaźnik można wyłączyć w ustawieniach Mówika; sygnały dźwiękowe i powiadomienia Windows konfiguruje się niezależnie.
 
 W sekcji **Dźwięki** rozwiń **ustawienia zaawansowane**, aby przypisać osobny plik do każdego zdarzenia: naciśnięcie, puszczenie, gotowy tekst, błąd. Obsługiwane są nieskompresowane pliki `.wav` (PCM) do 50 MB. Po zapisaniu plik jest kopiowany do `%APPDATA%\Mowik\sounds`, więc działa nawet po usunięciu oryginału. Pole pokazuje **Wbudowany**, gdy działa krótki ton programu; przycisk **Przywróć** wraca do tego dźwięku.
 

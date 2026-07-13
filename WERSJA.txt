@@ -1,2 +1,2 @@
-Mowik 2.5.0
-Prostsze Centrum Mówika z ustawieniami zaawansowanymi na żądanie, naturalną obsługą klawiatury i ostrym skalowaniem HiDPI.
+Mowik 2.6.0
+Opcjonalny wskaźnik dyktowania na ekranie: zielona kropka podczas nagrywania, animacja podczas przetwarzania i znacznik zakończenia; można go włączyć lub wyłączyć w ustawieniach.
