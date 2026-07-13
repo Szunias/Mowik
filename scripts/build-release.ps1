@@ -5,7 +5,7 @@ param(
     [string]$Version = '2.7.0',
 
     [Parameter()]
-    [ValidateSet('UnsignedLocal', 'SignedRelease')]
+    [ValidateSet('UnsignedLocal', 'UnsignedRelease', 'SignedRelease')]
     [string]$BuildMode = 'UnsignedLocal',
 
     [Parameter()]
@@ -22,6 +22,9 @@ param(
     [string]$SignToolPath,
 
     [Parameter()]
+    [string]$InnoCompilerPath,
+
+    [Parameter()]
     [switch]$SkipTests,
 
     [Parameter()]
@@ -34,7 +37,7 @@ param(
     [switch]$UsePreparedApplication,
 
     [Parameter()]
-    [string]$PreparedAppSha256
+    [string]$PreparedAppManifestPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,47 +105,39 @@ function Write-NewAsciiFile {
     }
 }
 
-function Find-InnoCompiler {
-    $Command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-    if ($null -ne $Command) {
-        return $Command.Source
-    }
-
-    $Candidates = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
-    )
-    foreach ($Candidate in $Candidates) {
-        if (Test-Path -LiteralPath $Candidate) {
-            return $Candidate
-        }
-    }
-    return $null
-}
-
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'Instalator Mówika można zbudować wyłącznie w Windows.'
 }
 
 $IsSignedRelease = $BuildMode -eq 'SignedRelease'
+$IsUnsignedRelease = $BuildMode -eq 'UnsignedRelease'
+$IsReleaseBuild = $IsSignedRelease -or $IsUnsignedRelease
 $ResolvedSignTool = $null
+$ResolvedInnoCompiler = $null
 $SigningCertificate = $null
 
 if ($PrepareApplicationOnly -and $UsePreparedApplication) {
     throw '-PrepareApplicationOnly and -UsePreparedApplication are mutually exclusive.'
 }
-if ($PrepareApplicationOnly -and $IsSignedRelease) {
+if ($PrepareApplicationOnly -and $IsReleaseBuild) {
     throw '-PrepareApplicationOnly must use the UnsignedLocal build mode.'
 }
 if ($UsePreparedApplication -and (-not $IsSignedRelease)) {
     throw '-UsePreparedApplication is allowed only for SignedRelease.'
 }
-if ($UsePreparedApplication -and $PreparedAppSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
-    throw '-UsePreparedApplication requires an exact -PreparedAppSha256 value.'
+if (($PrepareApplicationOnly -or $UsePreparedApplication) -and
+    [string]::IsNullOrWhiteSpace($PreparedAppManifestPath)) {
+    throw '-PrepareApplicationOnly and -UsePreparedApplication require -PreparedAppManifestPath.'
+}
+if ((-not $PrepareApplicationOnly) -and (-not $UsePreparedApplication) -and
+    -not [string]::IsNullOrWhiteSpace($PreparedAppManifestPath)) {
+    throw '-PreparedAppManifestPath is valid only for a prepared-application build.'
 }
 
 if ($IsSignedRelease) {
+    if (-not $UsePreparedApplication) {
+        throw 'SignedRelease requires -UsePreparedApplication and its verified directory manifest.'
+    }
     if ($SkipTests) {
         throw 'SignedRelease cannot be built with -SkipTests.'
     }
@@ -152,6 +147,12 @@ if ($IsSignedRelease) {
     if ([string]::IsNullOrWhiteSpace($TimestampServer)) {
         throw 'SignedRelease requires an explicit RFC 3161 -TimestampServer.'
     }
+    if ([string]::IsNullOrWhiteSpace($InnoCompilerPath)) {
+        throw 'SignedRelease requires a preinstalled, verified -InnoCompilerPath.'
+    }
+    if (-not $SkipToolInstall) {
+        throw 'SignedRelease requires -SkipToolInstall so no installer is downloaded after key import.'
+    }
     if (Test-Path -LiteralPath $ReleaseDir) {
         throw (
             "SignedRelease refuses to replace an existing release directory: $ReleaseDir. " +
@@ -160,6 +161,7 @@ if ($IsSignedRelease) {
     }
 
     $ResolvedSignTool = Resolve-SignToolPath -SignToolPath $SignToolPath
+    $ResolvedInnoCompiler = Resolve-InnoCompiler -InnoCompilerPath $InnoCompilerPath
     $SigningCertificate = Assert-CodeSigningCertificate `
         -Thumbprint $SigningCertificateThumbprint `
         -StoreLocation $SigningCertificateStore
@@ -167,9 +169,28 @@ if ($IsSignedRelease) {
 }
 elseif ($SigningCertificateThumbprint -or $TimestampServer -or $SignToolPath) {
     throw (
-        'Signing parameters were supplied to an UnsignedLocal build. ' +
+        'Signing parameters were supplied to an unsigned build. ' +
         'Pass -BuildMode SignedRelease to enable the fail-closed signing pipeline.'
     )
+}
+
+if ($IsUnsignedRelease) {
+    if ($SkipTests) {
+        throw 'UnsignedRelease cannot be built with -SkipTests.'
+    }
+    if ([string]::IsNullOrWhiteSpace($InnoCompilerPath)) {
+        throw 'UnsignedRelease requires a preinstalled, verified -InnoCompilerPath.'
+    }
+    if (-not $SkipToolInstall) {
+        throw 'UnsignedRelease requires -SkipToolInstall so release tools stay pinned.'
+    }
+    if (Test-Path -LiteralPath $ReleaseDir) {
+        throw (
+            "UnsignedRelease refuses to replace an existing release directory: $ReleaseDir. " +
+            'Move or remove it explicitly after checking its contents.'
+        )
+    }
+    $ResolvedInnoCompiler = Resolve-InnoCompiler -InnoCompilerPath $InnoCompilerPath
 }
 
 Set-Location $Root
@@ -195,7 +216,7 @@ if (-not $UsePreparedApplication) {
     Write-Host "[3/7] Buduję aplikację Windows..." -ForegroundColor Cyan
     Remove-ProjectDirectory $BuildDir
     Remove-ProjectDirectory $DistDir
-    if ((-not $IsSignedRelease) -and (-not $PrepareApplicationOnly)) {
+    if ((-not $IsReleaseBuild) -and (-not $PrepareApplicationOnly)) {
         Remove-ProjectDirectory $ReleaseDir
     }
     Invoke-Checked $Python @('-m', 'PyInstaller', '--noconfirm', '--clean', 'packaging\Mowik.spec')
@@ -203,7 +224,7 @@ if (-not $UsePreparedApplication) {
         throw "PyInstaller nie utworzył pliku: $AppExe"
     }
     $BuiltVersion = (Get-Item -LiteralPath $AppExe).VersionInfo.ProductVersion
-    if ($BuiltVersion -notlike "$Version*") {
+    if ($BuiltVersion -cne $Version) {
         throw "Metadane Mowik.exe mają wersję '$BuiltVersion', oczekiwano '$Version'."
     }
     Invoke-Checked $Python @('scripts\test-exe-manifest.py', $AppExe)
@@ -213,9 +234,14 @@ if (-not $UsePreparedApplication) {
     }
 
     if ($PrepareApplicationOnly) {
-        $PreparedHash = (Get-FileHash -LiteralPath $AppExe -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-DirectoryIntegrityManifest `
+            -Directory (Join-Path $DistDir 'Mowik') `
+            -ManifestPath $PreparedAppManifestPath
+        $ManifestHash = (
+            Get-FileHash -LiteralPath $PreparedAppManifestPath -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
         Write-Host "Prepared unsigned application: $AppExe" -ForegroundColor Green
-        Write-Host "Mowik.exe SHA-256: $PreparedHash"
+        Write-Host "Directory manifest SHA-256: $ManifestHash"
         return
     }
 }
@@ -225,13 +251,12 @@ else {
         throw "Prepared Mowik.exe was not found: $AppExe"
     }
     $BuiltVersion = (Get-Item -LiteralPath $AppExe).VersionInfo.ProductVersion
-    if ($BuiltVersion -notlike "$Version*") {
+    if ($BuiltVersion -cne $Version) {
         throw "Prepared Mowik.exe has version '$BuiltVersion', expected '$Version'."
     }
-    $ActualPreparedHash = (Get-FileHash -LiteralPath $AppExe -Algorithm SHA256).Hash
-    if ($ActualPreparedHash -ine $PreparedAppSha256) {
-        throw 'Prepared Mowik.exe changed after the unsigned build and verification phase.'
-    }
+    Assert-DirectoryIntegrityManifest `
+        -Directory (Join-Path $DistDir 'Mowik') `
+        -ManifestPath $PreparedAppManifestPath
     $PreparedSignature = Get-AuthenticodeSignature -LiteralPath $AppExe
     if ($PreparedSignature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
         throw "Prepared Mowik.exe must be unsigned, got $($PreparedSignature.Status)."
@@ -252,13 +277,35 @@ if ($IsSignedRelease) {
         -CertificateStoreLocation $SigningCertificateStore `
         -TimestampServer $TimestampServer `
         -SignToolPath $ResolvedSignTool
+
+    $SignedAppManifestPath = "$PreparedAppManifestPath.signed"
+    Write-DirectoryIntegrityManifest `
+        -Directory (Join-Path $DistDir 'Mowik') `
+        -ManifestPath $SignedAppManifestPath
+    Assert-DirectoryIntegrityManifestTransition `
+        -BeforeManifestPath $PreparedAppManifestPath `
+        -AfterManifestPath $SignedAppManifestPath `
+        -AllowedChangedPath 'Mowik.exe'
 }
 else {
-    Write-Host "[4/7] Pomijam podpis: jawny lokalny build deweloperski." -ForegroundColor Yellow
+    $UnsignedBuildLabel = if ($IsUnsignedRelease) { 'release' } else { 'lokalny build deweloperski' }
+    Write-Host "[4/7] Pomijam podpis: jawny unsigned $UnsignedBuildLabel." -ForegroundColor Yellow
+}
+
+if ($IsUnsignedRelease) {
+    $AppSignature = Get-AuthenticodeSignature -LiteralPath $AppExe
+    if ($AppSignature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+        throw "UnsignedRelease expected an unsigned Mowik.exe, got $($AppSignature.Status)."
+    }
 }
 
 Write-Host "[5/7] Przygotowuję Inno Setup..." -ForegroundColor Cyan
-$Iscc = Find-InnoCompiler
+$Iscc = if ($null -ne $ResolvedInnoCompiler) {
+    $ResolvedInnoCompiler
+}
+else {
+    Resolve-InnoCompiler -InnoCompilerPath $InnoCompilerPath
+}
 if (($null -eq $Iscc) -and (-not $SkipToolInstall)) {
     $Winget = Get-Command winget.exe -ErrorAction SilentlyContinue
     if ($null -eq $Winget) {
@@ -269,14 +316,14 @@ if (($null -eq $Iscc) -and (-not $SkipToolInstall)) {
         '--silent', '--accept-package-agreements', '--accept-source-agreements',
         '--disable-interactivity'
     )
-    $Iscc = Find-InnoCompiler
+    $Iscc = Resolve-InnoCompiler
 }
 if ($null -eq $Iscc) {
     throw 'Nie znaleziono ISCC.exe (Inno Setup 6).'
 }
 
 Write-Host "[6/7] Buduję właściwy instalator..." -ForegroundColor Cyan
-if ($IsSignedRelease) {
+if ($IsReleaseBuild) {
     # No -Force: if anything recreated release/ during the build, fail instead
     # of compiling over a potentially published or externally supplied asset.
     New-Item -ItemType Directory -Path $ReleaseDir -ErrorAction Stop | Out-Null
@@ -304,6 +351,11 @@ if ($IsSignedRelease) {
     $InnoArguments += "/SMowikAuthenticode=$InnoSignCommand"
 }
 $InnoArguments += 'packaging\Mowik.iss'
+if ($IsSignedRelease) {
+    Assert-DirectoryIntegrityManifest `
+        -Directory (Join-Path $DistDir 'Mowik') `
+        -ManifestPath $SignedAppManifestPath
+}
 Invoke-Checked $Iscc $InnoArguments
 $InstallerFileName = "$InstallerBaseName.exe"
 $Installer = Join-Path $ReleaseDir $InstallerFileName
@@ -316,6 +368,12 @@ if ($IsSignedRelease) {
         -Path $Installer `
         -ExpectedSignerThumbprint $SigningCertificate.Thumbprint `
         -SignToolPath $ResolvedSignTool
+}
+elseif ($IsUnsignedRelease) {
+    $InstallerSignature = Get-AuthenticodeSignature -LiteralPath $Installer
+    if ($InstallerSignature.Status -ne [System.Management.Automation.SignatureStatus]::NotSigned) {
+        throw "UnsignedRelease expected an unsigned installer, got $($InstallerSignature.Status)."
+    }
 }
 
 Write-Host "[7/7] Zapisuję i weryfikuję sumę kontrolną..." -ForegroundColor Cyan
@@ -340,6 +398,12 @@ Invoke-Checked (Join-Path $PSScriptRoot 'test-release-artifacts.ps1') $ArtifactT
 $SizeMiB = [Math]::Round((Get-Item -LiteralPath $Installer).Length / 1MB, 1)
 Write-Host "Gotowe: $Installer ($SizeMiB MiB)" -ForegroundColor Green
 Write-Host "SHA-256: $($Hash.Hash.ToLowerInvariant())"
-if (-not $IsSignedRelease) {
+if ($IsUnsignedRelease) {
+    Write-Warning (
+        'UNSIGNED RELEASE BUILD - publishing is allowed only with a prominent ' +
+        'Unknown publisher/SmartScreen warning and SHA-256 verification guidance.'
+    )
+}
+elseif (-not $IsSignedRelease) {
     Write-Warning 'UNSIGNED LOCAL DEVELOPER BUILD - do not publish this installer as a release.'
 }

@@ -10,7 +10,7 @@
 
 [![Release](https://img.shields.io/github/v/release/Szunias/Mowik?label=release&color=1f6feb)](https://github.com/Szunias/Mowik/releases/latest)
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE.txt)
-[![Python 3.10-3.12](https://img.shields.io/badge/python-3.10--3.12-3776ab)](https://www.python.org/)
+[![Python 3.11-3.12](https://img.shields.io/badge/python-3.11--3.12-3776ab)](https://www.python.org/)
 [![Windows 10/11](https://img.shields.io/badge/windows-10%20%7C%2011-0078d6)](#)
 [![Works offline](https://img.shields.io/badge/works-offline-success)](#privacy)
 
@@ -86,7 +86,7 @@ Recordings are never written to disk, and technical logs do not contain the text
 
 ### Fresh installation
 
-1. Download `Mowik-x.y.z-Setup.exe` from the [latest release](https://github.com/Szunias/Mowik/releases/latest).
+1. Download `Mowik-x.y.z-Setup-UNSIGNED.exe` from the [latest release](https://github.com/Szunias/Mowik/releases/latest).
 2. Run the installer and follow the short setup wizard. Python and manual file extraction are not required.
 3. Leave **Launch Mówik** selected and click **Finish**. In the Polish installer these labels are **Uruchom Mówika** and **Zakończ**.
 4. Hold **F8**, speak a sentence, and release the key.
@@ -95,11 +95,12 @@ The installer requires 64-bit Windows 10 version 1809 or later, or Windows 11. I
 
 On first launch, Mówik downloads the selected local speech model to `%LOCALAPPDATA%\Mowik\models`. Transcription works offline after that download is complete.
 
-Local developer builds are unsigned unless a trusted Authenticode certificate is supplied, so Windows SmartScreen may display an “Unknown publisher” warning. Public releases must be signed and timestamped by the release pipeline; still download only from the official GitHub release, check the displayed publisher, and compare SHA-256 with `SHA256SUMS.txt` when in doubt. A signature improves identity and reputation but cannot guarantee that a brand-new file hash will never trigger SmartScreen.
+> [!WARNING]
+> The public Mówik 2.7.0 installer is **not digitally signed**. Windows may therefore show **Unknown publisher** or a Microsoft Defender SmartScreen warning. Download the installer only from the [official Mówik GitHub release](https://github.com/Szunias/Mowik/releases/latest) and verify its SHA-256 hash against `SHA256SUMS.txt` from the same release before running it. In PowerShell, use `Get-FileHash .\Mowik-2.7.0-Setup-UNSIGNED.exe -Algorithm SHA256` and compare the complete value. Do not disable Windows security protections to install Mówik.
 
 ### Updating an existing installation
 
-Download and run the newer `Mowik-x.y.z-Setup.exe`. The installer detects the existing version, closes it during the update, and replaces only the application files. Your configuration, vocabulary, custom sounds, and downloaded models remain in place.
+Download and run the newer `Mowik-x.y.z-Setup-UNSIGNED.exe`. The installer detects the existing version, closes it during the update, and replaces only the application files. Your configuration, vocabulary, custom sounds, and downloaded models remain in place.
 
 If you are upgrading from the old ZIP-based version 2.2.0 or earlier, use the new installer as well. Existing AppData files are reused automatically, and the installer removes the old startup shortcut. After confirming that the new version works, you may manually delete the old folder containing `.venv`.
 
@@ -199,7 +200,7 @@ The violet on-screen indicator distinguishes command capture from regular green 
 
 ### Antivirus and SmartScreen transparency
 
-Mówik does not obfuscate code, disable antivirus protection, create Defender exclusions, hide command shells, or download executable updates. The Windows build is one-directory rather than a self-extracting one-file binary, uses an `asInvoker` manifest, keeps autostart opt-in, and does not execute terminal drafts. These choices reduce suspicious behavior but cannot replace Authenticode signing and normal reputation building. If a signed official artifact is falsely detected, report that exact final file to Microsoft as a software developer instead of weakening the user's security settings.
+Mówik does not obfuscate code, disable antivirus protection, create Defender exclusions, hide command shells, or download executable updates. The Windows build is one-directory rather than a self-extracting one-file binary, uses an `asInvoker` manifest, keeps autostart opt-in, and does not execute terminal drafts. These choices reduce suspicious behavior but cannot replace Authenticode signing and normal reputation building. The public 2.7.0 installer is unsigned, so an Unknown publisher or SmartScreen warning is possible even when its SHA-256 matches the official release. If antivirus reports the verified official file, submit that exact file as a possible false positive instead of weakening the user's security settings.
 
 Hold F7, speak the configured phrase, and release it. If no valid exact or terminal-prefix match is found, Mówik performs no action and never falls back to inserting the utterance as dictation. Command recognition also bypasses voice-command replacements and Ollama correction so the trigger phrase cannot be rewritten unexpectedly.
 
@@ -256,7 +257,7 @@ Mówik cannot insert text into an application running as administrator unless M�
 - Automatic startup is an unchecked, explicit opt-in in the setup wizard. Running the installer again allows you to change that option.
 - The interface language can follow Windows automatically or be set explicitly to English or Polish in Mówik Center.
 - `BUDUJ_EXE.cmd` builds the application directory at `dist\Mowik`.
-- `BUDUJ_INSTALATOR.cmd` runs the tests, builds the application, and creates the explicitly local-only `release\Mowik-x.y.z-Setup-UNSIGNED.exe` together with its SHA-256 checksum. Do not publish that developer artifact. The GitHub release workflow is the only path that produces the signed `Mowik-x.y.z-Setup.exe` name.
+- `BUDUJ_INSTALATOR.cmd` runs the tests, builds the application, and creates the explicitly local-only `release\Mowik-x.y.z-Setup-UNSIGNED.exe` together with its SHA-256 checksum. Do not upload an ad-hoc local build as an official release. Official artifacts are built through the GitHub release workflow together with `SHA256SUMS.txt`; the public 2.7.0 installer is also unsigned and may trigger Windows warnings.
 - Reproducible release definitions are stored in `packaging`, and the GitHub Actions workflow is located at `.github/workflows/windows-release.yml`.
 
 ## License

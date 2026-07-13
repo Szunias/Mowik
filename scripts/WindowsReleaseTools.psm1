@@ -49,11 +49,6 @@ function Resolve-SignToolPath {
         return $Explicit.FullName
     }
 
-    $Command = Get-Command signtool.exe -ErrorAction SilentlyContinue
-    if ($null -ne $Command) {
-        return $Command.Source
-    }
-
     $SdkRoots = @()
     if (${env:ProgramFiles(x86)}) {
         $SdkRoots += (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin')
@@ -86,7 +81,304 @@ function Resolve-SignToolPath {
         }
     }
 
-    throw 'signtool.exe was not found. Install the Windows SDK or pass -SignToolPath explicitly.'
+    throw (
+        'signtool.exe was not found in a trusted Windows SDK directory. ' +
+        'Install the Windows SDK or pass -SignToolPath explicitly.'
+    )
+}
+
+function Assert-TrustedInnoCompiler {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $Compiler = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($Compiler.PSIsContainer -or $Compiler.Name -ine 'ISCC.exe') {
+        throw "The Inno Setup compiler path is not ISCC.exe: $Path"
+    }
+
+    $Signature = Get-AuthenticodeSignature -LiteralPath $Compiler.FullName
+    if ($Signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
+        $null -eq $Signature.SignerCertificate) {
+        throw "ISCC.exe does not have a valid Authenticode signature: $($Compiler.FullName)"
+    }
+    if ($Signature.SignerCertificate.Subject -notmatch '(?:^|,\s*)O=Pyrsys B\.V\.(?:,|$)') {
+        throw (
+            "ISCC.exe is not signed by the expected Inno Setup publisher, Pyrsys B.V.: " +
+            $Signature.SignerCertificate.Subject
+        )
+    }
+
+    return $Compiler.FullName
+}
+
+function Resolve-InnoCompiler {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string]$InnoCompilerPath
+    )
+
+    if ($InnoCompilerPath) {
+        return Assert-TrustedInnoCompiler -Path $InnoCompilerPath
+    }
+
+    # Prefer the vendor executable over a package-manager shim. Chocolatey
+    # registers ISCC.exe in its bin directory, but that shim is not signed by
+    # the Inno Setup publisher and must never be treated as the compiler.
+    $Candidates = @()
+    if ($env:LOCALAPPDATA) {
+        $Candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $Candidates += (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe')
+    }
+    if ($env:ProgramFiles) {
+        $Candidates += (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+    }
+    $Command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($null -ne $Command) {
+        $Candidates += $Command.Source
+    }
+
+    foreach ($Candidate in ($Candidates | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
+            return Assert-TrustedInnoCompiler -Path $Candidate
+        }
+    }
+    return $null
+}
+
+function Get-CanonicalDirectoryManifestContent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Directory
+    )
+
+    $RootItem = Get-Item -LiteralPath $Directory -Force -ErrorAction Stop
+    if (-not $RootItem.PSIsContainer) {
+        throw "The integrity manifest root is not a directory: $Directory"
+    }
+    if (($RootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The integrity manifest root must not be a reparse point: $Directory"
+    }
+
+    $Separators = [char[]]@(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $RootPath = [IO.Path]::GetFullPath($RootItem.FullName).TrimEnd($Separators)
+    $RootPrefix = $RootPath + [IO.Path]::DirectorySeparatorChar
+    $Children = @(Get-ChildItem -LiteralPath $RootPath -Recurse -Force -ErrorAction Stop)
+    foreach ($Child in $Children) {
+        if (($Child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The application directory must not contain reparse points: $($Child.FullName)"
+        }
+    }
+
+    [string[]]$Lines = @(
+        foreach ($File in ($Children | Where-Object { -not $_.PSIsContainer })) {
+            $FullPath = [IO.Path]::GetFullPath($File.FullName)
+            if (-not $FullPath.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "A manifest entry escaped the application directory: $FullPath"
+            }
+            $RelativePath = $FullPath.Substring($RootPrefix.Length).Replace('\', '/')
+            if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+                $RelativePath -match '[\x00-\x1F]' -or
+                $RelativePath.StartsWith('/') -or
+                $RelativePath.Contains('\') -or
+                $RelativePath -match '(^|/)\.\.?(/|$)') {
+                throw "The application directory contains a non-canonical path: $RelativePath"
+            }
+            $Length = $File.Length.ToString([Globalization.CultureInfo]::InvariantCulture)
+            $Hash = (Get-FileHash -LiteralPath $FullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$RelativePath`t$Length`t$Hash"
+        }
+    )
+    [Array]::Sort($Lines, [StringComparer]::Ordinal)
+
+    $Content = "MOWIK-DIRECTORY-MANIFEST-V1`n"
+    if ($Lines.Count -gt 0) {
+        $Content += ($Lines -join "`n") + "`n"
+    }
+    return $Content
+}
+
+function ConvertFrom-CanonicalDirectoryManifestContent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Content,
+
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    if ($Content.Contains("`r") -or -not $Content.EndsWith("`n", [StringComparison]::Ordinal)) {
+        throw "$Description is not a canonical LF-terminated manifest."
+    }
+    $Lines = $Content.Split([string[]]@("`n"), [StringSplitOptions]::None)
+    if ($Lines.Count -lt 2 -or $Lines[0] -cne 'MOWIK-DIRECTORY-MANIFEST-V1' -or
+        $Lines[$Lines.Count - 1] -cne '') {
+        throw "$Description has an invalid manifest header or terminator."
+    }
+
+    $Entries = [Collections.Generic.Dictionary[string, string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    for ($Index = 1; $Index -lt ($Lines.Count - 1); $Index++) {
+        $Line = $Lines[$Index]
+        $Parts = $Line.Split([char]9)
+        if ($Parts.Count -ne 3) {
+            throw "$Description has an invalid entry at line $($Index + 1)."
+        }
+        $RelativePath, $Length, $Hash = $Parts
+        if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+            $RelativePath -match '[\x00-\x1F]' -or
+            $RelativePath.StartsWith('/') -or
+            $RelativePath.Contains('\') -or
+            $RelativePath -match '(^|/)\.\.?(/|$)' -or
+            $Length -notmatch '^(0|[1-9][0-9]*)$' -or
+            $Hash -notmatch '^[0-9a-f]{64}$') {
+            throw "$Description has a non-canonical entry at line $($Index + 1)."
+        }
+        if ($Entries.ContainsKey($RelativePath)) {
+            throw "$Description contains a duplicate path: $RelativePath"
+        }
+        $Entries.Add($RelativePath, $Line)
+    }
+    return ,$Entries
+}
+
+function Read-CanonicalDirectoryManifest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ManifestPath
+    )
+
+    $Manifest = Get-Item -LiteralPath $ManifestPath -Force -ErrorAction Stop
+    if ($Manifest.PSIsContainer -or
+        ($Manifest.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The integrity manifest must be a regular file: $ManifestPath"
+    }
+    $Utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $Content = [IO.File]::ReadAllText($Manifest.FullName, $Utf8)
+    $Entries = ConvertFrom-CanonicalDirectoryManifestContent `
+        -Content $Content `
+        -Description $Manifest.FullName
+    return [pscustomobject]@{
+        Content = $Content
+        Entries = $Entries
+    }
+}
+
+function Write-DirectoryIntegrityManifest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Directory,
+
+        [Parameter(Mandatory)]
+        [string]$ManifestPath
+    )
+
+    $RootPath = [IO.Path]::GetFullPath((Get-Item -LiteralPath $Directory -Force).FullName)
+    $OutputPath = [IO.Path]::GetFullPath($ManifestPath)
+    $RootPrefix = $RootPath.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if ($OutputPath.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $OutputPath -ieq $RootPath) {
+        throw 'The integrity manifest must be stored outside the directory it describes.'
+    }
+    $Parent = Split-Path -Parent $OutputPath
+    if (-not (Test-Path -LiteralPath $Parent -PathType Container)) {
+        throw "The integrity manifest parent directory does not exist: $Parent"
+    }
+
+    $Content = Get-CanonicalDirectoryManifestContent -Directory $RootPath
+    $Utf8 = [Text.UTF8Encoding]::new($false)
+    $Stream = [IO.File]::Open(
+        $OutputPath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    try {
+        $Bytes = $Utf8.GetBytes($Content)
+        $Stream.Write($Bytes, 0, $Bytes.Length)
+        $Stream.Flush($true)
+    }
+    finally {
+        $Stream.Dispose()
+    }
+    Write-Host "Application directory manifest written: $OutputPath" -ForegroundColor Green
+}
+
+function Assert-DirectoryIntegrityManifest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Directory,
+
+        [Parameter(Mandatory)]
+        [string]$ManifestPath
+    )
+
+    $Expected = Read-CanonicalDirectoryManifest -ManifestPath $ManifestPath
+    $ActualContent = Get-CanonicalDirectoryManifestContent -Directory $Directory
+    if ($ActualContent -cne $Expected.Content) {
+        throw (
+            'The application directory changed after verification: a file was added, removed, ' +
+            'resized, renamed, or its SHA-256 digest changed.'
+        )
+    }
+    Write-Host "Application directory integrity verified: $Directory" -ForegroundColor Green
+}
+
+function Assert-DirectoryIntegrityManifestTransition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$BeforeManifestPath,
+
+        [Parameter(Mandatory)]
+        [string]$AfterManifestPath,
+
+        [Parameter(Mandatory)]
+        [string[]]$AllowedChangedPath
+    )
+
+    $Before = Read-CanonicalDirectoryManifest -ManifestPath $BeforeManifestPath
+    $After = Read-CanonicalDirectoryManifest -ManifestPath $AfterManifestPath
+    if ($Before.Entries.Count -ne $After.Entries.Count) {
+        throw 'The signed application tree added or removed files.'
+    }
+
+    $Allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($Path in $AllowedChangedPath) {
+        $CanonicalPath = $Path.Replace('\', '/')
+        if (-not $Allowed.Add($CanonicalPath) -or -not $Before.Entries.ContainsKey($CanonicalPath)) {
+            throw "The allowed changed path is duplicated or absent from the prepared tree: $Path"
+        }
+    }
+
+    foreach ($Entry in $Before.Entries.GetEnumerator()) {
+        if (-not $After.Entries.ContainsKey($Entry.Key)) {
+            throw "The signed application tree removed a file: $($Entry.Key)"
+        }
+        if ($Allowed.Contains($Entry.Key)) {
+            if ($Entry.Value -ceq $After.Entries[$Entry.Key]) {
+                throw "The expected signing change did not occur: $($Entry.Key)"
+            }
+        }
+        elseif ($Entry.Value -cne $After.Entries[$Entry.Key]) {
+            throw "Signing changed an unexpected application file: $($Entry.Key)"
+        }
+    }
+    Write-Host 'Only the explicitly signed application file changed.' -ForegroundColor Green
 }
 
 function Assert-CodeSigningCertificate {
@@ -298,6 +590,11 @@ Export-ModuleMember -Function @(
     'Normalize-CodeSigningThumbprint',
     'Assert-TimestampServer',
     'Resolve-SignToolPath',
+    'Assert-TrustedInnoCompiler',
+    'Resolve-InnoCompiler',
+    'Write-DirectoryIntegrityManifest',
+    'Assert-DirectoryIntegrityManifest',
+    'Assert-DirectoryIntegrityManifestTransition',
     'Assert-CodeSigningCertificate',
     'Assert-AuthenticodeSignature',
     'Invoke-AuthenticodeSign',

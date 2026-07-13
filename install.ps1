@@ -36,7 +36,7 @@ try {
             [string[]]$Prefix = @()
         )
         try {
-            & $Exe @Prefix -c "import struct,sys; ok=((3,10) <= sys.version_info[:2] < (3,13)); raise SystemExit(0 if ok and struct.calcsize('P') == 8 else 1)" *> $null
+            & $Exe @Prefix -c "import struct,sys; ok=((3,11) <= sys.version_info[:2] < (3,13)); raise SystemExit(0 if ok and struct.calcsize('P') == 8 else 1)" *> $null
             return ($LASTEXITCODE -eq 0)
         } catch {
             return $false
@@ -49,16 +49,13 @@ try {
         if ($null -ne $py) {
             [void]$items.Add(@{ Exe = $py.Source; Prefix = @("-3.11"); Label = "Python 3.11 przez py.exe" })
             [void]$items.Add(@{ Exe = $py.Source; Prefix = @("-3.12"); Label = "Python 3.12 przez py.exe" })
-            [void]$items.Add(@{ Exe = $py.Source; Prefix = @("-3.10"); Label = "Python 3.10 przez py.exe" })
         }
 
         $known = @(
             (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
             (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
-            (Join-Path $env:LOCALAPPDATA "Programs\Python\Python310\python.exe"),
             (Join-Path $env:ProgramFiles "Python311\python.exe"),
-            (Join-Path $env:ProgramFiles "Python312\python.exe"),
-            (Join-Path $env:ProgramFiles "Python310\python.exe")
+            (Join-Path $env:ProgramFiles "Python312\python.exe")
         )
         foreach ($path in $known) {
             if (Test-Path -LiteralPath $path) {
@@ -79,7 +76,7 @@ try {
         return $null
     }
 
-    Write-Host "[1/6] Szukam 64-bitowego Pythona 3.10-3.12..."
+    Write-Host "[1/6] Szukam 64-bitowego Pythona 3.11-3.12..."
     $Python = Find-Python
 
     if ($null -eq $Python) {

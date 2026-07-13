@@ -8,12 +8,11 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mowik_commands import (
-    ACTION_OPEN_TERMINAL,
     ACTION_PASTE_TEXT,
     ACTION_REGISTRY,
     BLOCKED_OPEN_SUFFIXES,
+    CUSTOM_COMMANDS_SCHEMA_VERSION,
     MATCH_EXACT,
-    MATCH_PREFIX_TAIL,
     OPERATION_DRAFT,
     OPERATION_OPEN,
     CommandRegistry,
@@ -35,6 +34,42 @@ def captured_context(explorer_path: str | None = r"C:\work\Mowik") -> ExecutionC
 
 
 class CommandConfigCompatibilityTests(unittest.TestCase):
+    def test_schema_accepts_only_legacy_missing_or_exact_integer_one(self) -> None:
+        item = {
+            "phrase": "Wklej podpis",
+            "action": "paste_text",
+            "value": "safe",
+        }
+        for settings in (
+            {"items": [item]},
+            {
+                "schema_version": CUSTOM_COMMANDS_SCHEMA_VERSION,
+                "items": [item],
+            },
+        ):
+            with self.subTest(settings=settings):
+                registry = parse_custom_commands({"custom_commands": settings})
+                self.assertEqual(len(registry.definitions), 1)
+                self.assertEqual(registry.issues, ())
+
+        for unsupported in (True, 1.0, "1", 0, 2, None, {}, []):
+            with self.subTest(schema_version=repr(unsupported)):
+                registry = parse_custom_commands(
+                    {
+                        "custom_commands": {
+                            "schema_version": unsupported,
+                            "items": [item],
+                        }
+                    }
+                )
+                self.assertEqual(registry.definitions, ())
+                self.assertEqual(len(registry.issues), 1)
+                self.assertEqual(
+                    registry.issues[0].code,
+                    "schema_version_unsupported",
+                )
+                self.assertEqual(registry.issues[0].field, "schema_version")
+
     def test_old_flat_text_item_is_still_parsed_as_exact_paste(self) -> None:
         registry = parse_custom_commands(
             {
@@ -214,6 +249,58 @@ class CommandMatchingTests(unittest.TestCase):
 
 
 class CommandSafetyPolicyTests(unittest.TestCase):
+    def test_active_content_denylist_covers_script_container_and_macro_types(
+        self,
+    ) -> None:
+        required = {
+            ".ahk",
+            ".appinstaller",
+            ".application",
+            ".appref-ms",
+            ".appx",
+            ".appxbundle",
+            ".chm",
+            ".diagcab",
+            ".gadget",
+            ".inf",
+            ".jar",
+            ".jnlp",
+            ".library-ms",
+            ".msc",
+            ".msix",
+            ".msixbundle",
+            ".ps1",
+            ".py",
+            ".scf",
+            ".sct",
+            ".settingcontent-ms",
+            ".udl",
+            ".vbs",
+            ".website",
+            ".wsf",
+            ".xaml",
+            ".xbap",
+            ".docm",
+            ".ppam",
+            ".pptm",
+            ".xlam",
+            ".xlsm",
+        }
+
+        self.assertTrue(required.issubset(BLOCKED_OPEN_SUFFIXES))
+        for index, suffix in enumerate(sorted(required)):
+            with self.subTest(suffix=suffix):
+                registry = CommandRegistry.from_items(
+                    [
+                        {
+                            "phrase": f"active content {index}",
+                            "action": "open",
+                            "value": rf"C:\Work\payload{suffix}",
+                        }
+                    ]
+                )
+                self.assertEqual(registry.definitions, ())
+
     def test_open_action_always_requires_confirmation_and_has_bounded_preview(self) -> None:
         registry = CommandRegistry.from_items(
             [
