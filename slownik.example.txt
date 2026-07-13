@@ -1,5 +1,5 @@
-# Jedna nazwa lub fraza w każdym wierszu.
-# Linie zaczynające się od # są ignorowane.
+# One name or phrase per line. / Jedna nazwa lub fraza w każdym wierszu.
+# Lines beginning with # are ignored. / Linie zaczynające się od # są ignorowane.
 OpenAI
 ChatGPT
 Mówik

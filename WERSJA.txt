@@ -1,2 +1,2 @@
-Mowik 2.3.0
-Niskie opóźnienie CUDA/CPU, lokalny cache modelu i łagodne sygnały dźwiękowe.
+Mowik 2.4.0
+Dwujęzyczny interfejs PL/EN, odświeżone Centrum Mówika i lokalne dyktowanie CUDA/CPU.

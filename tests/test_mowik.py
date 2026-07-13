@@ -49,6 +49,85 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertFalse(model.transcribe.called)
 
 
+class InternationalDictationTests(unittest.TestCase):
+    def test_old_config_keeps_transcription_language_and_gains_ui_language(self) -> None:
+        migrated = mowik.deep_merge(
+            mowik.DEFAULT_CONFIG,
+            {"language": "pl", "trigger": "keyboard:f8"},
+        )
+
+        self.assertEqual(migrated["language"], "pl")
+        self.assertEqual(migrated["ui_language"], "auto")
+
+    def test_english_voice_commands(self) -> None:
+        config = {
+            "language": "en",
+            "voice_commands": {"enabled": True},
+        }
+
+        result = mowik.apply_voice_commands(
+            "First sentence new paragraph second sentence new line third",
+            config,
+        )
+
+        self.assertEqual(
+            result,
+            "First sentence\n\nsecond sentence\nthird",
+        )
+
+    def test_auto_voice_commands_supports_polish_and_english(self) -> None:
+        config = {
+            "language": "auto",
+            "voice_commands": {"enabled": True},
+        }
+
+        result = mowik.apply_voice_commands(
+            "Pierwsza nowa linia second new paragraph third",
+            config,
+        )
+
+        self.assertEqual(result, "Pierwsza\nsecond\n\nthird")
+
+    def test_other_transcription_languages_accept_bilingual_commands(self) -> None:
+        config = {
+            "language": "de",
+            "voice_commands": {"enabled": True},
+        }
+
+        result = mowik.apply_voice_commands(
+            "Erste Zeile new line druga nowa linia trzecia",
+            config,
+        )
+
+        self.assertEqual(result, "Erste Zeile\ndruga\ntrzecia")
+
+    def test_llm_wrapper_and_english_negation_are_safe(self) -> None:
+        self.assertEqual(
+            mowik.strip_llm_wrapping("Corrected text: This is ready."),
+            "This is ready.",
+        )
+        self.assertFalse(
+            mowik.llm_result_is_safe(
+                "This should not change.",
+                "This should change.",
+            )
+        )
+
+    def test_llm_safety_preserves_negations_in_supported_languages(self) -> None:
+        examples = (
+            ("Das Ergebnis ist nicht korrekt.", "Das Ergebnis ist korrekt."),
+            ("Ce résultat n’est jamais correct.", "Ce résultat est correct."),
+            ("Este resultado no es correcto.", "Este resultado es correcto."),
+            ("Цей результат не є правильним.", "Цей результат є правильним."),
+            ("Залишити без змін.", "Залишити зі змінами."),
+            ("This is not required.", "This is never required."),
+        )
+
+        for original, corrected in examples:
+            with self.subTest(original=original):
+                self.assertFalse(mowik.llm_result_is_safe(original, corrected))
+
+
 class RecorderTests(unittest.TestCase):
     def test_pre_roll_keeps_exact_number_of_samples(self) -> None:
         recorder = mowik.ContinuousRecorder({"pre_roll_ms": 300, "microphone": None})

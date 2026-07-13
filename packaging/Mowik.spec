@@ -10,6 +10,7 @@ ROOT = Path(SPECPATH).resolve().parent
 
 datas = [
     (str(ROOT / "README.md"), "."),
+    (str(ROOT / "README.pl.md"), "."),
     (str(ROOT / "LICENSE.txt"), "."),
     (str(ROOT / "THIRD_PARTY_NOTICES.txt"), "."),
     (str(ROOT / "config.example.json"), "."),
