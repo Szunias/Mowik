@@ -1,0 +1,31 @@
+# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(2, 3, 0, 0),
+    prodvers=(2, 3, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '041504e2',
+        [
+          StringStruct('CompanyName', 'Igor Szuniewicz'),
+          StringStruct('FileDescription', 'Mówik — lokalne dyktowanie'),
+          StringStruct('FileVersion', '2.3.0'),
+          StringStruct('InternalName', 'Mowik'),
+          StringStruct('LegalCopyright', 'Copyright © 2026 Igor Szuniewicz'),
+          StringStruct('OriginalFilename', 'Mowik.exe'),
+          StringStruct('ProductName', 'Mówik'),
+          StringStruct('ProductVersion', '2.3.0')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct('Translation', [1045, 1250])])
+  ]
+)

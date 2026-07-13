@@ -1,0 +1,22 @@
+MÓWIK — INFORMACJE O KOMPONENTACH ZEWNĘTRZNYCH
+
+Mówik korzysta z bibliotek rozwijanych przez niezależnych autorów. Każda z nich
+pozostaje objęta własną licencją. Pełne teksty licencji są dostępne w metadanych
+pakietów oraz w podanych repozytoriach projektów.
+
+Najważniejsze komponenty:
+
+- faster-whisper — MIT — https://github.com/SYSTRAN/faster-whisper
+- CTranslate2 — MIT — https://github.com/OpenNMT/CTranslate2
+- NumPy — BSD-3-Clause — https://github.com/numpy/numpy
+- python-sounddevice — MIT — https://github.com/spatialaudio/python-sounddevice
+- pynput — LGPL-3.0 — https://github.com/moses-palmer/pynput
+- pystray — LGPL-3.0 — https://github.com/moses-palmer/pystray
+- Pillow — HPND — https://github.com/python-pillow/Pillow
+- Pyperclip — BSD-3-Clause — https://github.com/asweigart/pyperclip
+- PyAV / FFmpeg — BSD-3-Clause oraz licencje FFmpeg — https://github.com/PyAV-Org/PyAV
+- NVIDIA CUDA, cuBLAS i cuDNN — warunki NVIDIA Software License Agreement —
+  https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/
+
+Model Whisper jest pobierany oddzielnie podczas pierwszego uruchomienia i
+podlega warunkom opublikowanym przez jego autora/dystrybutora.

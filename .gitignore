@@ -7,3 +7,6 @@ __pycache__/
 *.log
 .installed
 backup-przed-*/
+release/
+*.sha256
+!packaging/Mowik.spec

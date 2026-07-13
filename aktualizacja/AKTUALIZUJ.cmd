@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title Mowik - aktualizacja 2.2.0
+title Mowik - aktualizacja 2.3.0
 
 echo ============================================================
-echo   MOWIK - AKTUALIZACJA DO WERSJI 2.2.0
+echo   MOWIK - AKTUALIZACJA DO WERSJI 2.3.0
 echo ============================================================
 echo.
 echo Aktualizator sprobuje sam znalezc obecna instalacje.
@@ -19,7 +19,7 @@ set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :fail
 
 echo.
-echo Aktualizacja zakonczona. Mowik 2.2.0 zostal uruchomiony.
+echo Aktualizacja zakonczona. Mowik 2.3.0 zostal uruchomiony.
 echo Kliknij prawym przyciskiem ikone przy zegarze i wybierz Panel ustawien.
 timeout /t 5 /nobreak >nul
 exit /b 0

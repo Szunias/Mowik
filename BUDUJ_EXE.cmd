@@ -5,24 +5,16 @@ title Mowik - budowanie EXE
 set "PYTHONUTF8=1"
 if not exist "%~dp0.venv\Scripts\python.exe" goto :not_installed
 
-"%~dp0.venv\Scripts\python.exe" -m pip install --upgrade pyinstaller
+"%~dp0.venv\Scripts\python.exe" -m pip install "PyInstaller==6.21.0"
+if errorlevel 1 goto :fail
+"%~dp0.venv\Scripts\python.exe" -m pip install --prefer-binary -r "%~dp0requirements-gpu.txt"
 if errorlevel 1 goto :fail
 
-"%~dp0.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed --onedir ^
-  --name Mowik ^
-  --collect-all faster_whisper ^
-  --collect-all ctranslate2 ^
-  --collect-all av ^
-  --collect-all sounddevice ^
-  --collect-all pystray ^
-  --collect-all pyperclip ^
-  --collect-all PIL ^
-  "%~dp0mowik.py"
+"%~dp0.venv\Scripts\python.exe" "%~dp0scripts\generate-icon.py"
 if errorlevel 1 goto :fail
 
-copy /Y "%~dp0README.md" "%~dp0dist\Mowik\README.md" >nul
-copy /Y "%~dp0config.example.json" "%~dp0dist\Mowik\config.example.json" >nul
-copy /Y "%~dp0slownik.example.txt" "%~dp0dist\Mowik\slownik.example.txt" >nul
+"%~dp0.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean "%~dp0packaging\Mowik.spec"
+if errorlevel 1 goto :fail
 
 echo.
 echo Gotowe: %~dp0dist\Mowik\Mowik.exe
