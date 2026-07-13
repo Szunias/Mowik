@@ -31,6 +31,7 @@
   "feedback": {
     "sounds": true,
     "notifications": true,
+    "floating_indicator": true,
     "loop_recording_sound": false,
     "custom_sounds": {
       "start": "",

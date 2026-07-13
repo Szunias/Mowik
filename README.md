@@ -23,6 +23,41 @@ No cloud, no subscription, and no voice uploads.
 > [!NOTE]
 > The application interface is available in English and Polish. By default, Mówik follows the Windows display language; you can override it in Mówik Center with **Save and restart**.
 
+## Interface preview
+
+Mówik Center keeps everyday controls clear and moves technical options into expandable advanced sections. Select any preview to open it at full size.
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-home-pl.png">
+        <img src="assets/screenshots/mowik-home-pl.png" alt="Mówik Center home screen in Polish" width="100%">
+      </a>
+      <br><sub><strong>Home overview</strong> · Polish interface</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-dictation-en.png">
+        <img src="assets/screenshots/mowik-dictation-en.png" alt="Mówik Center dictation settings in English" width="100%">
+      </a>
+      <br><sub><strong>Dictation and performance</strong> · English interface</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-sounds-pl.png">
+        <img src="assets/screenshots/mowik-sounds-pl.png" alt="Mówik visual feedback settings in Polish" width="100%">
+      </a>
+      <br><sub><strong>Visual feedback</strong> · Polish interface</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="assets/screenshots/mowik-sounds-en.png">
+        <img src="assets/screenshots/mowik-sounds-en.png" alt="Mówik visual feedback settings in English" width="100%">
+      </a>
+      <br><sub><strong>Visual feedback</strong> · English interface</sub>
+    </td>
+  </tr>
+</table>
+
 ## Features
 
 - **Push-to-talk**: Mówik transcribes a dictation only while you hold the selected keyboard key or mouse button.
@@ -31,6 +66,7 @@ No cloud, no subscription, and no voice uploads.
 - **Clear graphical settings panel** in the Windows system tray: everyday choices stay visible, while model, GPU/CPU, voice detection, and custom connection details are available on demand under **Advanced settings**.
 - **English and Polish interface** with automatic Windows-language detection and a persistent language selector.
 - **Subtle built-in sound cues and custom WAV files** for recording start, key release, completed text, and errors, with previews and optional looping.
+- **Optional on-screen dictation indicator** with a green recording dot, a processing animation, a success check mark, and an error X.
 - **Flexible text output**: paste into the active window, copy to the clipboard, or do both.
 - **Private vocabulary**: provide names, brands, and specialist terms as hints for the speech model.
 - **Pre-roll audio buffer**: reduces clipped first syllables by keeping a short microphone buffer in RAM.
@@ -116,7 +152,9 @@ Both options cannot be disabled at the same time.
 
 When clipboard copying is enabled, the clipboard contains the exact transcription. The optional trailing space is sent separately to the active window and is not included in the copied text.
 
-## Custom sounds
+## Visual feedback and custom sounds
+
+The optional **On-screen dictation indicator** under **Sounds → Feedback** provides immediate visual confirmation without taking focus from the application where you are typing. It shows a small green dot while recording, a compact animation while the recording is processed, a check mark after the text is delivered successfully, and an X if an error occurs. Clear the checkbox in Mówik Settings to hide the indicator; sound cues and Windows notifications can be configured independently.
 
 In **Sounds** (**Dźwięki** in Polish), expand **Advanced settings** to assign a separate sound to each event: push-to-talk pressed, push-to-talk released, text ready, and error.
 
