@@ -1,0 +1,80 @@
+name: Windows installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Wersja bez prefiksu v, np. 2.3.0"
+        required: true
+        default: "2.3.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+
+      - name: Wybierz Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Ustal wersję
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          } else {
+            $version = '${{ inputs.version }}'
+          }
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Przygotuj środowisko
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          choco install innosetup --yes --no-progress
+
+      - name: Zbuduj i sprawdź instalator
+        shell: pwsh
+        run: ./scripts/build-release.ps1 -Version $env:RELEASE_VERSION -SkipToolInstall
+
+      - name: Przetestuj instalację i deinstalację
+        shell: pwsh
+        run: ./scripts/test-installer.ps1 -Version $env:RELEASE_VERSION
+
+      - name: Zachowaj artefakt
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mowik-${{ env.RELEASE_VERSION }}-Windows
+          path: |
+            release/Mowik-${{ env.RELEASE_VERSION }}-Setup.exe
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Dodaj pliki do GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $installer = "release/Mowik-$env:RELEASE_VERSION-Setup.exe"
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag $installer release/SHA256SUMS.txt --clobber
+          } else {
+            gh release create $tag $installer release/SHA256SUMS.txt --title "Mówik $env:RELEASE_VERSION" --generate-notes
+          }

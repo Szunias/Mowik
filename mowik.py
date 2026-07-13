@@ -28,11 +28,106 @@ import urllib.error
 import urllib.request
 import wave
 from collections import deque
+from functools import lru_cache
 from typing import Any, Optional
+
+
+_CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
+_CUDA_DLL_HANDLES: list[Any] = []
+
+
+def configure_cuda_dll_search_paths() -> tuple[Path, ...]:
+    """Udostępnij CTranslate2 biblioteki CUDA dołączone przez pakiety NVIDIA.
+
+    Python 3.8+ na Windowsie nie przeszukuje automatycznie katalogów DLL
+    z pakietów ``nvidia-*``. Zachowujemy uchwyty zwrócone przez
+    ``os.add_dll_directory`` przez cały czas życia procesu; ich zwolnienie
+    natychmiast usunęłoby katalog z wyszukiwania.
+    """
+    if os.name != "nt":
+        return ()
+
+    roots: list[Path] = []
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        roots.append(Path(bundle_root) / "nvidia")
+    executable_root = Path(sys.executable).resolve().parent
+    roots.extend(
+        (
+            executable_root / "_internal" / "nvidia",
+            executable_root / "nvidia",
+            Path(sys.prefix) / "Lib" / "site-packages" / "nvidia",
+        )
+    )
+
+    # Wybieramy dokładnie jednego dostawcę cuBLAS. AddDllDirectory nie
+    # gwarantuje kolejności między wieloma katalogami, a zmieszanie wersji
+    # cublas/cublasLt kończy się losowymi błędami podczas inferencji.
+    provider: Optional[Path] = None
+    provider_root: Optional[Path] = None
+    for root in roots:
+        candidate = root / "cublas" / "bin"
+        if all((candidate / name).is_file() for name in ("cublasLt64_12.dll", "cublas64_12.dll")):
+            provider = candidate
+            provider_root = root
+            break
+    if provider is None:
+        cuda_path = os.environ.get("CUDA_PATH")
+        candidate = Path(cuda_path) / "bin" if cuda_path else None
+        if candidate is not None and all(
+            (candidate / name).is_file()
+            for name in ("cublasLt64_12.dll", "cublas64_12.dll")
+        ):
+            provider = candidate
+    if provider is None:
+        return ()
+
+    candidates = [provider]
+    if provider_root is not None:
+        candidates.extend(
+            provider_root / package / "bin"
+            for package in ("cuda_nvrtc", "cuda_runtime", "cudnn")
+        )
+    added: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = os.path.normcase(str(resolved))
+        if key in seen or not resolved.is_dir():
+            continue
+        seen.add(key)
+        try:
+            handle = os.add_dll_directory(str(resolved))
+        except (AttributeError, OSError):
+            continue
+        _CUDA_DLL_DIRECTORY_HANDLES.append(handle)
+        added.append(resolved)
+
+    try:
+        # Jawne pełne ścieżki i kolejność Lt -> BLAS blokują przypadkowe
+        # podchwycenie starszej biblioteki z PATH producenta laptopa.
+        for dll_name in ("cublasLt64_12.dll", "cublas64_12.dll"):
+            _CUDA_DLL_HANDLES.append(ctypes.WinDLL(str(provider / dll_name)))
+    except OSError:
+        _CUDA_DLL_HANDLES.clear()
+
+    if added:
+        current_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join(
+            [*(str(path) for path in added), current_path]
+        )
+    return tuple(added)
+
+
+CUDA_DLL_SEARCH_PATHS = configure_cuda_dll_search_paths()
 
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
+from faster_whisper.audio import pad_or_trim
 import ctranslate2
 from PIL import Image, ImageDraw
 from pynput import keyboard, mouse
@@ -42,9 +137,16 @@ import pyperclip
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 MUTEX_NAME = r"Local\MowikLocalDictation"
 SAMPLE_RATE = 16_000
+
+APP_ROOT = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", APP_ROOT))
 
 APPDATA_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
 LOCALDATA_DIR = Path(os.environ.get("LOCALAPPDATA", APPDATA_DIR)) / APP_NAME
@@ -62,9 +164,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "auto",
     "device": "auto",
     "cpu_threads": 0,
-    "beam_size": 5,
+    "beam_size": 2,
     "pre_roll_ms": 300,
-    "post_roll_ms": 160,
+    "post_roll_ms": 120,
     "minimum_recording_ms": 250,
     "minimum_rms": 0.0015,
     "microphone": None,
@@ -83,7 +185,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "copy_to_clipboard": True,
         "append_space": True,
-        "delay_ms": 90,
+        "delay_ms": 25,
     },
     "feedback": {
         "sounds": True,
@@ -109,7 +211,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 QUICK_PROFILES: dict[str, dict[str, Any]] = {
     "light": {
-        "label": "Lekki",
+        "label": "Szybki",
         "description": "small, beam 1 — najmniejsze obciążenie",
         "changes": {
             "model": "small",
@@ -118,7 +220,7 @@ QUICK_PROFILES: dict[str, dict[str, Any]] = {
         },
     },
     "balanced": {
-        "label": "Zbalansowany",
+        "label": "Zalecany",
         "description": "large-v3-turbo, beam 2 — zalecany",
         "changes": {
             "model": "large-v3-turbo",
@@ -127,7 +229,7 @@ QUICK_PROFILES: dict[str, dict[str, Any]] = {
         },
     },
     "accurate": {
-        "label": "Dokładny",
+        "label": "Najdokładniejszy",
         "description": "large-v3, beam 5 — najwyższa jakość",
         "changes": {
             "model": "large-v3",
@@ -260,17 +362,18 @@ def request_app_restart() -> None:
     os.replace(temp_path, RESTART_REQUEST_PATH)
 
 
-def load_dictionary(config: dict[str, Any]) -> list[str]:
-    settings = config.get("dictionary", {})
-    if not settings.get("enabled", True):
-        return []
+@lru_cache(maxsize=4)
+def _load_dictionary_snapshot(
+    modified_ns: int, file_size: int, limit: int
+) -> tuple[str, ...]:
+    # modified_ns i file_size są częścią klucza cache; sam odczyt zawsze dotyczy
+    # stałej ścieżki prywatnego słownika.
     try:
         lines = DICTIONARY_PATH.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return []
+        return ()
     terms: list[str] = []
     seen: set[str] = set()
-    limit = max(0, int(settings.get("max_terms", 120)))
     for line in lines:
         value = line.strip()
         if not value or value.startswith("#"):
@@ -282,19 +385,38 @@ def load_dictionary(config: dict[str, Any]) -> list[str]:
         terms.append(value)
         if limit and len(terms) >= limit:
             break
-    return terms
+    return tuple(terms)
+
+
+def load_dictionary(config: dict[str, Any]) -> list[str]:
+    settings = config.get("dictionary", {})
+    if not settings.get("enabled", True):
+        return []
+    limit = max(0, int(settings.get("max_terms", 120)))
+    try:
+        stat = DICTIONARY_PATH.stat()
+    except OSError:
+        return []
+    return list(_load_dictionary_snapshot(stat.st_mtime_ns, stat.st_size, limit))
 
 
 def windows_cuda_runtime_present() -> bool:
     if os.name != "nt":
         return True
-    required_dlls = ("cublas64_12.dll", "cudnn64_9.dll")
+    # CTranslate2 >= 4.6.3 ma własną implementację konwolucji Whispera na
+    # CUDA, więc cuDNN nie jest już wymagane. cuBLAS (wraz z cublasLt) nadal jest.
+    required_dlls = ("cublas64_12.dll",)
     for dll_name in required_dlls:
         try:
             ctypes.WinDLL(dll_name)
         except OSError:
             logging.info("Brak biblioteki GPU w PATH: %s", dll_name)
             return False
+    if CUDA_DLL_SEARCH_PATHS:
+        logging.info(
+            "Biblioteki CUDA znalezione w: %s",
+            ", ".join(str(path) for path in CUDA_DLL_SEARCH_PATHS),
+        )
     return True
 
 
@@ -322,12 +444,56 @@ def resolve_model_plan(config: dict[str, Any]) -> tuple[str, str, str]:
         raise AppError("device musi mieć wartość: auto, cuda albo cpu.")
 
     if requested_model.lower() == "auto":
-        model_name = "large-v3" if device == "cuda" else "large-v3-turbo"
+        # Turbo zachowuje jakość rodziny large-v3, a na krótkich dyktowaniach
+        # daje znacznie niższe opóźnienie. Pełny large-v3 pozostaje w profilu
+        # „Najdokładniejszy” dla osób świadomie wybierających jakość ponad szybkość.
+        model_name = "large-v3-turbo"
     else:
         model_name = requested_model
 
     compute_type = "float16" if device == "cuda" else "int8"
     return model_name, device, compute_type
+
+
+def resolve_cpu_threads(config: dict[str, Any]) -> int:
+    """Dobierz sensowną liczbę wątków zamiast domyślnych 4 CTranslate2."""
+    configured = max(0, int(config.get("cpu_threads", 0) or 0))
+    if configured:
+        return configured
+    logical = max(1, int(os.cpu_count() or 4))
+    # Na typowym CPU z SMT połowa wątków logicznych odpowiada rdzeniom
+    # fizycznym. Dla mniejszych układów nie obniżamy dostępnej liczby.
+    estimated_physical = logical // 2 if logical >= 8 else logical
+    return max(1, min(16, estimated_physical))
+
+
+def load_model_local_first(
+    model_name: str,
+    kwargs: dict[str, Any],
+    status_callback=None,
+) -> WhisperModel:
+    """Załaduj cache bez odpytywania Hugging Face; sieć tylko przy braku plików."""
+    try:
+        return WhisperModel(model_name, local_files_only=True, **kwargs)
+    except Exception as local_error:
+        logging.info(
+            "Model %s nie uruchomił się wyłącznie z lokalnego cache (%s); "
+            "sprawdzam/pobieram pliki.",
+            model_name,
+            local_error,
+        )
+        if status_callback:
+            status_callback(f"Sprawdzam pliki modelu {model_name}…")
+        return WhisperModel(model_name, local_files_only=False, **kwargs)
+
+
+def warm_up_cuda_model(model: WhisperModel, config: dict[str, Any]) -> None:
+    """Rozgrzej encoder i sprawdź CUDA bez uruchamiania dekodera na ciszy."""
+    del config  # zachowany parametr ułatwia testowanie tej samej ścieżki
+    features = model.feature_extractor(
+        np.zeros(SAMPLE_RATE // 2, dtype=np.float32)
+    )
+    model.encode(pad_or_trim(features))
 
 
 def create_model(config: dict[str, Any], status_callback=None) -> tuple[WhisperModel, str, str]:
@@ -340,18 +506,27 @@ def create_model(config: dict[str, Any], status_callback=None) -> tuple[WhisperM
         "compute_type": compute_type,
         "download_root": str(MODEL_DIR),
     }
-    cpu_threads = int(config.get("cpu_threads", 0) or 0)
-    if cpu_threads > 0:
+    cpu_threads = resolve_cpu_threads(config)
+    if device == "cpu":
         kwargs["cpu_threads"] = cpu_threads
 
     logging.info(
-        "Ładowanie modelu: model=%s device=%s compute_type=%s",
+        "Ładowanie modelu: model=%s device=%s compute_type=%s cpu_threads=%s",
         model_name,
         device,
         compute_type,
+        cpu_threads if device == "cpu" else "n/d",
     )
     try:
-        model = WhisperModel(model_name, **kwargs)
+        model = load_model_local_first(model_name, kwargs, status_callback)
+        if device == "cuda":
+            if status_callback:
+                status_callback("Optymalizuję model na GPU…")
+            warm_started = time.perf_counter()
+            warm_up_cuda_model(model, config)
+            logging.info(
+                "Model GPU rozgrzany w %.3f s", time.perf_counter() - warm_started
+            )
         return model, model_name, device
     except Exception as exc:
         logging.exception("Nie udało się uruchomić modelu na %s", device)
@@ -362,7 +537,10 @@ def create_model(config: dict[str, Any], status_callback=None) -> tuple[WhisperM
         # lub sterownik jest niezgodny, program nadal ma działać na CPU.
         # Używamy już pobranego modelu, aby po błędzie CUDA nie ściągać
         # od razu drugiego, wielogigabajtowego wariantu.
-        fallback_model = model_name
+        requested_model = str(config.get("model", "auto")).strip().lower()
+        fallback_model = (
+            "large-v3-turbo" if requested_model == "auto" else model_name
+        )
         if status_callback:
             status_callback(
                 "CUDA nie ruszyła — przełączam na CPU. Szczegóły zapisano w logu."
@@ -370,12 +548,15 @@ def create_model(config: dict[str, Any], status_callback=None) -> tuple[WhisperM
         logging.warning(
             "Fallback CPU po błędzie CUDA (%s). Model: %s", exc, fallback_model
         )
-        model = WhisperModel(
+        model = load_model_local_first(
             fallback_model,
-            device="cpu",
-            compute_type="int8",
-            download_root=str(MODEL_DIR),
-            **({"cpu_threads": cpu_threads} if cpu_threads > 0 else {}),
+            {
+                "device": "cpu",
+                "compute_type": "int8",
+                "download_root": str(MODEL_DIR),
+                "cpu_threads": cpu_threads,
+            },
+            status_callback,
         )
         return model, fallback_model, "cpu"
 
@@ -491,6 +672,94 @@ def cleanup_with_ollama(
 
 
 CUSTOM_SOUND_KINDS = {"start", "stop", "done", "error"}
+BUILTIN_SOUND_NOTES: dict[str, tuple[tuple[float, int, int], ...]] = {
+    # częstotliwość Hz, czas tonu ms, cisza po tonie ms
+    "start": ((523.25, 72, 0),),
+    "stop": ((392.00, 68, 0),),
+    "done": ((523.25, 55, 10), (659.25, 74, 0)),
+    "error": ((329.63, 75, 8), (277.18, 95, 0)),
+}
+BUILTIN_SOUND_FALLBACK_TONES = {
+    "start": (520, 45),
+    "stop": (390, 40),
+    "done": (660, 55),
+    "error": (280, 100),
+}
+
+
+@lru_cache(maxsize=len(BUILTIN_SOUND_NOTES))
+def builtin_sound_wav(kind: str) -> bytes:
+    """Zbuduj cichy PCM WAV z łagodnym atakiem i wybrzmieniem, bez kliknięć."""
+    notes = BUILTIN_SOUND_NOTES.get(kind)
+    if notes is None:
+        raise AppError(f"Nieznany wbudowany dźwięk: {kind}")
+
+    sample_rate = 44_100
+    pieces: list[np.ndarray] = []
+    for frequency, duration_ms, gap_ms in notes:
+        sample_count = max(1, int(round(sample_rate * duration_ms / 1000)))
+        timeline = np.arange(sample_count, dtype=np.float64) / sample_rate
+        tone = np.sin(2 * np.pi * frequency * timeline)
+        tone += 0.14 * np.sin(4 * np.pi * frequency * timeline + 0.35)
+
+        envelope = np.ones(sample_count, dtype=np.float64)
+        attack = min(sample_count // 2, max(1, int(sample_rate * 0.008)))
+        release = min(sample_count - attack, max(1, int(sample_rate * 0.032)))
+        envelope[:attack] = np.sin(
+            np.linspace(0.0, np.pi / 2, attack, endpoint=False)
+        ) ** 2
+        if release:
+            envelope[-release:] = np.cos(
+                np.linspace(0.0, np.pi / 2, release, endpoint=True)
+            ) ** 2
+        pieces.append(0.075 * tone * envelope)
+        if gap_ms:
+            pieces.append(
+                np.zeros(int(round(sample_rate * gap_ms / 1000)), dtype=np.float64)
+            )
+
+    waveform = np.concatenate(pieces) if pieces else np.zeros(1, dtype=np.float64)
+    waveform[0] = 0.0
+    waveform[-1] = 0.0
+    pcm = np.asarray(np.clip(waveform, -1.0, 1.0) * 32767, dtype=np.int16)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
+    return buffer.getvalue()
+
+
+def play_builtin_sound(kind: str) -> None:
+    """Odtwórz wbudowany sygnał w bieżącym wątku; wywołujący nie blokuje UI."""
+    try:
+        import winsound
+
+        winsound.PlaySound(
+            builtin_sound_wav(kind),
+            winsound.SND_MEMORY | winsound.SND_NODEFAULT,
+        )
+        return
+    except Exception:
+        logging.debug("Nie udało się odtworzyć łagodnego WAV", exc_info=True)
+
+    try:
+        import winsound
+
+        frequency, duration = BUILTIN_SOUND_FALLBACK_TONES.get(kind, (520, 45))
+        winsound.Beep(frequency, duration)
+    except Exception:
+        logging.debug("Nie udało się odtworzyć sygnału awaryjnego", exc_info=True)
+
+
+def play_builtin_sound_async(kind: str, thread_name: Optional[str] = None) -> None:
+    threading.Thread(
+        target=play_builtin_sound,
+        args=(kind,),
+        name=thread_name or f"Feedback-{kind}",
+        daemon=True,
+    ).start()
 
 
 def resolve_sound_path(value: Any) -> Optional[Path]:
@@ -675,7 +944,7 @@ def paste_text(text: str, config: dict[str, Any]) -> None:
     if not paste_enabled:
         return
 
-    delay = max(0, int(settings.get("delay_ms", 90))) / 1000
+    delay = max(0, int(settings.get("delay_ms", 25))) / 1000
     if delay:
         time.sleep(delay)
 
@@ -770,15 +1039,75 @@ def trigger_display_name(trigger: str) -> str:
     return f"Klawiatura: {label}"
 
 
-def make_tray_image() -> Image.Image:
+def tray_state_for_status(status: str, error: bool = False) -> str:
+    """Mapuj komunikat aplikacji na niewielki zestaw stanów ikony zasobnika."""
+    normalized = status.casefold()
+    if error or "błąd" in normalized:
+        return "error"
+    if "nagrywanie" in normalized:
+        return "recording"
+    if normalized.startswith(("gotowy", "nagranie było", "nie wykryłem")):
+        return "ready"
+    if normalized.startswith(
+        (
+            "cuda nie ruszyła",
+            "kończę",
+            "kopiuję",
+            "ładowanie",
+            "przełączam",
+            "przygotowuję",
+            "rozpoznaję",
+            "stosuję",
+            "wklejam",
+            "włączam profil",
+        )
+    ):
+        return "processing"
+    return "idle"
+
+
+@lru_cache(maxsize=5)
+def make_tray_image(state: str = "idle") -> Image.Image:
+    """Utwórz czytelną ikonę mikrofonu z plakietką bieżącego stanu."""
+    state_colors = {
+        "idle": (100, 116, 139, 255),
+        "ready": (34, 197, 94, 255),
+        "recording": (244, 63, 94, 255),
+        "processing": (59, 130, 246, 255),
+        "error": (239, 68, 68, 255),
+    }
+    if state not in state_colors:
+        state = "idle"
+
+    accent = state_colors[state]
+    surface = (20, 28, 44, 255)
+    foreground = (248, 250, 252, 255)
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((5, 5, 59, 59), radius=15, fill=(31, 41, 55, 255))
-    draw.ellipse((20, 11, 44, 39), fill=(240, 240, 240, 255))
-    draw.rounded_rectangle((28, 18, 36, 46), radius=4, fill=(31, 41, 55, 255))
-    draw.arc((17, 26, 47, 50), start=15, end=165, fill=(240, 240, 240, 255), width=4)
-    draw.line((32, 48, 32, 55), fill=(240, 240, 240, 255), width=4)
-    draw.line((24, 55, 40, 55), fill=(240, 240, 240, 255), width=4)
+
+    draw.rounded_rectangle((3, 3, 61, 61), radius=17, fill=surface)
+    draw.rounded_rectangle((5, 5, 59, 59), radius=15, outline=accent, width=4)
+
+    # Prosty, kontrastowy mikrofon pozostaje czytelny po skalowaniu do 16–24 px.
+    draw.rounded_rectangle((23, 10, 41, 36), radius=9, fill=foreground)
+    draw.arc((17, 21, 47, 47), start=0, end=180, fill=foreground, width=4)
+    draw.line((32, 45, 32, 52), fill=foreground, width=4)
+    draw.rounded_rectangle((23, 51, 41, 55), radius=2, fill=foreground)
+
+    # Plakietka rozróżnia stany także kształtem, nie tylko kolorem.
+    draw.ellipse((43, 42, 62, 61), fill=surface)
+    draw.ellipse((45, 44, 60, 59), fill=accent)
+    if state == "idle":
+        draw.line((49, 52, 56, 52), fill=foreground, width=2)
+    elif state == "ready":
+        draw.line((49, 52, 52, 55, 57, 49), fill=foreground, width=2)
+    elif state == "recording":
+        draw.ellipse((50, 49, 55, 54), fill=foreground)
+    elif state == "processing":
+        draw.arc((49, 48, 57, 56), start=205, end=80, fill=foreground, width=2)
+    else:
+        draw.line((53, 48, 53, 53), fill=foreground, width=2)
+        draw.ellipse((52, 55, 54, 57), fill=foreground)
     return image
 
 
@@ -800,15 +1129,256 @@ def run_settings_window() -> int:
         ) from exc
 
     config = load_config()
+
     root = tk.Tk()
-    root.title(f"{APP_DISPLAY_NAME} — ustawienia")
-    root.geometry("930x700")
-    root.minsize(780, 620)
+    root.title(f"{APP_DISPLAY_NAME} — centrum ustawień")
+    root.geometry("1120x780")
+    root.minsize(960, 660)
+    try:
+        root.iconbitmap(default=str(RESOURCE_ROOT / "assets" / "Mowik.ico"))
+    except tk.TclError:
+        logging.debug("Nie udało się ustawić ikony okna", exc_info=True)
+
+    colors = {
+        "canvas": "#F5F7FB",
+        "surface": "#FFFFFF",
+        "surface_alt": "#F8FAFD",
+        "sidebar": "#10243E",
+        "sidebar_active": "#1C3B61",
+        "sidebar_hover": "#173250",
+        "text": "#172033",
+        "muted": "#627087",
+        "border": "#DDE3EC",
+        "primary": "#2563EB",
+        "primary_hover": "#1D4ED8",
+        "primary_soft": "#EAF1FF",
+        "success": "#168A5B",
+        "success_soft": "#E8F7F0",
+        "danger": "#D64550",
+        "white": "#FFFFFF",
+    }
+    root.configure(background=colors["canvas"])
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    base_font = ("Segoe UI", 10)
+    style.configure(".", font=base_font)
+    style.configure("TFrame", background=colors["surface"])
+    style.configure("App.TFrame", background=colors["canvas"])
+    style.configure("Surface.TFrame", background=colors["surface"])
+    style.configure("Sidebar.TFrame", background=colors["sidebar"])
+    style.configure("TLabel", background=colors["surface"], foreground=colors["text"])
+    style.configure(
+        "Title.TLabel",
+        font=("Segoe UI", 22, "bold"),
+        foreground=colors["text"],
+    )
+    style.configure(
+        "Subtitle.TLabel",
+        font=("Segoe UI", 10),
+        foreground=colors["muted"],
+    )
+    style.configure(
+        "Section.TLabel",
+        font=("Segoe UI", 11, "bold"),
+        foreground=colors["text"],
+    )
+    style.configure(
+        "Muted.TLabel",
+        foreground=colors["muted"],
+    )
+    style.configure(
+        "Field.TLabel",
+        foreground=colors["text"],
+        font=("Segoe UI", 9, "bold"),
+    )
+    style.configure(
+        "SidebarBrand.TLabel",
+        background=colors["sidebar"],
+        foreground=colors["white"],
+        font=("Segoe UI", 17, "bold"),
+    )
+    style.configure(
+        "SidebarMeta.TLabel",
+        background=colors["sidebar"],
+        foreground="#AFC2DA",
+        font=("Segoe UI", 9),
+    )
+    style.configure(
+        "SidebarSection.TLabel",
+        background=colors["sidebar"],
+        foreground="#8199B5",
+        font=("Segoe UI", 8, "bold"),
+    )
+    style.configure(
+        "TButton",
+        background=colors["surface_alt"],
+        foreground=colors["text"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        relief="flat",
+        padding=(13, 8),
+    )
+    style.map(
+        "TButton",
+        background=[("pressed", "#E7ECF4"), ("active", "#EEF2F8")],
+        bordercolor=[("focus", colors["primary"]), ("active", "#C9D2DF")],
+    )
+    style.configure(
+        "Primary.TButton",
+        background=colors["primary"],
+        foreground=colors["white"],
+        bordercolor=colors["primary"],
+        lightcolor=colors["primary"],
+        darkcolor=colors["primary"],
+        font=("Segoe UI", 10, "bold"),
+        padding=(16, 9),
+    )
+    style.map(
+        "Primary.TButton",
+        background=[("pressed", "#1E40AF"), ("active", colors["primary_hover"])],
+        foreground=[("disabled", "#DCE7FF")],
+    )
+    style.configure(
+        "Nav.TButton",
+        background=colors["sidebar"],
+        foreground="#C7D5E6",
+        bordercolor=colors["sidebar"],
+        lightcolor=colors["sidebar"],
+        darkcolor=colors["sidebar"],
+        anchor="w",
+        padding=(18, 11),
+        font=("Segoe UI", 10),
+    )
+    style.map(
+        "Nav.TButton",
+        background=[("active", colors["sidebar_hover"])],
+        foreground=[("active", colors["white"])],
+        bordercolor=[("focus", colors["sidebar_hover"])],
+    )
+    style.configure(
+        "NavActive.TButton",
+        background=colors["sidebar_active"],
+        foreground=colors["white"],
+        bordercolor=colors["sidebar_active"],
+        lightcolor=colors["sidebar_active"],
+        darkcolor=colors["sidebar_active"],
+        anchor="w",
+        padding=(18, 11),
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.map(
+        "NavActive.TButton",
+        background=[("active", colors["sidebar_active"])],
+        foreground=[("active", colors["white"])],
+    )
+    style.configure(
+        "Profile.TButton",
+        anchor="w",
+        padding=(14, 12),
+        font=("Segoe UI", 9),
+    )
+    style.configure(
+        "SelectedProfile.TButton",
+        background=colors["primary_soft"],
+        foreground=colors["primary_hover"],
+        bordercolor="#9EBBFF",
+        lightcolor="#9EBBFF",
+        darkcolor="#9EBBFF",
+        anchor="w",
+        padding=(14, 12),
+        font=("Segoe UI", 9, "bold"),
+    )
+    style.map(
+        "SelectedProfile.TButton",
+        background=[("active", "#DDE9FF")],
+        bordercolor=[("focus", colors["primary"])],
+    )
+    style.configure(
+        "TEntry",
+        fieldbackground=colors["surface"],
+        foreground=colors["text"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        insertcolor=colors["text"],
+        padding=8,
+    )
+    style.configure(
+        "TCombobox",
+        fieldbackground=colors["surface"],
+        foreground=colors["text"],
+        background=colors["surface_alt"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        arrowcolor=colors["muted"],
+        padding=6,
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", colors["surface"])],
+        selectbackground=[("readonly", colors["surface"])],
+        selectforeground=[("readonly", colors["text"])],
+        bordercolor=[("focus", colors["primary"])],
+    )
+    style.configure(
+        "TSpinbox",
+        fieldbackground=colors["surface"],
+        foreground=colors["text"],
+        background=colors["surface_alt"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        arrowcolor=colors["muted"],
+        padding=6,
+    )
+    style.configure(
+        "TCheckbutton",
+        background=colors["surface"],
+        foreground=colors["text"],
+        padding=(0, 3),
+    )
+    style.map(
+        "TCheckbutton",
+        background=[("active", colors["surface"])],
+        foreground=[("disabled", "#98A3B3")],
+    )
+    style.configure(
+        "TLabelframe",
+        background=colors["surface"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        relief="solid",
+        borderwidth=1,
+    )
+    style.configure(
+        "TLabelframe.Label",
+        background=colors["surface"],
+        foreground=colors["text"],
+        font=("Segoe UI", 11, "bold"),
+    )
+    style.configure(
+        "Vertical.TScrollbar",
+        background="#C8D1DF",
+        troughcolor=colors["surface"],
+        bordercolor=colors["surface"],
+        arrowcolor=colors["muted"],
+    )
+    style.configure("TSeparator", background=colors["border"])
 
     try:
         from PIL import ImageTk
 
-        root._mowik_icon = ImageTk.PhotoImage(make_tray_image())  # type: ignore[attr-defined]
+        root._mowik_icon = ImageTk.PhotoImage(  # type: ignore[attr-defined]
+            make_tray_image("processing")
+        )
         root.iconphoto(True, root._mowik_icon)  # type: ignore[attr-defined]
     except Exception:
         logging.debug("Nie udało się ustawić ikony okna ustawień", exc_info=True)
@@ -836,9 +1406,18 @@ def run_settings_window() -> int:
         "large-v3 — najdokładniejszy (~3,1 GB)": "large-v3",
     }
     device_values: dict[str, Any] = {
-        "Automatycznie": "auto",
+        "Automatycznie (zalecane)": "auto",
         "Procesor (CPU)": "cpu",
-        "NVIDIA CUDA (GPU)": "cuda",
+        "Karta NVIDIA (CUDA)": "cuda",
+    }
+    language_values: dict[str, Any] = {
+        "Polski": "pl",
+        "Angielski": "en",
+        "Niemiecki": "de",
+        "Francuski": "fr",
+        "Hiszpański": "es",
+        "Ukraiński": "uk",
+        "Wykryj automatycznie": "auto",
     }
     microphone_values: dict[str, Any] = {}
 
@@ -873,13 +1452,15 @@ def run_settings_window() -> int:
     device_var = tk.StringVar(
         value=display_for_value(device_values, config.get("device", "auto"))
     )
-    language_var = tk.StringVar(value=str(config.get("language", "pl")))
+    language_var = tk.StringVar(
+        value=display_for_value(language_values, config.get("language", "pl"))
+    )
     cpu_threads_var = tk.StringVar(value=str(config.get("cpu_threads", 0)))
-    beam_size_var = tk.StringVar(value=str(config.get("beam_size", 5)))
+    beam_size_var = tk.StringVar(value=str(config.get("beam_size", 2)))
     microphone_var = tk.StringVar()
 
     pre_roll_var = tk.StringVar(value=str(config.get("pre_roll_ms", 300)))
-    post_roll_var = tk.StringVar(value=str(config.get("post_roll_ms", 160)))
+    post_roll_var = tk.StringVar(value=str(config.get("post_roll_ms", 120)))
     minimum_recording_var = tk.StringVar(
         value=str(config.get("minimum_recording_ms", 250))
     )
@@ -910,7 +1491,7 @@ def run_settings_window() -> int:
         value=bool(paste.get("copy_to_clipboard", True))
     )
     append_space_var = tk.BooleanVar(value=bool(paste.get("append_space", True)))
-    paste_delay_var = tk.StringVar(value=str(paste.get("delay_ms", 90)))
+    paste_delay_var = tk.StringVar(value=str(paste.get("delay_ms", 25)))
 
     feedback = config.get("feedback", {})
     sounds_var = tk.BooleanVar(value=bool(feedback.get("sounds", True)))
@@ -943,44 +1524,436 @@ def run_settings_window() -> int:
         value=str(ollama.get("timeout_seconds", 45))
     )
 
-    status_var = tk.StringVar(value="Zmiany nie są jeszcze zapisane.")
+    status_var = tk.StringVar(value="Wszystko gotowe — ustawienia są zapisane.")
+    shortcut_summary_var = tk.StringVar()
 
-    outer = ttk.Frame(root, padding=14)
-    outer.grid(row=0, column=0, sticky="nsew")
+    def refresh_shortcut_summary(*args) -> None:
+        label = trigger_var.get().replace(" (domyślnie)", "")
+        if "(X1)" in label:
+            label = "Mysz X1"
+        elif "(X2)" in label:
+            label = "Mysz X2"
+        elif label.startswith("Klawiatura: "):
+            label = label.removeprefix("Klawiatura: ")
+        shortcut_summary_var.set(label)
+
+    trigger_var.trace_add("write", refresh_shortcut_summary)
+    refresh_shortcut_summary()
+    page_title_var = tk.StringVar(value="Start")
+    page_subtitle_var = tk.StringVar(
+        value="Najważniejsze informacje i szybki dostęp do ustawień dyktowania."
+    )
+
+    shell = ttk.Frame(root, style="App.TFrame")
+    shell.grid(row=0, column=0, sticky="nsew")
     root.rowconfigure(0, weight=1)
     root.columnconfigure(0, weight=1)
-    outer.rowconfigure(2, weight=1)
-    outer.columnconfigure(0, weight=1)
+    shell.rowconfigure(0, weight=1)
+    shell.columnconfigure(1, weight=1)
 
+    sidebar = ttk.Frame(shell, style="Sidebar.TFrame", width=224)
+    sidebar.grid(row=0, column=0, sticky="ns")
+    sidebar.grid_propagate(False)
+    sidebar.columnconfigure(0, weight=1)
+    sidebar.rowconfigure(20, weight=1)
+
+    brand = ttk.Frame(sidebar, style="Sidebar.TFrame", padding=(18, 22, 18, 16))
+    brand.grid(row=0, column=0, sticky="ew")
+    brand.columnconfigure(1, weight=1)
+    try:
+        from PIL import ImageTk
+
+        brand_image = make_tray_image("processing").resize((38, 38))
+        root._mowik_brand_icon = ImageTk.PhotoImage(brand_image)  # type: ignore[attr-defined]
+        ttk.Label(
+            brand,
+            image=root._mowik_brand_icon,  # type: ignore[attr-defined]
+            style="SidebarMeta.TLabel",
+        ).grid(row=0, column=0, rowspan=2, padx=(0, 11))
+    except Exception:
+        pass
+    ttk.Label(brand, text="Mówik", style="SidebarBrand.TLabel").grid(
+        row=0, column=1, sticky="sw"
+    )
     ttk.Label(
-        outer,
-        text="Ustawienia Mówika",
-        font=("Segoe UI", 16, "bold"),
-    ).grid(row=0, column=0, sticky="w")
+        brand,
+        text="Centrum ustawień",
+        style="SidebarMeta.TLabel",
+    ).grid(row=1, column=1, sticky="nw")
+
+    privacy_badge = tk.Label(
+        sidebar,
+        text="●  DZIAŁA LOKALNIE",
+        background="#173A45",
+        foreground="#7DE2B8",
+        font=("Segoe UI", 8, "bold"),
+        padx=12,
+        pady=7,
+        anchor="w",
+    )
+    privacy_badge.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 20))
+
+    main = ttk.Frame(shell, style="Surface.TFrame")
+    main.grid(row=0, column=1, sticky="nsew")
+    main.rowconfigure(2, weight=1)
+    main.columnconfigure(0, weight=1)
+
+    header = ttk.Frame(main, style="Surface.TFrame", padding=(30, 22, 30, 17))
+    header.grid(row=0, column=0, sticky="ew")
+    header.columnconfigure(0, weight=1)
+    ttk.Label(header, textvariable=page_title_var, style="Title.TLabel").grid(
+        row=0, column=0, sticky="w"
+    )
     ttk.Label(
-        outer,
-        text=(
-            "Zmień parametry bez edytowania pliku JSON. „Zapisz i zastosuj” "
-            "automatycznie uruchomi Mówika ponownie."
+        header,
+        textvariable=page_subtitle_var,
+        style="Subtitle.TLabel",
+        wraplength=650,
+    ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+    local_chip = tk.Label(
+        header,
+        text="Prywatnie i offline",
+        background=colors["success_soft"],
+        foreground=colors["success"],
+        font=("Segoe UI", 9, "bold"),
+        padx=11,
+        pady=6,
+    )
+    local_chip.grid(row=0, column=1, rowspan=2, sticky="e", padx=(18, 0))
+    ttk.Separator(main).grid(row=1, column=0, sticky="ew")
+
+    page_host = ttk.Frame(main, style="Surface.TFrame", padding=(30, 0, 20, 0))
+    page_host.grid(row=2, column=0, sticky="nsew")
+    page_host.rowconfigure(0, weight=1)
+    page_host.columnconfigure(0, weight=1)
+
+    def create_scrollable_page(parent) -> tuple[ttk.Frame, ttk.Frame, tk.Canvas]:
+        wrapper = ttk.Frame(parent, style="Surface.TFrame")
+        wrapper.rowconfigure(0, weight=1)
+        wrapper.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(
+            wrapper,
+            background=colors["surface"],
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            wrapper,
+            orient="vertical",
+            command=canvas.yview,
+            style="Vertical.TScrollbar",
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(8, 0))
+        content = ttk.Frame(
+            canvas,
+            style="Surface.TFrame",
+            padding=(0, 16, 8, 28),
+        )
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def update_scroll_region(event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_content(event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        content.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", fit_content)
+        return wrapper, content, canvas
+
+    start_page, start_tab, start_canvas = create_scrollable_page(page_host)
+    general_page, general_tab, general_canvas = create_scrollable_page(page_host)
+    audio_page, audio_tab, audio_canvas = create_scrollable_page(page_host)
+    text_page, text_tab, text_canvas = create_scrollable_page(page_host)
+    sounds_page, sounds_tab, sounds_canvas = create_scrollable_page(page_host)
+    ollama_page, ollama_tab, ollama_canvas = create_scrollable_page(page_host)
+    files_page, files_tab, files_canvas = create_scrollable_page(page_host)
+
+    page_frames = {
+        "start": start_page,
+        "dictation": general_page,
+        "audio": audio_page,
+        "text": text_page,
+        "sounds": sounds_page,
+        "integrations": ollama_page,
+        "help": files_page,
+    }
+    page_canvases = {
+        "start": start_canvas,
+        "dictation": general_canvas,
+        "audio": audio_canvas,
+        "text": text_canvas,
+        "sounds": sounds_canvas,
+        "integrations": ollama_canvas,
+        "help": files_canvas,
+    }
+    page_meta = {
+        "start": (
+            "Start",
+            "Najważniejsze informacje i szybki dostęp do ustawień dyktowania.",
         ),
-        wraplength=810,
-    ).grid(row=1, column=0, sticky="ew", pady=(2, 10))
+        "dictation": (
+            "Dyktowanie",
+            "Skrót, mikrofon, język oraz profil szybkości i dokładności.",
+        ),
+        "audio": (
+            "Mikrofon i wykrywanie mowy",
+            "Dopasuj czułość i bufory tylko wtedy, gdy nagrania są ucinane.",
+        ),
+        "text": (
+            "Tekst i słownik",
+            "Zdecyduj, gdzie trafia transkrypcja i podpowiedz Mówikowi własne nazwy.",
+        ),
+        "sounds": (
+            "Dźwięki i powiadomienia",
+            "Wybierz dyskretną informację zwrotną na każdym etapie dyktowania.",
+        ),
+        "integrations": (
+            "Integracje",
+            "Opcjonalna, lokalna korekta tekstu przez Ollamę.",
+        ),
+        "help": (
+            "Pomoc i diagnostyka",
+            "Szybki dostęp do konfiguracji, danych aplikacji i logów.",
+        ),
+    }
+    for page in page_frames.values():
+        page.grid(row=0, column=0, sticky="nsew")
 
-    notebook = ttk.Notebook(outer)
-    notebook.grid(row=2, column=0, sticky="nsew")
+    nav_buttons: dict[str, ttk.Button] = {}
+    active_page_key = {"value": "start"}
 
-    general_tab = ttk.Frame(notebook, padding=14)
-    audio_tab = ttk.Frame(notebook, padding=14)
-    text_tab = ttk.Frame(notebook, padding=14)
-    sounds_tab = ttk.Frame(notebook, padding=14)
-    ollama_tab = ttk.Frame(notebook, padding=14)
-    files_tab = ttk.Frame(notebook, padding=14)
-    notebook.add(general_tab, text="Ogólne")
-    notebook.add(audio_tab, text="Mikrofon i VAD")
-    notebook.add(text_tab, text="Tekst i schowek")
-    notebook.add(sounds_tab, text="Dźwięki")
-    notebook.add(ollama_tab, text="Ollama (opcjonalnie)")
-    notebook.add(files_tab, text="Pliki")
+    def scroll_active_page(event) -> None:
+        if event.delta:
+            page_canvases[active_page_key["value"]].yview_scroll(
+                int(-event.delta / 120), "units"
+            )
+
+    root.bind_all("<MouseWheel>", scroll_active_page)
+
+    def show_page(page_key: str) -> None:
+        title, subtitle = page_meta[page_key]
+        active_page_key["value"] = page_key
+        page_title_var.set(title)
+        page_subtitle_var.set(subtitle)
+        page_frames[page_key].tkraise()
+        for key, button in nav_buttons.items():
+            button.configure(
+                style="NavActive.TButton" if key == page_key else "Nav.TButton"
+            )
+        root.after_idle(lambda: page_canvases[page_key].yview_moveto(0))
+
+    nav_row = 2
+    for section, items in (
+        ("CENTRUM", (("start", "Start"),)),
+        (
+            "USTAWIENIA",
+            (
+                ("dictation", "Dyktowanie"),
+                ("audio", "Mikrofon i mowa"),
+                ("text", "Tekst i słownik"),
+                ("sounds", "Dźwięki"),
+            ),
+        ),
+        (
+            "WIĘCEJ",
+            (("integrations", "Integracje"), ("help", "Pomoc i diagnostyka")),
+        ),
+    ):
+        ttk.Label(sidebar, text=section, style="SidebarSection.TLabel").grid(
+            row=nav_row,
+            column=0,
+            sticky="w",
+            padx=19,
+            pady=(7 if nav_row == 2 else 18, 6),
+        )
+        nav_row += 1
+        for page_key, label in items:
+            button = ttk.Button(
+                sidebar,
+                text=label,
+                style="Nav.TButton",
+                command=lambda selected=page_key: show_page(selected),
+            )
+            button.grid(row=nav_row, column=0, sticky="ew", padx=10, pady=1)
+            nav_buttons[page_key] = button
+            nav_row += 1
+
+    ttk.Label(
+        sidebar,
+        text=f"Mówik {APP_VERSION}\nWindows 10/11",
+        style="SidebarMeta.TLabel",
+        justify="left",
+    ).grid(row=21, column=0, sticky="sw", padx=19, pady=18)
+
+    ttk.Separator(main).grid(row=3, column=0, sticky="ew")
+    footer = ttk.Frame(main, style="Surface.TFrame", padding=(30, 13, 30, 15))
+    footer.grid(row=4, column=0, sticky="ew")
+    footer.columnconfigure(1, weight=1)
+
+    # Widok startowy podaje użytkownikowi najważniejszy przepływ bez
+    # wystawiania na pierwszy plan parametrów technicznych Whispera.
+    start_tab.columnconfigure(0, weight=1)
+    hero = tk.Frame(
+        start_tab,
+        background=colors["primary_soft"],
+        highlightbackground="#C9D9FF",
+        highlightthickness=1,
+        padx=24,
+        pady=22,
+    )
+    hero.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+    hero.columnconfigure(0, weight=1)
+    tk.Label(
+        hero,
+        text="GOTOWY DO DYKTOWANIA",
+        background=colors["primary_soft"],
+        foreground=colors["primary"],
+        font=("Segoe UI", 9, "bold"),
+    ).grid(row=0, column=0, sticky="w")
+    tk.Label(
+        hero,
+        text="Przytrzymaj skrót, powiedz zdanie i puść",
+        background=colors["primary_soft"],
+        foreground=colors["text"],
+        font=("Segoe UI", 18, "bold"),
+        justify="left",
+        wraplength=470,
+    ).grid(row=1, column=0, sticky="w", pady=(5, 5))
+    tk.Label(
+        hero,
+        text=(
+            "Mówik rozpozna głos lokalnie i wklei tekst do aktywnego okna. "
+            "Nie wysyła nagrań do chmury."
+        ),
+        background=colors["primary_soft"],
+        foreground=colors["muted"],
+        font=("Segoe UI", 10),
+        justify="left",
+        wraplength=470,
+    ).grid(row=2, column=0, sticky="w")
+    shortcut_keycap = tk.Label(
+        hero,
+        textvariable=shortcut_summary_var,
+        background=colors["surface"],
+        foreground=colors["text"],
+        font=("Segoe UI", 12, "bold"),
+        relief="solid",
+        borderwidth=1,
+        padx=18,
+        pady=10,
+    )
+    shortcut_keycap.grid(row=0, column=1, rowspan=2, sticky="e", padx=(20, 0))
+    ttk.Button(
+        hero,
+        text="Zmień skrót",
+        command=lambda: show_page("dictation"),
+    ).grid(row=2, column=1, sticky="e", padx=(20, 0), pady=(10, 0))
+
+    overview = ttk.Frame(start_tab, style="Surface.TFrame")
+    overview.grid(row=1, column=0, sticky="ew", pady=(0, 16))
+    for column in range(3):
+        overview.columnconfigure(column, weight=1, uniform="overview")
+
+    def add_overview_card(
+        parent, column: int, eyebrow: str, value_var: tk.Variable, description: str
+    ) -> None:
+        card = tk.Frame(
+            parent,
+            background=colors["surface_alt"],
+            highlightbackground=colors["border"],
+            highlightthickness=1,
+            padx=16,
+            pady=14,
+        )
+        card.grid(
+            row=0,
+            column=column,
+            sticky="nsew",
+            padx=(0 if column == 0 else 6, 0 if column == 2 else 6),
+        )
+        tk.Label(
+            card,
+            text=eyebrow,
+            background=colors["surface_alt"],
+            foreground=colors["muted"],
+            font=("Segoe UI", 8, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            card,
+            textvariable=value_var,
+            background=colors["surface_alt"],
+            foreground=colors["text"],
+            font=("Segoe UI", 10, "bold"),
+            justify="left",
+            anchor="w",
+            wraplength=190,
+        ).pack(anchor="w", fill="x", pady=(5, 3))
+        tk.Label(
+            card,
+            text=description,
+            background=colors["surface_alt"],
+            foreground=colors["muted"],
+            font=("Segoe UI", 8),
+            justify="left",
+            anchor="w",
+            wraplength=190,
+        ).pack(anchor="w", fill="x")
+
+    add_overview_card(overview, 0, "SKRÓT", trigger_var, "Przytrzymaj podczas mówienia")
+    add_overview_card(overview, 1, "MIKROFON", microphone_var, "Aktywne źródło dźwięku")
+    add_overview_card(overview, 2, "MODEL", model_var, "Rozpoznawanie lokalne")
+
+    privacy_panel = tk.Frame(
+        start_tab,
+        background=colors["success_soft"],
+        highlightbackground="#BFE8D5",
+        highlightthickness=1,
+        padx=18,
+        pady=14,
+    )
+    privacy_panel.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+    tk.Label(
+        privacy_panel,
+        text="Prywatność jest ustawieniem domyślnym",
+        background=colors["success_soft"],
+        foreground=colors["success"],
+        font=("Segoe UI", 10, "bold"),
+    ).pack(anchor="w")
+    tk.Label(
+        privacy_panel,
+        text=(
+            "Dźwięk istnieje tylko chwilowo w pamięci RAM. Nagrania nie są "
+            "zapisywane, a treść dyktowania nie trafia do logów."
+        ),
+        background=colors["success_soft"],
+        foreground="#356B57",
+        font=("Segoe UI", 9),
+        justify="left",
+        wraplength=700,
+    ).pack(anchor="w", pady=(4, 0))
+
+    quick_actions = ttk.LabelFrame(start_tab, text="Szybkie działania", padding=16)
+    quick_actions.grid(row=3, column=0, sticky="ew")
+    for column in range(3):
+        quick_actions.columnconfigure(column, weight=1)
+    ttk.Button(
+        quick_actions,
+        text="Ustaw dyktowanie",
+        command=lambda: show_page("dictation"),
+    ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+    ttk.Button(
+        quick_actions,
+        text="Otwórz słownik",
+        command=lambda: show_page("text"),
+    ).grid(row=0, column=1, sticky="ew", padx=5)
+    ttk.Button(
+        quick_actions,
+        text="Diagnostyka",
+        command=lambda: show_page("help"),
+    ).grid(row=0, column=2, sticky="ew", padx=(5, 0))
 
     for tab in (
         general_tab,
@@ -992,10 +1965,28 @@ def run_settings_window() -> int:
     ):
         tab.columnconfigure(1, weight=1)
 
-    presets = ttk.LabelFrame(general_tab, text="Szybkie profile", padding=10)
-    presets.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+    presets = ttk.LabelFrame(general_tab, text="Profil jakości", padding=14)
+    presets.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     for column in range(3):
         presets.columnconfigure(column, weight=1)
+
+    profile_buttons: dict[str, ttk.Button] = {}
+
+    def refresh_profile_buttons(*args) -> None:
+        selected_model = str(model_values.get(model_var.get(), model_var.get()))
+        try:
+            selected_beam = int(beam_size_var.get())
+        except ValueError:
+            selected_beam = -1
+        for profile_name, button in profile_buttons.items():
+            changes = QUICK_PROFILES[profile_name]["changes"]
+            selected = (
+                selected_model == changes["model"]
+                and selected_beam == changes["beam_size"]
+            )
+            button.configure(
+                style="SelectedProfile.TButton" if selected else "Profile.TButton"
+            )
 
     def set_profile(profile_name: str) -> None:
         profile = QUICK_PROFILES[profile_name]
@@ -1004,24 +1995,33 @@ def run_settings_window() -> int:
         device_var.set(display_for_value(device_values, changes["device"]))
         beam_size_var.set(str(changes["beam_size"]))
         status_var.set(
-            f"Wybrano profil „{profile['label']}”. Kliknij „Zapisz i zastosuj”."
+            f"Wybrano profil „{profile['label']}”. Zastosuj zmiany, aby go uruchomić."
         )
+        refresh_profile_buttons()
 
-    ttk.Button(
-        presets,
-        text="Lekki\nsmall · beam 1",
-        command=lambda: set_profile("light"),
-    ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
-    ttk.Button(
-        presets,
-        text="Zbalansowany\nTurbo · beam 2",
-        command=lambda: set_profile("balanced"),
-    ).grid(row=0, column=1, sticky="ew", padx=5)
-    ttk.Button(
-        presets,
-        text="Dokładny\nlarge-v3 · beam 5",
-        command=lambda: set_profile("accurate"),
-    ).grid(row=0, column=2, sticky="ew", padx=(5, 0))
+    for column, (profile_name, button_text) in enumerate(
+        (
+            ("light", "Szybki\nsmall · najmniejsze obciążenie"),
+            ("balanced", "Zalecany\nTurbo · dobry balans"),
+            ("accurate", "Najdokładniejszy\nlarge-v3 · najwyższa jakość"),
+        )
+    ):
+        button = ttk.Button(
+            presets,
+            text=button_text,
+            style="Profile.TButton",
+            command=lambda selected=profile_name: set_profile(selected),
+        )
+        button.grid(
+            row=0,
+            column=column,
+            sticky="nsew",
+            padx=(0 if column == 0 else 5, 0 if column == 2 else 5),
+        )
+        profile_buttons[profile_name] = button
+    model_var.trace_add("write", refresh_profile_buttons)
+    beam_size_var.trace_add("write", refresh_profile_buttons)
+    refresh_profile_buttons()
 
     def add_field(
         parent,
@@ -1030,13 +2030,19 @@ def run_settings_window() -> int:
         widget,
         hint: Optional[str] = None,
     ) -> None:
-        ttk.Label(parent, text=label).grid(
-            row=row, column=0, sticky="w", padx=(0, 12), pady=5
+        ttk.Label(parent, text=label, style="Field.TLabel").grid(
+            row=row, column=0, sticky="w", padx=(0, 14), pady=7
         )
-        widget.grid(row=row, column=1, sticky="ew", pady=5)
+        widget.grid(row=row, column=1, sticky="ew", pady=7)
         if hint:
-            ttk.Label(parent, text=hint, foreground="#666666").grid(
-                row=row, column=2, sticky="w", padx=(10, 0), pady=5
+            ttk.Label(
+                parent,
+                text=hint,
+                style="Muted.TLabel",
+                wraplength=220,
+                justify="left",
+            ).grid(
+                row=row, column=2, sticky="w", padx=(14, 0), pady=7
             )
 
     trigger_row = ttk.Frame(general_tab)
@@ -1121,7 +2127,7 @@ def run_settings_window() -> int:
             note = f"Ustawiono {trigger_display_name(trigger)}."
             if trigger in {"mouse:left", "mouse:right"}:
                 note += " Ten przycisk może kolidować ze zwykłą obsługą Windows."
-            status_var.set(note + " Kliknij „Zapisz i zastosuj”.")
+            status_var.set(note + " Kliknij „Zastosuj zmiany”.")
             try:
                 dialog.grab_release()
             except tk.TclError:
@@ -1246,7 +2252,7 @@ def run_settings_window() -> int:
         3,
         "Model mowy",
         model_combo,
-        "Zmiana modelu może uruchomić jednorazowe pobieranie.",
+        "Nowy model może zostać pobrany przy zastosowaniu zmian.",
     )
     device_combo = ttk.Combobox(
         general_tab,
@@ -1254,22 +2260,29 @@ def run_settings_window() -> int:
         values=list(device_values.keys()),
         state="readonly",
     )
-    add_field(general_tab, 4, "Urządzenie obliczeniowe", device_combo)
+    add_field(
+        general_tab,
+        4,
+        "Miejsce przetwarzania",
+        device_combo,
+        "Automatyczny wybór jest najlepszy dla większości komputerów.",
+    )
     language_combo = ttk.Combobox(
         general_tab,
         textvariable=language_var,
-        values=("pl", "en", "de", "fr", "es", "uk", "auto"),
+        values=list(language_values.keys()),
+        state="readonly",
     )
-    add_field(general_tab, 5, "Język", language_combo, "Dla polskiego zostaw „pl”.")
+    add_field(general_tab, 5, "Język dyktowania", language_combo)
     beam_spin = ttk.Spinbox(
         general_tab, from_=1, to=10, textvariable=beam_size_var, width=8
     )
     add_field(
         general_tab,
         6,
-        "Beam size",
+        "Dokładność rozpoznawania",
         beam_spin,
-        "1 = szybciej; 5 = dokładniej, ale wolniej.",
+        "1 = najszybciej; 5 = dokładniej, ale wolniej.",
     )
     threads_spin = ttk.Spinbox(
         general_tab, from_=0, to=256, textvariable=cpu_threads_var, width=8
@@ -1277,13 +2290,15 @@ def run_settings_window() -> int:
     add_field(
         general_tab,
         7,
-        "Wątki CPU",
+        "Liczba wątków CPU",
         threads_spin,
-        "0 = dobór automatyczny.",
+        "0 oznacza automatyczny dobór.",
     )
 
-    capture_frame = ttk.LabelFrame(audio_tab, text="Nagrywanie", padding=10)
-    capture_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+    capture_frame = ttk.LabelFrame(
+        audio_tab, text="Bufor i czułość mikrofonu", padding=14
+    )
+    capture_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     capture_frame.columnconfigure(1, weight=1)
     add_field(
         capture_frame,
@@ -1313,53 +2328,72 @@ def run_settings_window() -> int:
     add_field(
         capture_frame,
         3,
-        "Minimalna głośność RMS",
+        "Minimalny poziom dźwięku",
         ttk.Entry(capture_frame, textvariable=minimum_rms_var),
-        "Niżej = większa czułość na cichy dźwięk.",
+        "Niższa wartość zwiększa czułość na cichy głos.",
     )
 
-    vad_frame = ttk.LabelFrame(audio_tab, text="Wykrywanie mowy (VAD)", padding=10)
+    vad_frame = ttk.LabelFrame(
+        audio_tab, text="Wykrywanie ciszy — ustawienia zaawansowane", padding=14
+    )
     vad_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
     vad_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         vad_frame,
-        text="Włącz filtrowanie ciszy",
+        text="Automatycznie pomijaj ciszę i dźwięki bez wyraźnej mowy",
         variable=vad_enabled_var,
-    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+    vad_controls: list[ttk.Widget] = []
+    vad_threshold_entry = ttk.Entry(vad_frame, textvariable=vad_threshold_var)
+    vad_controls.append(vad_threshold_entry)
     add_field(
         vad_frame,
         1,
-        "Próg VAD",
-        ttk.Entry(vad_frame, textvariable=vad_threshold_var),
-        "Zakres 0–1; wyżej = bardziej rygorystycznie.",
+        "Czułość wykrywania",
+        vad_threshold_entry,
+        "Zakres 0–1; wyższa wartość mocniej odrzuca szum.",
     )
+    vad_speech_spin = ttk.Spinbox(
+        vad_frame, from_=0, to=10000, textvariable=vad_min_speech_var
+    )
+    vad_controls.append(vad_speech_spin)
     add_field(
         vad_frame,
         2,
-        "Minimalna mowa (ms)",
-        ttk.Spinbox(
-            vad_frame, from_=0, to=10000, textvariable=vad_min_speech_var
-        ),
+        "Minimalna długość mowy (ms)",
+        vad_speech_spin,
     )
+    vad_silence_spin = ttk.Spinbox(
+        vad_frame, from_=0, to=10000, textvariable=vad_min_silence_var
+    )
+    vad_controls.append(vad_silence_spin)
     add_field(
         vad_frame,
         3,
-        "Minimalna cisza (ms)",
-        ttk.Spinbox(
-            vad_frame, from_=0, to=10000, textvariable=vad_min_silence_var
-        ),
+        "Minimalna długość ciszy (ms)",
+        vad_silence_spin,
     )
+    vad_pad_spin = ttk.Spinbox(
+        vad_frame, from_=0, to=3000, textvariable=vad_speech_pad_var
+    )
+    vad_controls.append(vad_pad_spin)
     add_field(
         vad_frame,
         4,
         "Margines mowy (ms)",
-        ttk.Spinbox(
-            vad_frame, from_=0, to=3000, textvariable=vad_speech_pad_var
-        ),
+        vad_pad_spin,
     )
 
-    text_frame = ttk.LabelFrame(text_tab, text="Wklejanie i formatowanie", padding=10)
-    text_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+    def sync_vad_controls(*args) -> None:
+        state = "normal" if vad_enabled_var.get() else "disabled"
+        for control in vad_controls:
+            control.configure(state=state)
+
+    vad_enabled_var.trace_add("write", sync_vad_controls)
+    sync_vad_controls()
+
+    text_frame = ttk.LabelFrame(text_tab, text="Miejsce docelowe i format", padding=14)
+    text_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     text_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         text_frame,
@@ -1371,21 +2405,26 @@ def run_settings_window() -> int:
         text="Kopiuj rozpoznany tekst również do schowka",
         variable=copy_to_clipboard_var,
     ).grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
-    ttk.Checkbutton(
+    append_space_check = ttk.Checkbutton(
         text_frame,
         text="Dodawaj spację po wklejonym zdaniu",
         variable=append_space_var,
-    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
+    )
+    append_space_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=4)
     ttk.Checkbutton(
         text_frame,
         text="Rozpoznawaj komendy „nowa linia” i „nowy akapit”",
         variable=voice_commands_var,
     ).grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
+    paste_delay_spin = ttk.Spinbox(
+        text_frame, from_=0, to=5000, textvariable=paste_delay_var
+    )
     add_field(
         text_frame,
         4,
-        "Opóźnienie przed Ctrl+V (ms)",
-        ttk.Spinbox(text_frame, from_=0, to=5000, textvariable=paste_delay_var),
+        "Opóźnienie wklejania (ms)",
+        paste_delay_spin,
+        "Zwiększ tylko wtedy, gdy aplikacja docelowa pomija tekst.",
     )
     ttk.Label(
         text_frame,
@@ -1393,16 +2432,26 @@ def run_settings_window() -> int:
             "Gdy schowek jest włączony, pozostaje w nim dokładna transkrypcja "
             "bez automatycznie dodanej spacji."
         ),
-        foreground="#666666",
-        wraplength=820,
+        style="Muted.TLabel",
+        wraplength=760,
     ).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
-    dictionary_frame = ttk.LabelFrame(text_tab, text="Słownik", padding=10)
-    dictionary_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+    def sync_paste_controls(*args) -> None:
+        state = "normal" if paste_enabled_var.get() else "disabled"
+        append_space_check.configure(state=state)
+        paste_delay_spin.configure(state=state)
+
+    paste_enabled_var.trace_add("write", sync_paste_controls)
+    sync_paste_controls()
+
+    dictionary_frame = ttk.LabelFrame(
+        text_tab, text="Prywatny słownik nazw i terminów", padding=14
+    )
+    dictionary_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
     dictionary_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
         dictionary_frame,
-        text="Używaj prywatnego słownika nazw i terminów",
+        text="Podpowiadaj modelowi zapis własnych nazw, marek i skrótów",
         variable=dictionary_enabled_var,
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=4)
     add_field(
@@ -1425,12 +2474,14 @@ def run_settings_window() -> int:
 
     ttk.Button(
         dictionary_frame,
-        text="Otwórz słownik",
+        text="Edytuj słownik…",
         command=lambda: open_path(DICTIONARY_PATH),
     ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
-    feedback_frame = ttk.LabelFrame(sounds_tab, text="Informacje zwrotne", padding=10)
-    feedback_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+    feedback_frame = ttk.LabelFrame(
+        sounds_tab, text="Informacje zwrotne", padding=14
+    )
+    feedback_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
     ttk.Checkbutton(
         feedback_frame, text="Sygnały dźwiękowe", variable=sounds_var
     ).grid(row=0, column=0, sticky="w", padx=(0, 25), pady=4)
@@ -1439,11 +2490,18 @@ def run_settings_window() -> int:
         text="Powiadomienia Windows",
         variable=notifications_var,
     ).grid(row=0, column=1, sticky="w", pady=4)
-    ttk.Checkbutton(
+    loop_sound_check = ttk.Checkbutton(
         feedback_frame,
         text="Zapętlaj własny dźwięk nagrywania podczas trzymania przycisku",
         variable=loop_recording_sound_var,
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+    )
+    loop_sound_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+
+    def sync_sound_controls(*args) -> None:
+        loop_sound_check.configure(state="normal" if sounds_var.get() else "disabled")
+
+    sounds_var.trace_add("write", sync_sound_controls)
+    sync_sound_controls()
 
     sound_labels = {
         "start": "Naciśnięcie / trzymanie",
@@ -1451,13 +2509,6 @@ def run_settings_window() -> int:
         "done": "Tekst gotowy",
         "error": "Błąd lub brak mowy",
     }
-    sound_tones = {
-        "start": (880, 120),
-        "stop": (520, 100),
-        "done": (1100, 100),
-        "error": (260, 180),
-    }
-
     def choose_sound(kind: str) -> None:
         current = resolve_sound_path(sound_path_vars[kind].get())
         initial_dir = str(current.parent) if current is not None else str(Path.home())
@@ -1500,12 +2551,7 @@ def run_settings_window() -> int:
                     | winsound.SND_NODEFAULT,
                 )
             else:
-                frequency, duration = sound_tones[kind]
-                threading.Thread(
-                    target=lambda: winsound.Beep(frequency, duration),
-                    name="SoundPreview",
-                    daemon=True,
-                ).start()
+                play_builtin_sound_async(kind, "SoundPreview")
         except Exception as exc:
             messagebox.showerror(
                 APP_DISPLAY_NAME,
@@ -1516,43 +2562,46 @@ def run_settings_window() -> int:
     custom_sound_frame = ttk.LabelFrame(
         sounds_tab,
         text="Własne dźwięki WAV",
-        padding=10,
+        padding=14,
     )
     custom_sound_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
-    custom_sound_frame.columnconfigure(1, weight=1)
+    custom_sound_frame.columnconfigure(0, weight=1)
     ttk.Label(
         custom_sound_frame,
         text=(
             "Pozostaw puste, aby używać krótkiego sygnału wbudowanego. "
             "Wybrany plik zostanie skopiowany do %APPDATA%\\Mowik\\sounds."
         ),
-        foreground="#666666",
-        wraplength=820,
-    ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        style="Muted.TLabel",
+        wraplength=760,
+    ).grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
     for row_index, kind in enumerate(("start", "stop", "done", "error"), start=1):
-        ttk.Label(custom_sound_frame, text=sound_labels[kind]).grid(
-            row=row_index,
-            column=0,
-            sticky="w",
-            padx=(0, 12),
-            pady=5,
+        sound_row = ttk.Frame(custom_sound_frame, style="Surface.TFrame")
+        sound_row.grid(
+            row=row_index, column=0, sticky="ew", pady=(5, 7)
         )
+        sound_row.columnconfigure(0, weight=1)
+        ttk.Label(
+            sound_row,
+            text=sound_labels[kind],
+            style="Field.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 5))
         ttk.Entry(
-            custom_sound_frame,
+            sound_row,
             textvariable=sound_path_vars[kind],
             state="readonly",
-        ).grid(row=row_index, column=1, sticky="ew", pady=5)
-        buttons = ttk.Frame(custom_sound_frame)
-        buttons.grid(row=row_index, column=2, sticky="e", padx=(8, 0), pady=5)
+        ).grid(row=1, column=0, sticky="ew")
+        buttons = ttk.Frame(sound_row)
+        buttons.grid(row=1, column=1, sticky="e", padx=(8, 0))
         ttk.Button(
             buttons,
-            text="Wybierz WAV…",
+            text="Wybierz…",
             command=lambda selected_kind=kind: choose_sound(selected_kind),
         ).grid(row=0, column=0, padx=(0, 4))
         ttk.Button(
             buttons,
-            text="Odsłuchaj",
+            text="Odsłuch",
             command=lambda selected_kind=kind: preview_sound(selected_kind),
         ).grid(row=0, column=1, padx=4)
         ttk.Button(
@@ -1569,75 +2618,151 @@ def run_settings_window() -> int:
         command=lambda: open_path(SOUNDS_DIR),
     ).grid(row=0, column=0)
 
-    ttk.Label(
+    ollama_intro = tk.Frame(
         ollama_tab,
+        background=colors["primary_soft"],
+        highlightbackground="#C9D9FF",
+        highlightthickness=1,
+        padx=18,
+        pady=14,
+    )
+    ollama_intro.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+    tk.Label(
+        ollama_intro,
+        text="Funkcja opcjonalna",
+        background=colors["primary_soft"],
+        foreground=colors["primary"],
+        font=("Segoe UI", 9, "bold"),
+    ).pack(anchor="w")
+    tk.Label(
+        ollama_intro,
         text=(
-            "Ollama nie jest potrzebna do rozpoznawania mowy. Może jedynie "
-            "opcjonalnie poprawić interpunkcję i oczywiste błędy po transkrypcji."
+            "Mówik rozpoznaje mowę bez Ollamy. Lokalny model językowy może "
+            "jedynie poprawić interpunkcję i oczywiste literówki."
         ),
-        wraplength=790,
-    ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        background=colors["primary_soft"],
+        foreground=colors["muted"],
+        font=("Segoe UI", 9),
+        justify="left",
+        wraplength=720,
+    ).pack(anchor="w", pady=(4, 0))
+
+    ollama_frame = ttk.LabelFrame(
+        ollama_tab, text="Lokalna korekta tekstu", padding=14
+    )
+    ollama_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+    ollama_frame.columnconfigure(1, weight=1)
     ttk.Checkbutton(
-        ollama_tab,
+        ollama_frame,
         text="Włącz lokalną korektę przez Ollamę",
         variable=ollama_enabled_var,
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=5)
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 7))
+    ollama_url_entry = ttk.Entry(ollama_frame, textvariable=ollama_url_var)
     add_field(
-        ollama_tab,
-        2,
+        ollama_frame,
+        1,
         "Adres Ollamy",
-        ttk.Entry(ollama_tab, textvariable=ollama_url_var),
+        ollama_url_entry,
     )
+    ollama_model_entry = ttk.Entry(ollama_frame, textvariable=ollama_model_var)
     add_field(
-        ollama_tab,
-        3,
+        ollama_frame,
+        2,
         "Nazwa modelu",
-        ttk.Entry(ollama_tab, textvariable=ollama_model_var),
-        "Np. model już pobrany w Ollamie.",
+        ollama_model_entry,
+        "Wpisz nazwę modelu pobranego wcześniej w Ollamie.",
+    )
+    ollama_timeout_spin = ttk.Spinbox(
+        ollama_frame, from_=1, to=600, textvariable=ollama_timeout_var
     )
     add_field(
-        ollama_tab,
-        4,
+        ollama_frame,
+        3,
         "Limit czasu (s)",
-        ttk.Spinbox(
-            ollama_tab, from_=1, to=600, textvariable=ollama_timeout_var
-        ),
+        ollama_timeout_spin,
     )
     ttk.Label(
-        ollama_tab,
+        ollama_frame,
         text=(
             "Włączenie korektora wydłuży oczekiwanie. Mówik odrzuca korektę, "
             "jeżeli za mocno zmienia tekst, liczby lub negacje."
         ),
-        foreground="#666666",
-        wraplength=790,
-    ).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        style="Muted.TLabel",
+        wraplength=720,
+    ).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+
+    ollama_controls = (
+        ollama_url_entry,
+        ollama_model_entry,
+        ollama_timeout_spin,
+    )
+
+    def sync_ollama_controls(*args) -> None:
+        state = "normal" if ollama_enabled_var.get() else "disabled"
+        for control in ollama_controls:
+            control.configure(state=state)
+
+    ollama_enabled_var.trace_add("write", sync_ollama_controls)
+    sync_ollama_controls()
 
     files_tab.columnconfigure(0, weight=1)
-    ttk.Label(
+    diagnostics_intro = tk.Frame(
         files_tab,
-        text="Konfiguracja",
-        font=("Segoe UI", 11, "bold"),
-    ).grid(row=0, column=0, sticky="w")
-    ttk.Label(files_tab, text=str(CONFIG_PATH), wraplength=790).grid(
-        row=1, column=0, sticky="ew", pady=(2, 8)
+        background=colors["success_soft"],
+        highlightbackground="#BFE8D5",
+        highlightthickness=1,
+        padx=18,
+        pady=14,
     )
-    ttk.Button(
-        files_tab,
-        text="Otwórz surowy config.json (zaawansowane)",
-        command=lambda: open_path(CONFIG_PATH),
-    ).grid(row=2, column=0, sticky="w")
+    diagnostics_intro.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+    tk.Label(
+        diagnostics_intro,
+        text=f"Mówik {APP_VERSION} · dane pozostają na tym komputerze",
+        background=colors["success_soft"],
+        foreground=colors["success"],
+        font=("Segoe UI", 10, "bold"),
+    ).pack(anchor="w")
+    tk.Label(
+        diagnostics_intro,
+        text=(
+            "Jeżeli coś nie działa, zacznij od logu. Nie zawiera on treści "
+            "dyktowanych zdań."
+        ),
+        background=colors["success_soft"],
+        foreground="#356B57",
+        font=("Segoe UI", 9),
+        justify="left",
+        wraplength=700,
+    ).pack(anchor="w", pady=(4, 0))
 
-    ttk.Label(
-        files_tab,
-        text="Dane i modele",
-        font=("Segoe UI", 11, "bold"),
-    ).grid(row=3, column=0, sticky="w", pady=(20, 0))
-    ttk.Label(files_tab, text=str(LOCALDATA_DIR), wraplength=790).grid(
-        row=4, column=0, sticky="ew", pady=(2, 8)
+    config_card = ttk.LabelFrame(
+        files_tab, text="Konfiguracja zaawansowana", padding=14
     )
-    files_buttons = ttk.Frame(files_tab)
-    files_buttons.grid(row=5, column=0, sticky="w")
+    config_card.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+    config_card.columnconfigure(0, weight=1)
+    ttk.Label(
+        config_card,
+        text=str(CONFIG_PATH),
+        style="Muted.TLabel",
+        wraplength=700,
+    ).grid(row=0, column=0, sticky="ew", pady=(0, 9))
+    ttk.Button(
+        config_card,
+        text="Otwórz config.json…",
+        command=lambda: open_path(CONFIG_PATH),
+    ).grid(row=1, column=0, sticky="w")
+
+    data_card = ttk.LabelFrame(files_tab, text="Dane, modele i diagnostyka", padding=14)
+    data_card.grid(row=2, column=0, sticky="ew")
+    data_card.columnconfigure(0, weight=1)
+    ttk.Label(
+        data_card,
+        text=str(LOCALDATA_DIR),
+        style="Muted.TLabel",
+        wraplength=700,
+    ).grid(row=0, column=0, sticky="ew", pady=(0, 9))
+    files_buttons = ttk.Frame(data_card)
+    files_buttons.grid(row=1, column=0, sticky="w")
     ttk.Button(
         files_buttons,
         text="Otwórz folder danych",
@@ -1645,7 +2770,7 @@ def run_settings_window() -> int:
     ).grid(row=0, column=0, padx=(0, 8))
     ttk.Button(
         files_buttons,
-        text="Otwórz log",
+        text="Otwórz log diagnostyczny",
         command=lambda: open_path(LOG_PATH),
     ).grid(row=0, column=1)
 
@@ -1681,13 +2806,15 @@ def run_settings_window() -> int:
         split_trigger(trigger)
         model = str(model_values.get(model_var.get(), model_var.get())).strip()
         device = str(device_values.get(device_var.get(), device_var.get())).strip()
-        language = language_var.get().strip()
+        language = str(
+            language_values.get(language_var.get(), language_var.get())
+        ).strip()
         if not model:
             raise AppError("Wybierz model mowy.")
         if device not in {"auto", "cpu", "cuda"}:
             raise AppError("Urządzenie musi mieć wartość auto, cpu albo cuda.")
         if not language:
-            raise AppError("Pole „Język” nie może być puste.")
+            raise AppError("Wybierz język dyktowania.")
         if microphone_var.get() not in microphone_values:
             raise AppError("Wybierz mikrofon z listy.")
 
@@ -1699,7 +2826,9 @@ def run_settings_window() -> int:
         updated["cpu_threads"] = parse_int(
             cpu_threads_var, "Wątki CPU", 0, 256
         )
-        updated["beam_size"] = parse_int(beam_size_var, "Beam size", 1, 10)
+        updated["beam_size"] = parse_int(
+            beam_size_var, "Dokładność rozpoznawania", 1, 10
+        )
         updated["pre_roll_ms"] = parse_int(
             pre_roll_var, "Bufor przed naciśnięciem", 0, 2000
         )
@@ -1790,15 +2919,97 @@ def run_settings_window() -> int:
         }
         return updated
 
+    tracked_variables: list[tk.Variable] = [
+        trigger_var,
+        model_var,
+        device_var,
+        language_var,
+        cpu_threads_var,
+        beam_size_var,
+        microphone_var,
+        pre_roll_var,
+        post_roll_var,
+        minimum_recording_var,
+        minimum_rms_var,
+        vad_enabled_var,
+        vad_threshold_var,
+        vad_min_speech_var,
+        vad_min_silence_var,
+        vad_speech_pad_var,
+        dictionary_enabled_var,
+        dictionary_max_terms_var,
+        paste_enabled_var,
+        copy_to_clipboard_var,
+        append_space_var,
+        paste_delay_var,
+        sounds_var,
+        notifications_var,
+        loop_recording_sound_var,
+        voice_commands_var,
+        ollama_enabled_var,
+        ollama_url_var,
+        ollama_model_var,
+        ollama_timeout_var,
+        *sound_path_vars.values(),
+    ]
+    dirty_state: dict[str, Any] = {
+        "baseline": tuple(variable.get() for variable in tracked_variables),
+        "dirty": False,
+    }
+
+    status_dot = tk.Label(
+        footer,
+        text="●",
+        background=colors["surface"],
+        foreground=colors["success"],
+        font=("Segoe UI", 10, "bold"),
+    )
+    status_dot.grid(row=0, column=0, sticky="w")
+    ttk.Label(
+        footer,
+        textvariable=status_var,
+        style="Muted.TLabel",
+        wraplength=360,
+    ).grid(row=0, column=1, sticky="w", padx=(7, 12))
+    footer.columnconfigure(1, weight=1)
+
+    def update_status_indicator(*args) -> None:
+        status = status_var.get().casefold()
+        if "błąd" in status:
+            color = colors["danger"]
+        elif dirty_state["dirty"]:
+            color = "#C56A10"
+        else:
+            color = colors["success"]
+        status_dot.configure(foreground=color)
+
+    def refresh_dirty_state(*args) -> None:
+        current = tuple(variable.get() for variable in tracked_variables)
+        was_dirty = bool(dirty_state["dirty"])
+        dirty_state["dirty"] = current != dirty_state["baseline"]
+        if dirty_state["dirty"] and not was_dirty:
+            status_var.set("Masz niezapisane zmiany.")
+        elif not dirty_state["dirty"] and was_dirty:
+            status_var.set("Wszystko gotowe — ustawienia są zapisane.")
+        update_status_indicator()
+
+    for variable in tracked_variables:
+        variable.trace_add("write", refresh_dirty_state)
+    status_var.trace_add("write", update_status_indicator)
+
     def save_from_window(apply_now: bool) -> None:
         nonlocal config
         try:
             updated = collect_config()
             save_config(updated)
             config = updated
+            dirty_state["baseline"] = tuple(
+                variable.get() for variable in tracked_variables
+            )
+            dirty_state["dirty"] = False
             if apply_now:
                 request_app_restart()
-                status_var.set("Zapisano. Mówik uruchamia się ponownie…")
+                status_var.set("Zapisano — Mówik stosuje zmiany…")
                 root.after(180, root.destroy)
             else:
                 status_var.set(
@@ -1816,7 +3027,9 @@ def run_settings_window() -> int:
         trigger_var.set(ensure_trigger_display(DEFAULT_CONFIG["trigger"]))
         model_var.set(display_for_value(model_values, DEFAULT_CONFIG["model"]))
         device_var.set(display_for_value(device_values, DEFAULT_CONFIG["device"]))
-        language_var.set(str(DEFAULT_CONFIG["language"]))
+        language_var.set(
+            display_for_value(language_values, DEFAULT_CONFIG["language"])
+        )
         cpu_threads_var.set(str(DEFAULT_CONFIG["cpu_threads"]))
         beam_size_var.set(str(DEFAULT_CONFIG["beam_size"]))
         microphone_var.set(display_for_value(microphone_values, None))
@@ -1852,35 +3065,39 @@ def run_settings_window() -> int:
         ollama_url_var.set(str(default_ollama["url"]))
         ollama_model_var.set(str(default_ollama["model"]))
         ollama_timeout_var.set(str(default_ollama["timeout_seconds"]))
-        status_var.set("Przywrócono wartości domyślne w oknie. Zapisz, aby je zastosować.")
+        dirty_state["dirty"] = True
+        status_var.set("Przywrócono wartości domyślne. Zastosuj, aby je zapisać.")
 
-    footer = ttk.Frame(outer)
-    footer.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-    footer.columnconfigure(0, weight=1)
-    ttk.Label(footer, textvariable=status_var, wraplength=470).grid(
-        row=0, column=0, sticky="w", padx=(0, 12)
-    )
+    def close_window() -> None:
+        if dirty_state["dirty"] and not messagebox.askyesno(
+            f"{APP_DISPLAY_NAME} — niezapisane zmiany",
+            "Zamknąć okno i odrzucić niezapisane zmiany?",
+            parent=root,
+        ):
+            return
+        root.destroy()
+
     ttk.Button(
         footer,
-        text="Domyślne",
+        text="Przywróć domyślne",
         command=restore_defaults,
-    ).grid(row=0, column=1, padx=4)
-    ttk.Button(footer, text="Anuluj", command=root.destroy).grid(
-        row=0, column=2, padx=4
+    ).grid(row=0, column=2, padx=4)
+    ttk.Button(footer, text="Zamknij", command=close_window).grid(
+        row=0, column=3, padx=4
     )
     ttk.Button(
         footer,
-        text="Zapisz",
-        command=lambda: save_from_window(False),
-    ).grid(row=0, column=3, padx=4)
-    ttk.Button(
-        footer,
-        text="Zapisz i zastosuj",
+        text="Zastosuj zmiany",
+        style="Primary.TButton",
         command=lambda: save_from_window(True),
     ).grid(row=0, column=4, padx=(4, 0))
 
     root.bind("<Control-s>", lambda event: save_from_window(False))
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.bind("<Control-Return>", lambda event: save_from_window(True))
+    root.bind("<Escape>", lambda event: close_window())
+    root.protocol("WM_DELETE_WINDOW", close_window)
+    show_page("start")
+    update_status_indicator()
     root.mainloop()
     return 0
 
@@ -1988,8 +3205,16 @@ class ContinuousRecorder:
                 self._ring.append(chunk)
                 self._ring_samples += len(chunk)
                 while self._ring and self._ring_samples > self.pre_roll_samples:
-                    removed = self._ring.popleft()
-                    self._ring_samples -= len(removed)
+                    excess = self._ring_samples - self.pre_roll_samples
+                    oldest = self._ring[0]
+                    if len(oldest) <= excess:
+                        self._ring.popleft()
+                        self._ring_samples -= len(oldest)
+                    else:
+                        # Zachowaj dokładnie zadany pre-roll zamiast tracić cały
+                        # blok (1024 próbki to aż 64 ms przy 16 kHz).
+                        self._ring[0] = oldest[excess:].copy()
+                        self._ring_samples -= excess
 
     def begin(self) -> None:
         with self._lock:
@@ -2020,6 +3245,7 @@ class MowikApp:
         self.busy = False
         self.key_down = False
         self.capture_active = False
+        self._release_started_at: Optional[float] = None
         self.model: Optional[WhisperModel] = None
         self.model_name = ""
         self.model_device = ""
@@ -2029,6 +3255,7 @@ class MowikApp:
         self.jobs: queue.Queue[Optional[np.ndarray]] = queue.Queue()
         self.tray: Optional[pystray.Icon] = None
         self.status = "Start…"
+        self.tray_state = "idle"
         self._status_lock = threading.Lock()
         self._restart_lock = threading.Lock()
         self._restart_started = False
@@ -2143,26 +3370,39 @@ class MowikApp:
         try:
             self.recorder.begin()
             self.capture_active = True
-        except Exception:
+        except Exception as exc:
             self._release_busy()
-            raise
-        self.set_status("Nagrywanie…")
+            logging.exception("Nie udało się rozpocząć nagrywania")
+            self.set_status("Błąd nagrywania", notify=str(exc), error=True)
+            self.beep("error")
+            return
         self.beep("start")
+        self.set_status("Nagrywanie…")
 
     def end_dictation(self) -> None:
         if not self.capture_active:
             return
         self.capture_active = False
+        self._release_started_at = time.perf_counter()
         # Kończymy także dłuższy, niezapętlony WAV przypisany do nagrywania.
         self.stop_feedback_sound()
         threading.Thread(
-            target=self._finish_dictation_after_tail,
+            target=self._finish_dictation_safely,
             name="PostRoll",
             daemon=True,
         ).start()
 
+    def _finish_dictation_safely(self) -> None:
+        try:
+            self._finish_dictation_after_tail()
+        except Exception as exc:
+            logging.exception("Nie udało się zakończyć nagrywania")
+            self._release_busy()
+            self.set_status("Błąd nagrywania", notify=str(exc), error=True)
+            self.beep("error")
+
     def _finish_dictation_after_tail(self) -> None:
-        post_roll = max(0, int(self.config.get("post_roll_ms", 160))) / 1000
+        post_roll = max(0, int(self.config.get("post_roll_ms", 120))) / 1000
         if post_roll:
             time.sleep(post_roll)
         if self.stop_event.is_set():
@@ -2218,6 +3458,11 @@ class MowikApp:
                     paste_enabled,
                     copy_enabled,
                 )
+                if self._release_started_at is not None:
+                    logging.info(
+                        "Latencja F8 release -> tekst: %.3f s",
+                        time.perf_counter() - self._release_started_at,
+                    )
                 self.set_status(
                     f"Gotowy — {trigger_display_name(str(self.config['trigger']))}"
                 )
@@ -2231,6 +3476,7 @@ class MowikApp:
                 self.jobs.task_done()
 
     def transcribe(self, audio: np.ndarray) -> str:
+        pipeline_started = time.perf_counter()
         model = self.model
         if model is None:
             raise AppError("Model nie jest załadowany.")
@@ -2242,7 +3488,8 @@ class MowikApp:
         sample_rate = (
             self.recorder.sample_rate if self.recorder is not None else SAMPLE_RATE
         )
-        logging.info("Audio: %.2f s, %d Hz, RMS=%.6f", len(audio) / sample_rate, sample_rate, rms)
+        audio_duration = len(audio) / sample_rate
+        logging.info("Audio: %.2f s, %d Hz, RMS=%.6f", audio_duration, sample_rate, rms)
         if rms < float(self.config.get("minimum_rms", 0.0015)):
             return ""
 
@@ -2262,9 +3509,6 @@ class MowikApp:
 
         dictionary_terms = load_dictionary(self.config)
         glossary = ", ".join(dictionary_terms)
-        initial_prompt = None
-        if glossary:
-            initial_prompt = glossary[:1800]
 
         vad_settings = self.config.get("vad", {})
         vad_enabled = bool(vad_settings.get("enabled", True))
@@ -2282,36 +3526,49 @@ class MowikApp:
         configured_language = str(self.config.get("language", "pl")).strip()
         language: Optional[str] = None if configured_language.lower() == "auto" else configured_language
 
+        whisper_started = time.perf_counter()
         segments, info = model.transcribe(
             audio_input,
             language=language,
             task="transcribe",
-            beam_size=max(1, int(self.config.get("beam_size", 5))),
+            beam_size=max(1, int(self.config.get("beam_size", 2))),
             temperature=0.0,
             condition_on_previous_text=False,
-            initial_prompt=initial_prompt,
             hotwords=glossary[:1800] if glossary else None,
             vad_filter=vad_enabled,
             vad_parameters=vad_parameters if vad_enabled else None,
             without_timestamps=True,
         )
         transcript = "".join(segment.text for segment in segments)
+        whisper_elapsed = time.perf_counter() - whisper_started
         logging.info(
-            "Whisper: język=%s prawdopodobieństwo=%.3f, znaków=%d",
+            "Whisper: język=%s prawdopodobieństwo=%.3f, znaków=%d, "
+            "czas=%.3f s, RTF=%.3f",
             getattr(info, "language", "?"),
             float(getattr(info, "language_probability", 0.0)),
             len(transcript),
+            whisper_elapsed,
+            whisper_elapsed / max(0.001, audio_duration),
         )
         transcript = normalize_transcript(transcript)
         transcript = apply_voice_commands(transcript, self.config)
+        cleanup_started = time.perf_counter()
         transcript = cleanup_with_ollama(
             transcript, self.config, dictionary_terms
+        )
+        cleanup_elapsed = time.perf_counter() - cleanup_started
+        logging.info(
+            "Pipeline: whisper=%.3f s, korekta=%.3f s, razem=%.3f s",
+            whisper_elapsed,
+            cleanup_elapsed,
+            time.perf_counter() - pipeline_started,
         )
         return normalize_transcript(transcript)
 
     def _release_busy(self) -> None:
         with self.busy_lock:
             self.busy = False
+            self._release_started_at = None
 
     def stop_feedback_sound(self) -> None:
         if os.name != "nt":
@@ -2329,13 +3586,6 @@ class MowikApp:
             return
         if os.name != "nt":
             return
-        tones = {
-            "start": (880, 55),
-            "stop": (520, 45),
-            "done": (1100, 45),
-            "error": (260, 120),
-        }
-        frequency, duration = tones.get(kind, (700, 50))
         custom_path = configured_sound_path(self.config, kind)
         loop = bool(
             kind == "start"
@@ -2363,22 +3613,7 @@ class MowikApp:
                     exc_info=True,
                 )
 
-        def play_tone() -> None:
-            try:
-                import winsound
-
-                winsound.Beep(frequency, duration)
-            except Exception:
-                logging.debug(
-                    "Nie udało się odtworzyć sygnału awaryjnego",
-                    exc_info=True,
-                )
-
-        threading.Thread(
-            target=play_tone,
-            name=f"Feedback-{kind}",
-            daemon=True,
-        ).start()
+        play_builtin_sound_async(kind)
 
     def set_status(
         self,
@@ -2386,12 +3621,15 @@ class MowikApp:
         notify: Optional[str] = None,
         error: bool = False,
     ) -> None:
+        tray_state = tray_state_for_status(status, error)
         with self._status_lock:
             self.status = status
+            self.tray_state = tray_state
         logging.error(status) if error else logging.info(status)
         tray = self.tray
         if tray is not None:
             try:
+                tray.icon = make_tray_image(tray_state)
                 tray.title = f"{APP_DISPLAY_NAME} — {status}"[:127]
                 tray.update_menu()
             except Exception:
@@ -2412,7 +3650,7 @@ class MowikApp:
         try:
             subprocess.Popen(
                 settings_process_args(),
-                cwd=str(Path(__file__).resolve().parent),
+                cwd=str(APP_ROOT),
             )
         except Exception as exc:
             logging.exception("Nie udało się otworzyć panelu ustawień")
@@ -2471,7 +3709,7 @@ class MowikApp:
                     "--restart-delay",
                     "1.0",
                 ]
-            subprocess.Popen(args, cwd=str(Path(__file__).resolve().parent))
+            subprocess.Popen(args, cwd=str(APP_ROOT))
         except Exception:
             with self._restart_lock:
                 self._restart_started = False
@@ -2500,15 +3738,15 @@ class MowikApp:
     def run_tray(self) -> None:
         profiles_menu = pystray.Menu(
             pystray.MenuItem(
-                "Lekki — small / beam 1",
+                "Szybki — small / dokładność 1",
                 self.apply_light_profile,
             ),
             pystray.MenuItem(
-                "Zbalansowany — Turbo / beam 2",
+                "Zalecany — Turbo / dokładność 2",
                 self.apply_balanced_profile,
             ),
             pystray.MenuItem(
-                "Dokładny — large-v3 / beam 5",
+                "Najdokładniejszy — large-v3 / dokładność 5",
                 self.apply_accurate_profile,
             ),
         )
@@ -2531,7 +3769,7 @@ class MowikApp:
         )
         self.tray = pystray.Icon(
             APP_NAME,
-            make_tray_image(),
+            make_tray_image(self.tray_state),
             f"{APP_DISPLAY_NAME} — Start…",
             menu,
         )

@@ -148,6 +148,24 @@ try {
         throw "Instalacja bibliotek nie powiodla sie."
     }
 
+    $HasNvidiaGpu = $false
+    try {
+        $NvidiaController = Get-CimInstance Win32_VideoController -ErrorAction Stop |
+            Where-Object { [string]$_.Name -match "(?i)NVIDIA" } |
+            Select-Object -First 1
+        $HasNvidiaGpu = $null -ne $NvidiaController
+    } catch {
+        Write-Host "Nie udalo sie automatycznie sprawdzic karty NVIDIA; pozostaje tryb CPU."
+    }
+    $GpuRequirements = Join-Path $Root "requirements-gpu.txt"
+    if ($HasNvidiaGpu -and (Test-Path -LiteralPath $GpuRequirements)) {
+        Write-Host "Wykryto NVIDIA. Instaluje lokalny runtime CUDA 12 (jednorazowo)..."
+        & $VenvPython -m pip install --prefer-binary -r $GpuRequirements
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Runtime NVIDIA nie zainstalowal sie; Mowik nadal zadziala na CPU."
+        }
+    }
+
     Write-Host "Sprawdzam import bibliotek..."
     & $VenvPython -c "import faster_whisper,ctranslate2,numpy,sounddevice,pynput,pystray,pyperclip,PIL; print('Biblioteki: OK')"
     if ($LASTEXITCODE -ne 0) {
@@ -171,7 +189,7 @@ try {
         throw "Brakuje pythonw.exe w srodowisku .venv."
     }
 
-    Set-Content -LiteralPath (Join-Path $Root ".installed") -Value "Mowik 2.2.0" -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Root ".installed") -Value "Mowik 2.3.0" -Encoding ASCII
     Write-Host ""
     Write-Host "INSTALACJA ZAKONCZONA POMYSLNIE" -ForegroundColor Green
     Write-Host "Przytrzymaj F8, powiedz zdanie i pusc F8."

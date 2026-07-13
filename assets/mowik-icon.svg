@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Mówik">
+  <defs>
+    <linearGradient id="background" x1="128" y1="96" x2="896" y2="928" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#173A63"/>
+      <stop offset="1" stop-color="#0B1B31"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="210" y1="130" x2="820" y2="900" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5FE1FF"/>
+      <stop offset="1" stop-color="#4D7CFE"/>
+    </linearGradient>
+  </defs>
+  <rect x="56" y="56" width="912" height="912" rx="248" fill="url(#background)"/>
+  <rect x="84" y="84" width="856" height="856" rx="222" fill="none" stroke="url(#accent)" stroke-width="40"/>
+  <rect x="376" y="206" width="272" height="390" rx="136" fill="#F8FAFC"/>
+  <path d="M280 460v28c0 128 104 232 232 232s232-104 232-232v-28" fill="none" stroke="#F8FAFC" stroke-width="58" stroke-linecap="round"/>
+  <path d="M512 720v102M390 824h244" fill="none" stroke="#F8FAFC" stroke-width="58" stroke-linecap="round"/>
+  <circle cx="790" cy="770" r="124" fill="#0B1B31"/>
+  <circle cx="790" cy="770" r="96" fill="#22C55E"/>
+  <path d="m744 770 31 32 64-70" fill="none" stroke="#F8FAFC" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,4 +1,4 @@
-MOWIK 2.2.0 - PROSTA AKTUALIZACJA
+MOWIK 2.3.0 - PROSTA AKTUALIZACJA
 
 1. Wyodrebnij CALA zawartosc ZIP-a do tymczasowego folderu.
 2. Uruchom AKTUALIZUJ.cmd.

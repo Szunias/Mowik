@@ -46,12 +46,14 @@ function Find-RunningMowikFolder {
 function Find-AutostartMowikFolder {
     try {
         $Startup = [Environment]::GetFolderPath("Startup")
-        $ShortcutPath = Join-Path $Startup "Mowik.lnk"
-        if (Test-Path -LiteralPath $ShortcutPath) {
-            $Shell = New-Object -ComObject WScript.Shell
-            $Shortcut = $Shell.CreateShortcut($ShortcutPath)
-            if (Test-MowikFolder -Path $Shortcut.WorkingDirectory) {
-                return [string]$Shortcut.WorkingDirectory
+        foreach ($ShortcutName in @("Mówik.lnk", "Mowik.lnk")) {
+            $ShortcutPath = Join-Path $Startup $ShortcutName
+            if (Test-Path -LiteralPath $ShortcutPath) {
+                $Shell = New-Object -ComObject WScript.Shell
+                $Shortcut = $Shell.CreateShortcut($ShortcutPath)
+                if (Test-MowikFolder -Path $Shortcut.WorkingDirectory) {
+                    return [string]$Shortcut.WorkingDirectory
+                }
             }
         }
     } catch {
@@ -84,10 +86,19 @@ try {
     }
 
     Write-Host ""
-    Write-Host "MOWIK - AKTUALIZACJA 2.2.0" -ForegroundColor Cyan
+    Write-Host "MOWIK - AKTUALIZACJA 2.3.0" -ForegroundColor Cyan
     Write-Host ""
 
-    $Files = @("mowik.py", "README.md", "WERSJA.txt", "install.ps1", "USTAWIENIA.cmd", "config.example.json")
+    $Files = @(
+        "mowik.py",
+        "README.md",
+        "WERSJA.txt",
+        "install.ps1",
+        "USTAWIENIA.cmd",
+        "config.example.json",
+        "requirements.txt",
+        "requirements-gpu.txt"
+    )
     foreach ($Name in $Files) {
         if (-not (Test-Path -LiteralPath (Join-Path $Payload $Name))) {
             throw "Brakuje pliku payload\$Name. Wyodrebnij ponownie cala paczke."
@@ -158,7 +169,7 @@ try {
 
     Write-Host "[3/6] Tworze mala kopie zapasowa kodu..."
     $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $Backup = Join-Path $Target ("backup-przed-2.2.0-" + $Stamp)
+    $Backup = Join-Path $Target ("backup-przed-2.3.0-" + $Stamp)
     New-Item -ItemType Directory -Path $Backup -Force | Out-Null
     $OriginallyPresent = @{}
     foreach ($Name in $Files) {
@@ -170,12 +181,31 @@ try {
     }
 
     try {
-        Write-Host "[4/6] Kopiuje wersje 2.2.0..."
+        Write-Host "[4/6] Kopiuje wersje 2.3.0..."
         foreach ($Name in $Files) {
             Copy-Item -LiteralPath (Join-Path $Payload $Name) -Destination (Join-Path $Target $Name) -Force
         }
 
-        Write-Host "[5/6] Sprawdzam nowa wersje..."
+        Write-Host "[5/6] Aktualizuje biblioteki i sprawdzam nowa wersje..."
+        & $VenvPython -m pip install --prefer-binary -r (Join-Path $Target "requirements.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Aktualizacja podstawowych bibliotek nie powiodla sie."
+        }
+        try {
+            $HasNvidiaGpu = $null -ne (
+                Get-CimInstance Win32_VideoController -ErrorAction Stop |
+                    Where-Object { [string]$_.Name -match "(?i)NVIDIA" } |
+                    Select-Object -First 1
+            )
+        } catch {
+            $HasNvidiaGpu = $false
+        }
+        if ($HasNvidiaGpu) {
+            & $VenvPython -m pip install --prefer-binary -r (Join-Path $Target "requirements-gpu.txt")
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Runtime NVIDIA nie zainstalowal sie; pozostaje bezpieczny tryb CPU."
+            }
+        }
         & $VenvPython -m py_compile $TargetScript
         if ($LASTEXITCODE -ne 0) {
             throw "Nowy plik mowik.py nie przeszedl kontroli skladni."
@@ -184,11 +214,11 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "Nie udalo sie uruchomic nowej wersji. Wynik: $VersionOutput"
         }
-        if ($VersionOutput -notmatch "2\.2\.0") {
-            throw "Plik nie jest wersja 2.2.0. Wynik: $VersionOutput"
+        if ($VersionOutput -notmatch "2\.3\.0") {
+            throw "Plik nie jest wersja 2.3.0. Wynik: $VersionOutput"
         }
         Write-Host $VersionOutput
-        Set-Content -LiteralPath (Join-Path $Target ".installed") -Value "Mowik 2.2.0" -Encoding ASCII
+        Set-Content -LiteralPath (Join-Path $Target ".installed") -Value "Mowik 2.3.0" -Encoding ASCII
     } catch {
         Write-Host "Kontrola nie przeszla. Przywracam stare pliki..." -ForegroundColor Yellow
         foreach ($Name in $Files) {

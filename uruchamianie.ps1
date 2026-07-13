@@ -9,14 +9,17 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Startup = [Environment]::GetFolderPath("Startup")
-$ShortcutPath = Join-Path $Startup "Mowik.lnk"
+$ShortcutPath = Join-Path $Startup "Mówik.lnk"
+$LegacyShortcutPath = Join-Path $Startup "Mowik.lnk"
 
 try {
     if ($Mode -eq "disable") {
-        if (Test-Path -LiteralPath $ShortcutPath) {
-            Remove-Item -LiteralPath $ShortcutPath -Force
+        foreach ($Path in @($ShortcutPath, $LegacyShortcutPath)) {
+            if (Test-Path -LiteralPath $Path) {
+                Remove-Item -LiteralPath $Path -Force
+            }
         }
-        Write-Host "Autostart Mowika zostal wylaczony."
+        Write-Host "Autostart Mówika zostal wylaczony."
         exit 0
     }
 
@@ -34,10 +37,13 @@ try {
     $Shortcut.TargetPath = $PythonW
     $Shortcut.Arguments = '"' + $Script + '"'
     $Shortcut.WorkingDirectory = $Root
-    $Shortcut.Description = "Lokalne dyktowanie Mowik"
+    $Shortcut.Description = "Lokalne dyktowanie Mówik"
     $Shortcut.Save()
+    if (Test-Path -LiteralPath $LegacyShortcutPath) {
+        Remove-Item -LiteralPath $LegacyShortcutPath -Force
+    }
 
-    Write-Host "Autostart Mowika zostal wlaczony."
+    Write-Host "Autostart Mówika zostal wlaczony."
     Write-Host "Skrot: $ShortcutPath"
     exit 0
 } catch {
