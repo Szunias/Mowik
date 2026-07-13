@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.7.2',
+    [string]$Version = '2.7.3',
 
     [Parameter()]
     [ValidateSet('UnsignedLocal', 'UnsignedRelease', 'SignedRelease')]
@@ -382,18 +382,21 @@ $HashLine = "$($Hash.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($Install
 $HashPath = Join-Path $ReleaseDir 'SHA256SUMS.txt'
 Write-NewAsciiFile -Path $HashPath -Value ($HashLine + "`n")
 
-$ArtifactTestArguments = @(
-    '-Version', $Version,
-    '-InstallerFileName', $InstallerFileName
-)
-if ($IsSignedRelease) {
-    $ArtifactTestArguments += @(
-        '-RequireAuthenticode',
-        '-ExpectedSignerThumbprint', $SigningCertificate.Thumbprint,
-        '-SignToolPath', $ResolvedSignTool
-    )
+$ArtifactTestArguments = @{
+    Version = $Version
+    InstallerFileName = $InstallerFileName
 }
-Invoke-Checked (Join-Path $PSScriptRoot 'test-release-artifacts.ps1') $ArtifactTestArguments
+if ($IsSignedRelease) {
+    $ArtifactTestArguments.RequireAuthenticode = $true
+    $ArtifactTestArguments.ExpectedSignerThumbprint = $SigningCertificate.Thumbprint
+    $ArtifactTestArguments.SignToolPath = $ResolvedSignTool
+}
+$ArtifactTestScript = Join-Path $PSScriptRoot 'test-release-artifacts.ps1'
+$global:LASTEXITCODE = 0
+& $ArtifactTestScript @ArtifactTestArguments
+if ((-not $?) -or ($LASTEXITCODE -ne 0)) {
+    throw "Release artifact verification failed with exit code $LASTEXITCODE."
+}
 
 $SizeMiB = [Math]::Round((Get-Item -LiteralPath $Installer).Length / 1MB, 1)
 Write-Host "Gotowe: $Installer ($SizeMiB MiB)" -ForegroundColor Green
