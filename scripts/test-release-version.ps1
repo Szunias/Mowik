@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.6.0'
+    [string]$Version = '2.7.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,9 +72,9 @@ $Checks = @(
         Description = 'the installer-test default'
     },
     @{
-        RelativePath = '.github\workflows\windows-release.yml'
-        Expected = "default: `"$Version`""
-        Description = 'the workflow default'
+        RelativePath = 'scripts\test-release-artifacts.ps1'
+        Expected = "[string]`$Version = '$Version'"
+        Description = 'the release-artifact-test default'
     },
     @{
         RelativePath = 'BUDUJ_INSTALATOR.cmd'

@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 6, 0, 0),
-    prodvers=(2, 6, 0, 0),
+    filevers=(2, 7, 0, 0),
+    prodvers=(2, 7, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,12 +17,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'Igor Szuniewicz'),
           StringStruct('FileDescription', 'Mówik — private local dictation'),
-          StringStruct('FileVersion', '2.6.0'),
+          StringStruct('FileVersion', '2.7.0'),
           StringStruct('InternalName', 'Mowik'),
           StringStruct('LegalCopyright', 'Copyright © 2026 Igor Szuniewicz'),
           StringStruct('OriginalFilename', 'Mowik.exe'),
           StringStruct('ProductName', 'Mówik'),
-          StringStruct('ProductVersion', '2.6.0')
+          StringStruct('ProductVersion', '2.7.0')
         ]
       )
     ]),

@@ -64,6 +64,7 @@ Centrum Mówika pokazuje na co dzień tylko najważniejsze ustawienia, a opcje t
 - **Polski i angielski interfejs** z automatycznym dopasowaniem do języka Windows oraz trwałym przełącznikiem języka.
 - **Łagodne sygnały wbudowane i własne dźwięki WAV** dla startu nagrywania, puszczenia przycisku, gotowego tekstu i błędu, z odsłuchem i opcjonalnym zapętleniem.
 - **Opcjonalny ekranowy wskaźnik dyktowania** z zieloną kropką nagrywania, animacją przetwarzania, znacznikiem sukcesu i symbolem X przy błędzie.
+- **Własne komendy w stylu Jarvisa** pod osobnym przyciskiem: wklejanie zapisanych treści, otwieranie programu/pliku/strony albo bezpieczne otwarcie terminala w folderze aktywnego Eksploratora ze szkicem w schowku.
 - **Elastyczne wyjście**: automatyczne wklejanie do aktywnego okna, kopiowanie do schowka albo jedno i drugie.
 - **Prywatny słownik**: nazwiska, marki i fachowe terminy jako podpowiedź dla modelu.
 - **Bufor sprzed naciśnięcia**: pierwsza sylaba nie jest ucinana, bo mikrofon trzyma krótki bufor w pamięci RAM.
@@ -91,7 +92,7 @@ Instalator wymaga 64-bitowego Windows 10 w wersji 1809 lub nowszej albo Windows 
 
 Instalator proponuje język zgodny z interfejsem Windows i pozwala go potwierdzić lub zmienić. Aplikacja domyślnie dopasowuje język automatycznie; w Centrum Mówika możesz niezależnie wybrać **Automatycznie**, **Polski** albo **English**, a następnie **Zapisz i uruchom ponownie**.
 
-Obecne wydanie nie jest jeszcze podpisane płatnym certyfikatem Authenticode, dlatego Windows SmartScreen może pokazać komunikat „Nieznany wydawca”. Pobieraj instalator wyłącznie z oficjalnego wydania GitHub i w razie wątpliwości porównaj SHA-256 z dołączonym `SHA256SUMS.txt`.
+Lokalne buildy deweloperskie są niepodpisane, jeśli nie podasz zaufanego certyfikatu Authenticode, dlatego Windows SmartScreen może pokazać komunikat „Nieznany wydawca”. Publiczne wydanie musi zostać podpisane i opatrzone znacznikiem czasu przez pipeline; mimo to pobieraj je wyłącznie z oficjalnego GitHuba, sprawdź nazwę wydawcy i w razie wątpliwości porównaj SHA-256 z `SHA256SUMS.txt`. Podpis pomaga potwierdzić autora i budować reputację, ale nie gwarantuje braku ostrzeżenia dla całkiem nowego hasha pliku.
 
 ### Aktualizacja istniejącej instalacji
 
@@ -109,6 +110,7 @@ Kliknij prawym przyciskiem ikonę mikrofonu przy zegarze Windows (czasem pod str
 | Dyktowanie | profil jakości, przycisk, mikrofon i język; model, GPU/CPU, dokładność i wątki w ustawieniach zaawansowanych |
 | Mikrofon i mowa | automatyczne wykrywanie mowy; bufory, czułość i szczegóły ciszy w ustawieniach zaawansowanych |
 | Tekst i słownik | wklejanie, kopiowanie, końcowa spacja, komendy głosowe i prywatny słownik |
+| Własne komendy | osobny skrót, wypowiadane frazy, szablony tekstu, otwieranie programów/plików/stron i bezpieczne szkice „terminal tutaj” |
 | Dźwięki | sygnały i powiadomienia; własne WAV-y, odsłuch i zapętlenie w ustawieniach zaawansowanych |
 | Integracje | opcjonalny lokalny korektor LLM przez Ollamę, ze szczegółami połączenia w ustawieniach zaawansowanych |
 | Pomoc i diagnostyka | najpierw bezpieczny log i folder danych; `config.json` w ustawieniach zaawansowanych |
@@ -145,7 +147,7 @@ Nie można wyłączyć obu opcji naraz. Gdy kopiowanie jest włączone, schowek 
 
 ## Informacje zwrotne i własne dźwięki
 
-Opcjonalny **Wskaźnik dyktowania na ekranie** w sekcji **Dźwięki → Informacje zwrotne** daje natychmiastowe potwierdzenie wizualne bez odbierania fokusu aplikacji, w której piszesz. Podczas nagrywania pokazuje małą zieloną kropkę, po puszczeniu przycisku — krótką animację przetwarzania, po pomyślnym przekazaniu tekstu — znacznik wyboru, a przy błędzie — symbol X. Wskaźnik można wyłączyć w ustawieniach Mówika; sygnały dźwiękowe i powiadomienia Windows konfiguruje się niezależnie.
+Opcjonalny **Wskaźnik dyktowania na ekranie** w sekcji **Dźwięki → Informacje zwrotne** daje natychmiastowe potwierdzenie wizualne bez odbierania fokusu aplikacji, w której piszesz. Zwykłe dyktowanie ma zieloną kropkę, a własne komendy — wyraźnie odmienny fioletowy wskaźnik. Oba tryby mają własną animację przetwarzania i znacznik sukcesu; przy błędzie pojawia się symbol X. Wskaźnik można wyłączyć w ustawieniach Mówika; sygnały dźwiękowe i powiadomienia Windows konfiguruje się niezależnie.
 
 W sekcji **Dźwięki** rozwiń **ustawienia zaawansowane**, aby przypisać osobny plik do każdego zdarzenia: naciśnięcie, puszczenie, gotowy tekst, błąd. Obsługiwane są nieskompresowane pliki `.wav` (PCM) do 50 MB. Po zapisaniu plik jest kopiowany do `%APPDATA%\Mowik\sounds`, więc działa nawet po usunięciu oryginału. Pole pokazuje **Wbudowany**, gdy działa krótki ton programu; przycisk **Przywróć** wraca do tego dźwięku.
 
@@ -166,6 +168,28 @@ Słownik jest przekazywany modelowi jako podpowiedź. Pomaga przy nazwiskach, ma
 
 Po włączeniu w sekcji **Tekst i słownik** rozpoznawane są komendy „nowa linia” i „nowy akapit” dla polskiego oraz `new line` i `new paragraph` dla angielskiego. Domyślnie są wyłączone, aby zwykłe zdania z tymi słowami nie były zamieniane.
 
+## Własne komendy i akcje
+
+Własne komendy używają drugiego przycisku push-to-talk — domyślnie **F7** — a **F8** pozostaje zwykłym dyktowaniem. W sekcji **Własne komendy** dodaj wypowiadaną frazę i wybierz jedną z trzech akcji:
+
+- **Wklej tekst** — wstaw zapisany fragment dokładnie. Tekst wielowierszowy zawsze wymaga potwierdzenia, bo wklejony do terminala mógłby coś wykonać.
+- **Otwórz program, plik lub stronę** — uruchom istniejącą bezwzględną ścieżkę lokalną albo adres HTTPS; potwierdzenie jest zawsze wymagane, a skrypty, skróty i ścieżki sieciowe są blokowane.
+- **Otwórz terminal** — uruchom Windows Terminal albo widoczną klasyczną konsolę w folderze przechwyconym z aktywnego Eksploratora, w wybranym stałym folderze lub w folderze domowym.
+
+Polecenia terminala celowo działają jako szkic. Komenda może dopasować wyłącznie pełną frazę i tylko otworzyć terminal albo potraktować resztę wypowiedzi jako jednowierszowy szkic. Mówik sprawdza go, kopiuje do schowka i nigdy nie wpisuje go automatycznie ani nie naciska Enter. To Ty przeglądasz tekst, wklejasz go przez `Ctrl+V` i samodzielnie uruchamiasz. Dowolne wykonywanie zapisanych poleceń przez `cmd.exe` oraz stare wpisy `run_command` są wyłączone.
+
+Wklejanie i otwieranie używa dokładnego dopasowania całej frazy. Szkic terminala ma jawny tryb fraza-plus-reszta: fraza musi znaleźć się na początku i kończyć na granicy pełnego słowa, a przy kilku możliwościach wygrywa najdłuższa. Nie ma rozmytego ani częściowego uruchamiania. Jeżeli aktywny Eksplorator pokazuje lokalizację wirtualną, ścieżkę sieciową, nieistniejący folder albo nie można go jednoznacznie rozpoznać, akcja jest blokowana bez zastępczego katalogu.
+
+Mówik zapamiętuje tożsamość okna Eksploratora w chwili naciśnięcia F7, a nie dopiero po transkrypcji. Otwieranie programów i terminala jest też blokowane, gdy Mówik działa jako administrator, aby proces potomny nie odziedziczył po cichu podwyższonych uprawnień. Wielowierszowe akcje wklejania mają ograniczoną długość, dzięki czemu okno potwierdzenia pokazuje całą treść. Frazy oraz treści pozostają lokalnie jako jawny tekst w `%APPDATA%\Mowik\config.json`; nie zapisuj w nich haseł, tokenów ani sekretów.
+
+Fioletowy wskaźnik ekranowy odróżnia komendy od zwykłego zielonego dyktowania. Ma własną animację przetwarzania i znacznik sukcesu; można go wyłączyć w **Dźwięki → Informacje zwrotne**.
+
+### Przejrzystość wobec antywirusa i SmartScreen
+
+Mówik nie zaciemnia kodu, nie wyłącza ochrony, nie dodaje wyjątków Defendera, nie ukrywa konsol poleceń i nie pobiera wykonywalnych aktualizacji. Build Windows jest katalogiem aplikacji zamiast samorozpakowującego się pojedynczego EXE, ma manifest `asInvoker`, pozostawia autostart jako świadomy wybór i nie wykonuje szkiców terminala. To ogranicza podejrzane zachowania, ale nie zastępuje podpisu Authenticode ani normalnego budowania reputacji. Jeżeli podpisany oficjalny artefakt dostanie fałszywy alarm, należy przesłać dokładnie ten końcowy plik Microsoftowi jako producent oprogramowania, a nie osłabiać zabezpieczenia użytkownika.
+
+Samo rozpoznawanie mowy nadal działa lokalnie, ale akcja otwierająca stronę lub program korzystający z sieci może oczywiście użyć połączenia internetowego tego programu.
+
 ## Opcjonalna korekta LLM (Ollama)
 
 Ollama nie jest potrzebna do rozpoznawania mowy. Może jedynie poprawić interpunkcję i oczywiste literówki po transkrypcji:
@@ -179,6 +203,7 @@ Korektor odrzuca wynik, gdy zbyt mocno zmienia tekst, liczby albo negacje. Przy 
 
 - Dźwięk jest przechowywany tylko chwilowo w pamięci RAM; nagrania nie są zapisywane.
 - Log techniczny nie zawiera treści dyktowanych zdań.
+- Frazy i zawartość własnych komend nie trafiają do logu technicznego, ale są lokalnie zapisane w `config.json`, aby można je było edytować.
 - Transkrypcja działa lokalnie; po pobraniu modelu internet nie jest potrzebny.
 - Ollama, jeżeli ją włączysz, jest wywoływana pod lokalnym adresem `127.0.0.1`.
 
@@ -207,10 +232,10 @@ Mówik nie wklei tekstu do aplikacji uruchomionej jako administrator, jeżeli sa
 ## Naprawa, autostart i budowanie
 
 - Ponowne uruchomienie tego samego instalatora naprawia pliki programu bez usuwania danych użytkownika.
-- Autostart można wybrać w kreatorze instalacji; ponowne uruchomienie instalatora pozwala zmienić tę opcję.
+- Autostart jest domyślnie odznaczony i wymaga świadomego zaznaczenia w kreatorze; ponowne uruchomienie instalatora pozwala zmienić tę opcję.
 - Język interfejsu może automatycznie podążać za językiem Windows albo zostać ustawiony na polski lub angielski w Centrum Mówika.
 - `BUDUJ_EXE.cmd` buduje katalog aplikacji `dist\Mowik`.
-- `BUDUJ_INSTALATOR.cmd` uruchamia testy, buduje aplikację i tworzy gotowy `release\Mowik-x.y.z-Setup.exe` wraz z sumą SHA-256.
+- `BUDUJ_INSTALATOR.cmd` uruchamia testy, buduje aplikację i tworzy jednoznacznie lokalny `release\Mowik-x.y.z-Setup-UNSIGNED.exe` wraz z sumą SHA-256. Tego deweloperskiego pliku nie należy publikować. Dopiero workflow wydania na GitHubie tworzy podpisany plik o nazwie `Mowik-x.y.z-Setup.exe`.
 - Definicje powtarzalnego wydania znajdują się w `packaging`, a workflow GitHub Actions w `.github/workflows/windows-release.yml`.
 
 ## Licencja

@@ -1,5 +1,9 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "2.6.0"
+  #define MyAppVersion "2.7.0"
+#endif
+
+#ifndef MyOutputBaseFilename
+  #define MyOutputBaseFilename "Mowik-" + MyAppVersion + "-Setup-UNSIGNED"
 #endif
 
 #define MyAppName "Mówik"
@@ -41,7 +45,7 @@ SetupIconFile=assets\Mowik.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile=LICENSE.txt
 OutputDir=release
-OutputBaseFilename=Mowik-{#MyAppVersion}-Setup
+OutputBaseFilename={#MyOutputBaseFilename}
 SourceDir=..
 Compression=lzma2/normal
 SolidCompression=no
@@ -55,6 +59,18 @@ UsePreviousAppDir=yes
 UsePreviousGroup=yes
 UsePreviousTasks=yes
 Uninstallable=yes
+ASLRCompatible=yes
+DEPCompatible=yes
+DisablePrecompiledFileVerifications=no
+#ifdef SignedRelease
+SignTool=MowikAuthenticode
+SignedUninstaller=yes
+SignToolRetryCount=3
+SignToolRetryDelay=2000
+SignToolMinimumTimeBetween=1000
+#else
+SignedUninstaller=no
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -82,7 +98,7 @@ polish.LaunchApp=Uruchom Mówika
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:DesktopIconTask}"; GroupDescription: "{cm:AdditionalShortcutsGroup}"; Flags: unchecked
-Name: "autostart"; Description: "{cm:AutoStartTask}"; GroupDescription: "{cm:StartupGroup}"; Flags: checkedonce
+Name: "autostart"; Description: "{cm:AutoStartTask}"; GroupDescription: "{cm:StartupGroup}"; Flags: unchecked
 
 [Files]
 Source: "dist\Mowik\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

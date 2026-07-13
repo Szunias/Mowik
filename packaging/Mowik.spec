@@ -34,6 +34,12 @@ for package in (
     binaries += package_binaries
     hiddenimports += package_hiddenimports
 
+hiddenimports += [
+    "pythoncom",
+    "pywintypes",
+    "win32com.client",
+]
+
 for package in ("nvidia.cublas", "nvidia.cuda_nvrtc", "nvidia.cudnn"):
     binaries += collect_dynamic_libs(package)
 

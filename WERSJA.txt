@@ -1,2 +1,2 @@
-Mowik 2.6.0
+Mowik 2.7.0
 Opcjonalny wskaźnik dyktowania na ekranie: zielona kropka podczas nagrywania, animacja podczas przetwarzania i znacznik zakończenia; można go włączyć lub wyłączyć w ustawieniach.

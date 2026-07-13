@@ -8,6 +8,7 @@ Opcjonalne czyszczenie lokalnym LLM przez Ollama jest domyślnie wyłączone.
 from __future__ import annotations
 
 import argparse
+import copy
 import io
 import ctypes
 import difflib
@@ -25,13 +26,18 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 import wave
 from collections import deque
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Optional
 
+import mowik_commands as command_engine
 from mowik_i18n import Translator
+import mowik_windows_actions as windows_actions
 
 
 _CUDA_DLL_DIRECTORY_HANDLES: list[Any] = []
@@ -170,9 +176,20 @@ import pyperclip
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 MUTEX_NAME = r"Local\MowikLocalDictation"
 SAMPLE_RATE = 16_000
+CUSTOM_COMMAND_ACTIONS = {
+    "paste_text",
+    "open",
+    "open_terminal",
+}
+MAX_CUSTOM_COMMANDS = 200
+MAX_CUSTOM_COMMAND_PHRASE_LENGTH = 120
+MAX_CUSTOM_COMMAND_VALUE_LENGTH = 50_000
+MAX_CUSTOM_COMMAND_LINE_LENGTH = 8_000
+MAX_CUSTOM_OPEN_TARGET_LENGTH = command_engine.MAX_OPEN_TARGET_LENGTH
+BLOCKED_CUSTOM_OPEN_SUFFIXES = command_engine.BLOCKED_OPEN_SUFFIXES
 
 APP_ROOT = (
     Path(sys.executable).resolve().parent
@@ -235,6 +252,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "voice_commands": {
         "enabled": False,
+    },
+    "custom_commands": {
+        "schema_version": 1,
+        "enabled": False,
+        "trigger": "keyboard:f7",
+        "items": [],
     },
     "ollama_cleanup": {
         "enabled": False,
@@ -352,6 +375,10 @@ VOICE_COMMAND_REPLACEMENTS = {
 
 class AppError(RuntimeError):
     pass
+
+
+class CustomOpenTargetError(ValueError):
+    """Raised without echoing a potentially sensitive configured target."""
 
 
 def ensure_directories() -> None:
@@ -725,6 +752,222 @@ def normalize_transcript(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     return text
+
+
+def normalize_custom_command_phrase(value: Any) -> str:
+    """Utwórz klucz używany przez wydzielony silnik własnych komend."""
+    return command_engine.normalize_command_phrase(value)
+
+
+def custom_command_definition_to_dict(
+    definition: command_engine.CommandDefinition,
+) -> dict[str, Any]:
+    """Zamień bezpieczny model runtime na format edytowalny przez UI."""
+    item: dict[str, Any] = {
+        "id": definition.id,
+        "phrase": definition.phrase,
+        "match": definition.match_mode,
+        "action": definition.action,
+        "value": definition.value,
+        "confirm": definition.confirm,
+    }
+    options = definition.terminal_options
+    if options is not None:
+        item["options"] = {
+            "cwd_source": options.cwd_source,
+            "host": options.host,
+            "shell": options.shell,
+            "draft_delivery": options.draft_delivery,
+        }
+        if options.fixed_cwd is not None:
+            item["options"]["fixed_cwd"] = options.fixed_cwd
+    return item
+
+
+def configured_custom_commands(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Zwróć poprawne i jednoznaczne komendy z potencjalnie ręcznego JSON-a."""
+    registry = command_engine.CommandRegistry.from_config(config)
+    return [
+        custom_command_definition_to_dict(definition)
+        for definition in registry.definitions
+    ]
+
+
+def partition_custom_command_items(
+    config: dict[str, Any],
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+    list[Any],
+]:
+    """Rozdziel wpisy edytowalne przez UI od wpisów wymagających zachowania.
+
+    Nieobsługiwane rekordy mogą pochodzić z ręcznej edycji albo nowszej wersji
+    programu. Panel ich nie wykonuje i nie pokazuje jako aktywnych, ale nie może
+    ich po cichu usuwać podczas zapisu zupełnie innego ustawienia.
+    """
+    valid_items = configured_custom_commands(config)
+    valid_keys = {
+        normalize_custom_command_phrase(item["phrase"])
+        for item in valid_items
+    }
+    settings = config.get("custom_commands", {})
+    raw_items = settings.get("items", []) if isinstance(settings, dict) else []
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    original_by_key: dict[str, dict[str, Any]] = {}
+    unmanaged: list[Any] = []
+    for raw_item in raw_items:
+        single_config = {
+            "custom_commands": {
+                "items": [raw_item],
+            }
+        }
+        single = configured_custom_commands(single_config)
+        normalized = (
+            normalize_custom_command_phrase(single[0]["phrase"])
+            if single
+            else ""
+        )
+        if (
+            normalized in valid_keys
+            and normalized not in original_by_key
+            and isinstance(raw_item, dict)
+        ):
+            original_copy = copy.deepcopy(raw_item)
+            original_by_key[normalized] = original_copy
+            command_id = single[0].get("id") if single else None
+            if isinstance(command_id, str) and command_id:
+                original_by_key[f"id:{command_id}"] = copy.deepcopy(raw_item)
+        else:
+            unmanaged.append(copy.deepcopy(raw_item))
+    return valid_items, original_by_key, unmanaged
+
+
+def custom_command_lookup(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        normalize_custom_command_phrase(item["phrase"]): item
+        for item in configured_custom_commands(config)
+        if item.get("match", command_engine.MATCH_EXACT)
+        == command_engine.MATCH_EXACT
+    }
+
+
+def match_custom_command(
+    transcript: str,
+    config: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    match = command_engine.CommandRegistry.from_config(config).match(transcript)
+    if match is None:
+        return None
+    item = custom_command_definition_to_dict(match.definition)
+    if match.spoken_tail:
+        item["spoken_tail"] = match.spoken_tail
+    return item
+
+
+def confirm_custom_command_action(
+    action: str,
+    value: str,
+    translator: Optional[Translator] = None,
+) -> bool:
+    """Poproś o zgodę natywnym oknem Windows przed akcją systemową."""
+    translator = translator or Translator("pl")
+    if os.name != "nt":
+        return False
+    action_label = translator.t(
+        "otwarcie programu, pliku lub strony",
+        "opening an app, file, or website",
+    )
+    if action == "paste_text":
+        action_label = translator.t(
+            "wklejenie wielowierszowego tekstu",
+            "inserting multi-line text",
+        )
+    preview = value.strip()
+    message = translator.t(
+        "Mówik rozpoznał komendę proszącą o {action}.\n\n"
+        "Czy na pewno chcesz kontynuować?\n\n{preview}",
+        "Mówik recognized a command requesting {action}.\n\n"
+        "Do you want to continue?\n\n{preview}",
+        action=action_label,
+        preview=preview,
+    )
+    try:
+        # MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 | MB_TOPMOST
+        result = ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+            None,
+            message,
+            translator.t(
+                "Mówik — potwierdź akcję",
+                "Mówik — Confirm action",
+            ),
+            0x00000001 | 0x00000030 | 0x00000100 | 0x00040000,
+        )
+    except Exception:
+        logging.exception("Nie udało się wyświetlić potwierdzenia komendy")
+        return False
+    return result == 1  # IDOK
+
+
+def resolve_custom_command_open_target(value: str) -> str:
+    """Resolve an HTTPS URL or an existing safe local path, never PATH lookup."""
+
+    if not isinstance(value, str):
+        raise CustomOpenTargetError("target_not_string")
+    if value != value.strip():
+        raise CustomOpenTargetError("target_outer_whitespace")
+    target = os.path.expandvars(os.path.expanduser(value))
+    try:
+        target = command_engine.validate_open_target_syntax(
+            target,
+            maximum=MAX_CUSTOM_OPEN_TARGET_LENGTH,
+        )
+    except command_engine.CommandValidationError as exc:
+        raise CustomOpenTargetError("target_invalid") from exc
+
+    parsed = urllib.parse.urlsplit(target)
+    if parsed.scheme.casefold() == "https":
+        return target
+
+    try:
+        candidate = Path(target)
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CustomOpenTargetError("target_missing") from exc
+    if str(resolved).startswith(("\\\\", "//")):
+        raise CustomOpenTargetError("network_path_denied")
+    if not windows_actions.is_local_filesystem_path(resolved):
+        raise CustomOpenTargetError("network_or_unknown_drive_denied")
+    if not (resolved.is_file() or resolved.is_dir()):
+        raise CustomOpenTargetError("target_not_file_or_directory")
+    try:
+        command_engine.validate_open_target_syntax(
+            str(resolved),
+            maximum=MAX_CUSTOM_OPEN_TARGET_LENGTH,
+        )
+    except command_engine.CommandValidationError as exc:
+        raise CustomOpenTargetError("resolved_target_invalid") from exc
+    return str(resolved)
+
+
+def open_custom_command_target(value: str) -> None:
+    if os.name != "nt":
+        raise AppError("Opening custom-command targets is supported on Windows.")
+    try:
+        target = resolve_custom_command_open_target(value)
+    except CustomOpenTargetError as exc:
+        raise AppError("The configured open target is unavailable or unsafe.") from exc
+    os.startfile(target)  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True)
+class SpeechJob:
+    audio: np.ndarray
+    mode: str = "dictation"
+    released_at: Optional[float] = None
+    execution_context: Optional[command_engine.ExecutionContext] = None
 
 
 def apply_voice_commands(text: str, config: dict[str, Any]) -> str:
@@ -1212,12 +1455,21 @@ def windows_type_unicode_text(
             )
 
 
-def paste_text(text: str, config: dict[str, Any]) -> None:
+def paste_text(
+    text: str,
+    config: dict[str, Any],
+    *,
+    append_space_override: Optional[bool] = None,
+) -> None:
     translator = Translator.from_config(config)
     settings = config.get("paste", {})
     paste_enabled = bool(settings.get("enabled", True))
     copy_to_clipboard = bool(settings.get("copy_to_clipboard", True))
-    append_space = bool(settings.get("append_space", True))
+    append_space = (
+        bool(settings.get("append_space", True))
+        if append_space_override is None
+        else bool(append_space_override)
+    )
 
     if not paste_enabled and not copy_to_clipboard:
         raise AppError(
@@ -1449,7 +1701,16 @@ def make_tray_image(state: str = "idle") -> Image.Image:
 
 
 STATUS_INDICATOR_STATES = frozenset(
-    {"hidden", "recording", "processing", "success", "error"}
+    {
+        "hidden",
+        "recording",
+        "processing",
+        "success",
+        "error",
+        "command_recording",
+        "command_processing",
+        "command_success",
+    }
 )
 STATUS_INDICATOR_SIZE = 56
 STATUS_INDICATOR_BOTTOM_MARGIN = 34
@@ -1490,6 +1751,8 @@ def render_status_indicator_frame(
     image = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
     if state == "hidden":
         return image.resize((size, size), Image.Resampling.LANCZOS)
+    command_mode = state.startswith("command_")
+    base_state = state.removeprefix("command_")
 
     draw = ImageDraw.Draw(image)
     center = canvas_size // 2
@@ -1506,16 +1769,23 @@ def render_status_indicator_frame(
     backing_radius = size * 0.39
     draw.ellipse(circle(backing_radius), fill=(15, 23, 42, 246))
 
-    if state == "recording":
+    if base_state == "recording":
         pulse_step = abs((int(frame) % 20) - 10) / 10
         ring_radius = size * (0.235 + 0.035 * pulse_step)
         draw.ellipse(
             circle(ring_radius),
-            outline=(134, 239, 172, 255),
+            outline=(196, 181, 253, 255)
+            if command_mode
+            else (134, 239, 172, 255),
             width=max(scale * 2, 1),
         )
-        draw.ellipse(circle(size * 0.125), fill=(34, 197, 94, 255))
-    elif state == "processing":
+        draw.ellipse(
+            circle(size * 0.125),
+            fill=(124, 58, 237, 255)
+            if command_mode
+            else (34, 197, 94, 255),
+        )
+    elif base_state == "processing":
         spinner_box = circle(size * 0.245)
         draw.ellipse(
             spinner_box,
@@ -1527,11 +1797,18 @@ def render_status_indicator_frame(
             spinner_box,
             start=start,
             end=start + 245,
-            fill=(96, 165, 250, 255),
+            fill=(167, 139, 250, 255)
+            if command_mode
+            else (96, 165, 250, 255),
             width=max(scale * 3, 1),
         )
-    elif state == "success":
-        draw.ellipse(circle(size * 0.285), fill=(22, 163, 74, 255))
+    elif base_state == "success":
+        draw.ellipse(
+            circle(size * 0.285),
+            fill=(109, 40, 217, 255)
+            if command_mode
+            else (22, 163, 74, 255),
+        )
         points = (
             (center - int(size * 0.14 * scale), center),
             (
@@ -1649,14 +1926,14 @@ class FloatingStatusIndicator:
                 return
             self._commands.put((state, active_monitor_work_area()))
 
-    def recording(self) -> None:
-        self.show("recording")
+    def recording(self, command: bool = False) -> None:
+        self.show("command_recording" if command else "recording")
 
-    def processing(self) -> None:
-        self.show("processing")
+    def processing(self, command: bool = False) -> None:
+        self.show("command_processing" if command else "processing")
 
-    def success(self) -> None:
-        self.show("success")
+    def success(self, command: bool = False) -> None:
+        self.show("command_success" if command else "success")
 
     def error(self) -> None:
         self.show("error")
@@ -1870,7 +2147,7 @@ class FloatingStatusIndicator:
                 self._show_no_activate(root, hwnd, x, y, window_size)
                 visible_seconds = (
                     STATUS_INDICATOR_SUCCESS_SECONDS
-                    if state == "success"
+                    if state.endswith("success")
                     else STATUS_INDICATOR_ERROR_SECONDS
                 )
                 root.after(
@@ -1883,7 +2160,13 @@ class FloatingStatusIndicator:
                 if (
                     token != generation
                     or self._failed.is_set()
-                    or current_state not in {"recording", "processing"}
+                    or current_state
+                    not in {
+                        "recording",
+                        "processing",
+                        "command_recording",
+                        "command_processing",
+                    }
                 ):
                     return
                 current_frame += 1
@@ -1902,7 +2185,9 @@ class FloatingStatusIndicator:
                     current_state = "hidden"
                     root.withdraw()
                     return
-                if state in {"success", "error"} and current_state == "processing":
+                terminal_states = {"success", "error", "command_success"}
+                processing_states = {"processing", "command_processing"}
+                if state in terminal_states and current_state in processing_states:
                     elapsed = time.monotonic() - processing_started
                     remaining = STATUS_INDICATOR_MIN_PROCESSING_SECONDS - elapsed
                     if remaining > 0:
@@ -1912,12 +2197,12 @@ class FloatingStatusIndicator:
                         )
                         root.after(50, lambda: animate_if_current(token))
                         return
-                if state in {"success", "error"}:
+                if state in terminal_states:
                     show_terminal(state, work_area, token)
                     return
                 current_state = state
                 current_frame = 0
-                if state == "processing":
+                if state in processing_states:
                     processing_started = time.monotonic()
                 area = work_area or fallback_work_area()
                 x, y = status_indicator_window_position(
@@ -2057,6 +2342,8 @@ def run_settings_window() -> int:
         "success_soft": "#ECFDF5",
         "success_border": "#B7E4CF",
         "warning": "#9A5A00",
+        "warning_soft": "#FFF8E8",
+        "warning_border": "#F3D59A",
         "danger": "#B4232F",
         "white": "#FFFFFF",
     }
@@ -2102,6 +2389,7 @@ def run_settings_window() -> int:
     style.configure("TFrame", background=colors["surface"])
     style.configure("App.TFrame", background=colors["canvas"])
     style.configure("Surface.TFrame", background=colors["surface"])
+    style.configure("Alt.TFrame", background=colors["surface_alt"])
     style.configure("Sidebar.TFrame", background=colors["sidebar"])
     style.configure("TLabel", background=colors["surface"], foreground=colors["text"])
     style.configure(
@@ -2539,6 +2827,40 @@ def run_settings_window() -> int:
     trigger_var = tk.StringVar(
         value=ensure_trigger_display(config.get("trigger", "keyboard:f8"))
     )
+    custom_commands_config = config.get("custom_commands", {})
+    if not isinstance(custom_commands_config, dict):
+        custom_commands_config = {}
+    custom_commands_enabled_var = tk.BooleanVar(
+        value=bool(custom_commands_config.get("enabled", False))
+    )
+    custom_commands_trigger_var = tk.StringVar(
+        value=ensure_trigger_display(
+            custom_commands_config.get("trigger", "keyboard:f7")
+        )
+    )
+    (
+        custom_command_items,
+        original_custom_command_items_by_key,
+        unmanaged_custom_command_items,
+    ) = partition_custom_command_items(config)
+    preserve_original_custom_commands_enabled = bool(
+        custom_commands_config.get("enabled", False)
+        and not custom_command_items
+        and unmanaged_custom_command_items
+    )
+    custom_commands_enabled_touched = {"value": False}
+    if not custom_command_items:
+        custom_commands_enabled_var.set(False)
+    custom_commands_revision_var = tk.StringVar(
+        value=json.dumps(
+            {
+                "items": custom_command_items,
+                "unmanaged": unmanaged_custom_command_items,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
     model_var = tk.StringVar(
         value=display_for_value(model_values, config.get("model", "auto"))
     )
@@ -2634,6 +2956,7 @@ def run_settings_window() -> int:
     )
     status_level = {"value": "success"}
     shortcut_summary_var = tk.StringVar()
+    custom_command_summary_var = tk.StringVar()
     quality_profile_var = tk.StringVar()
     profile_labels = {
         "light": t("Szybki", "Fast"),
@@ -2660,6 +2983,52 @@ def run_settings_window() -> int:
 
     trigger_var.trace_add("write", refresh_shortcut_summary)
     refresh_shortcut_summary()
+
+    def localized_command_count(count: int) -> str:
+        count = max(0, int(count))
+        if translator.language != "pl":
+            noun = "command" if count == 1 else "commands"
+            return f"{count} {noun}"
+        if count == 1:
+            noun = "komenda"
+        elif count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+            noun = "komendy"
+        else:
+            noun = "komend"
+        return f"{count} {noun}"
+
+    def refresh_custom_command_summary(*args) -> None:
+        if not custom_commands_enabled_var.get() or not custom_command_items:
+            custom_command_summary_var.set(t("Wyłączone", "Disabled"))
+            return
+        trigger = str(
+            trigger_values.get(
+                custom_commands_trigger_var.get(),
+                custom_commands_config.get("trigger", "keyboard:f7"),
+            )
+        )
+        try:
+            trigger_label = localized_trigger_display_name(trigger, compact=True)
+        except AppError:
+            trigger_label = custom_commands_trigger_var.get()
+        custom_command_summary_var.set(
+            t(
+                "{trigger} · {count}",
+                "{trigger} · {count}",
+                trigger=trigger_label,
+                count=localized_command_count(len(custom_command_items)),
+            )
+        )
+
+    for command_summary_variable in (
+        custom_commands_enabled_var,
+        custom_commands_trigger_var,
+        custom_commands_revision_var,
+    ):
+        command_summary_variable.trace_add(
+            "write", refresh_custom_command_summary
+        )
+    refresh_custom_command_summary()
 
     def selected_profile_key() -> Optional[str]:
         selected_model = str(model_values.get(model_var.get(), model_var.get()))
@@ -2839,6 +3208,9 @@ def run_settings_window() -> int:
     general_page, general_tab, general_canvas = create_scrollable_page(page_host)
     audio_page, audio_tab, audio_canvas = create_scrollable_page(page_host)
     text_page, text_tab, text_canvas = create_scrollable_page(page_host)
+    commands_page, commands_tab, commands_canvas = create_scrollable_page(
+        page_host
+    )
     sounds_page, sounds_tab, sounds_canvas = create_scrollable_page(page_host)
     ollama_page, ollama_tab, ollama_canvas = create_scrollable_page(page_host)
     files_page, files_tab, files_canvas = create_scrollable_page(page_host)
@@ -2848,6 +3220,7 @@ def run_settings_window() -> int:
         "dictation": general_page,
         "audio": audio_page,
         "text": text_page,
+        "commands": commands_page,
         "sounds": sounds_page,
         "integrations": ollama_page,
         "help": files_page,
@@ -2857,6 +3230,7 @@ def run_settings_window() -> int:
         "dictation": general_canvas,
         "audio": audio_canvas,
         "text": text_canvas,
+        "commands": commands_canvas,
         "sounds": sounds_canvas,
         "integrations": ollama_canvas,
         "help": files_canvas,
@@ -2866,6 +3240,7 @@ def run_settings_window() -> int:
         "dictation": general_tab,
         "audio": audio_tab,
         "text": text_tab,
+        "commands": commands_tab,
         "sounds": sounds_tab,
         "integrations": ollama_tab,
         "help": files_tab,
@@ -2897,6 +3272,13 @@ def run_settings_window() -> int:
             t(
                 "Zdecyduj, gdzie trafia transkrypcja i podpowiedz Mówikowi własne nazwy.",
                 "Choose where transcripts go and teach Mówik your preferred names.",
+            ),
+        ),
+        "commands": (
+            t("Własne komendy", "Custom commands"),
+            t(
+                "Powiedz krótką frazę, aby wkleić tekst albo uruchomić wybraną akcję.",
+                "Say a short phrase to insert text or run a chosen action.",
             ),
         ),
         "sounds": (
@@ -3023,6 +3405,7 @@ def run_settings_window() -> int:
                 ("dictation", t("Dyktowanie", "Dictation")),
                 ("audio", t("Mikrofon i mowa", "Microphone and speech")),
                 ("text", t("Tekst i słownik", "Text and dictionary")),
+                ("commands", t("Własne komendy", "Custom commands")),
                 ("sounds", t("Dźwięki", "Sounds")),
             ),
         ),
@@ -3153,7 +3536,7 @@ def run_settings_window() -> int:
 
     overview = ttk.Frame(start_tab, style="Surface.TFrame")
     overview.grid(row=1, column=0, sticky="ew", pady=(0, px(16)))
-    for column in range(3):
+    for column in range(4):
         overview.columnconfigure(column, weight=1, uniform="overview")
 
     def add_overview_card(
@@ -3173,7 +3556,7 @@ def run_settings_window() -> int:
             sticky="nsew",
             padx=(
                 0 if column == 0 else px(6),
-                0 if column == 2 else px(6),
+                0 if column == 3 else px(6),
             ),
         )
         tk.Label(
@@ -3214,13 +3597,20 @@ def run_settings_window() -> int:
     add_overview_card(
         overview,
         1,
+        t("KOMENDY", "COMMANDS"),
+        custom_command_summary_var,
+        t("Osobny tryb akcji głosowych", "Separate voice-action mode"),
+    )
+    add_overview_card(
+        overview,
+        2,
         t("MIKROFON", "MICROPHONE"),
         microphone_var,
         t("Aktywne źródło dźwięku", "Active audio source"),
     )
     add_overview_card(
         overview,
-        2,
+        3,
         t("PROFIL JAKOŚCI", "QUALITY PROFILE"),
         quality_profile_var,
         t("Balans szybkości i jakości", "Speed and accuracy balance"),
@@ -3288,6 +3678,7 @@ def run_settings_window() -> int:
         general_tab,
         audio_tab,
         text_tab,
+        commands_tab,
         sounds_tab,
         ollama_tab,
         files_tab,
@@ -3546,7 +3937,14 @@ def run_settings_window() -> int:
     )
     trigger_combo.grid(row=0, column=0, sticky="ew")
 
-    def capture_trigger() -> None:
+    def capture_trigger(
+        target_var: Optional[tk.StringVar] = None,
+        target_combo: Optional[Any] = None,
+    ) -> None:
+        if target_var is None:
+            target_var = trigger_var
+        if target_combo is None:
+            target_combo = trigger_combo
         dialog = tk.Toplevel(root)
         dialog.title(
             t(
@@ -3632,8 +4030,8 @@ def run_settings_window() -> int:
             stop_capture_listeners()
             trigger = f"{trigger_type}:{name}".lower()
             label = ensure_trigger_display(trigger)
-            trigger_combo["values"] = list(trigger_values.keys())
-            trigger_var.set(label)
+            target_combo["values"] = list(trigger_values.keys())
+            target_var.set(label)
             note = t(
                 "Ustawiono {trigger}.",
                 "Set to {trigger}.",
@@ -4206,9 +4604,10 @@ def run_settings_window() -> int:
         variable=dictionary_enabled_var,
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=px(4))
 
-    def open_path(path: Path) -> None:
+    def open_path(path: Path) -> bool:
         try:
             os.startfile(path)  # type: ignore[attr-defined]
+            return True
         except Exception as exc:
             messagebox.showerror(
                 APP_DISPLAY_NAME,
@@ -4220,6 +4619,7 @@ def run_settings_window() -> int:
                 ),
                 parent=root,
             )
+            return False
 
     dictionary_edit_button = ttk.Button(
         dictionary_frame,
@@ -4291,6 +4691,1057 @@ def run_settings_window() -> int:
 
     dictionary_enabled_var.trace_add("write", sync_dictionary_controls)
     sync_dictionary_controls()
+
+    commands_activation = ttk.LabelFrame(
+        commands_tab,
+        text=t("Tryb komend", "Command mode"),
+        padding=px(16),
+    )
+    commands_activation.grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
+    commands_activation.columnconfigure(1, weight=1)
+    ttk.Checkbutton(
+        commands_activation,
+        text=t(
+            "Włącz własne komendy głosowe",
+            "Enable custom voice commands",
+        ),
+        variable=custom_commands_enabled_var,
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, px(10)))
+
+    custom_trigger_row = ttk.Frame(commands_activation)
+    custom_trigger_row.columnconfigure(0, weight=1)
+    custom_trigger_combo = ttk.Combobox(
+        custom_trigger_row,
+        textvariable=custom_commands_trigger_var,
+        values=list(trigger_values.keys()),
+        state="readonly",
+    )
+    custom_trigger_combo.grid(row=0, column=0, sticky="ew")
+    custom_trigger_detect_button = ttk.Button(
+        custom_trigger_row,
+        text=t("Wykryj…", "Detect…"),
+        command=lambda: capture_trigger(
+            custom_commands_trigger_var,
+            custom_trigger_combo,
+        ),
+    )
+    custom_trigger_detect_button.grid(row=0, column=1, padx=(px(8), 0))
+    add_field(
+        commands_activation,
+        1,
+        t("Przycisk komend", "Command shortcut"),
+        custom_trigger_row,
+        t(
+            "Domyślnie F7. Musi być inny niż przycisk zwykłego dyktowania.",
+            "F7 by default. It must differ from the regular dictation shortcut.",
+        ),
+    )
+    ttk.Label(
+        commands_activation,
+        text=t(
+            "Przytrzymaj skrót, wypowiedz tylko pełną frazę komendy i puść. "
+            "Jeśli Mówik nie znajdzie dokładnego dopasowania, nie wykona żadnej akcji.",
+            "Hold the shortcut, say only the full command phrase, and release it. "
+            "If Mówik finds no exact match, it performs no action.",
+        ),
+        style="Muted.TLabel",
+        wraplength=px(760),
+    ).grid(
+        row=2,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(px(10), 0),
+    )
+
+    commands_frame = ttk.LabelFrame(
+        commands_tab,
+        text=t("Twoje komendy", "Your commands"),
+        padding=px(16),
+    )
+    commands_frame.grid(
+        row=1,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, px(14)),
+    )
+    commands_frame.columnconfigure(0, weight=1)
+    commands_toolbar = ttk.Frame(commands_frame)
+    commands_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, px(12)))
+    commands_toolbar.columnconfigure(0, weight=1)
+    custom_command_count_var = tk.StringVar()
+    ttk.Label(
+        commands_toolbar,
+        textvariable=custom_command_count_var,
+        style="Muted.TLabel",
+    ).grid(row=0, column=0, sticky="w")
+
+    action_labels = {
+        "paste_text": t("Wklej tekst", "Insert text"),
+        "open": t(
+            "Otwórz program, plik lub stronę",
+            "Open an app, file, or website",
+        ),
+        "open_terminal": t(
+            "Otwórz terminal",
+            "Open terminal",
+        ),
+    }
+    action_values = {label: action for action, label in action_labels.items()}
+    command_cards = ttk.Frame(commands_frame)
+    command_cards.grid(row=1, column=0, sticky="ew")
+    command_cards.columnconfigure(0, weight=1)
+
+    def update_custom_commands_revision() -> None:
+        custom_commands_revision_var.set(
+            json.dumps(
+                {
+                    "items": custom_command_items,
+                    "unmanaged": unmanaged_custom_command_items,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+
+    def custom_command_items_for_save() -> list[Any]:
+        result: list[Any] = []
+        for item in custom_command_items:
+            normalized = normalize_custom_command_phrase(item["phrase"])
+            command_id = item.get("id")
+            original = (
+                original_custom_command_items_by_key.get(f"id:{command_id}")
+                if isinstance(command_id, str) and command_id
+                else None
+            )
+            if original is None:
+                original = original_custom_command_items_by_key.get(normalized)
+            merged = copy.deepcopy(original) if original is not None else {}
+            # Migracja dawnego pola `text` bez pozostawiania dwóch źródeł
+            # oraz usunięcie znanych pól poprzedniego typu akcji.
+            merged.pop("text", None)
+            if item.get("action") != "open_terminal":
+                merged.pop("options", None)
+            merged.update(item)
+            result.append(merged)
+        result.extend(copy.deepcopy(unmanaged_custom_command_items))
+        return result
+
+    def unmanaged_custom_command_phrase_keys() -> set[str]:
+        keys: set[str] = set()
+        for raw_item in unmanaged_custom_command_items:
+            if not isinstance(raw_item, dict):
+                continue
+            phrase = raw_item.get("phrase")
+            if not isinstance(phrase, str) or "\x00" in phrase:
+                continue
+            normalized = normalize_custom_command_phrase(phrase)
+            if normalized:
+                keys.add(normalized)
+        return keys
+
+    def open_custom_command_editor(index: Optional[int] = None) -> None:
+        editing = index is not None
+        existing = (
+            custom_command_items[index]
+            if index is not None
+            else {
+                "id": f"cc_{uuid.uuid4().hex}",
+                "phrase": "",
+                "match": "exact",
+                "action": "paste_text",
+                "value": "",
+                "confirm": False,
+            }
+        )
+        dialog = tk.Toplevel(root)
+        dialog.title(
+            t(
+                "{app} — edytuj komendę" if editing else "{app} — nowa komenda",
+                "{app} — Edit command" if editing else "{app} — New command",
+                app=APP_DISPLAY_NAME,
+            )
+        )
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.resizable(True, True)
+        dialog.minsize(px(600), px(540))
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        editor = ttk.Frame(dialog, padding=px(22))
+        editor.grid(row=0, column=0, sticky="nsew")
+        editor.columnconfigure(0, weight=1)
+        editor.rowconfigure(7, weight=1)
+        ttk.Label(
+            editor,
+            text=t(
+                "Edytuj własną komendę" if editing else "Dodaj własną komendę",
+                "Edit custom command" if editing else "Add a custom command",
+            ),
+            font=(display_font_family, 15, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            editor,
+            text=t(
+                "Komenda zadziała tylko po przytrzymaniu osobnego skrótu.",
+                "The command works only while holding the separate shortcut.",
+            ),
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(px(4), px(16)))
+
+        ttk.Label(
+            editor,
+            text=t("Wypowiadana fraza", "Spoken phrase"),
+            font=(ui_font_family, 10, "bold"),
+        ).grid(row=2, column=0, sticky="w")
+        phrase_var = tk.StringVar(value=str(existing.get("phrase", "")))
+        phrase_entry = ttk.Entry(editor, textvariable=phrase_var)
+        phrase_entry.grid(row=3, column=0, sticky="ew", pady=(px(6), px(14)))
+
+        ttk.Label(
+            editor,
+            text=t("Co ma zrobić Mówik", "What Mówik should do"),
+            font=(ui_font_family, 10, "bold"),
+        ).grid(row=4, column=0, sticky="w")
+        selected_action = str(existing.get("action", "paste_text"))
+        action_var = tk.StringVar(
+            value=action_labels.get(selected_action, action_labels["paste_text"])
+        )
+        action_combo = ttk.Combobox(
+            editor,
+            textvariable=action_var,
+            values=list(action_values.keys()),
+            state="readonly",
+        )
+        action_combo.grid(row=5, column=0, sticky="ew", pady=(px(6), px(14)))
+
+        existing_options = existing.get("options", {})
+        if not isinstance(existing_options, dict):
+            existing_options = {}
+        cwd_source_labels = {
+            "active_explorer": t(
+                "Folder aktywnego Eksploratora",
+                "Active File Explorer folder",
+            ),
+            "fixed": t("Wybrany folder", "Selected folder"),
+            "home": t("Folder domowy", "Home folder"),
+        }
+        terminal_host_labels = {
+            "auto": t("Automatycznie", "Automatic"),
+            "windows_terminal": "Windows Terminal",
+            "classic": t("Klasyczna konsola", "Classic console"),
+        }
+        terminal_shell_labels = {
+            "default": t("Domyślna powłoka", "Default shell"),
+            "powershell": "PowerShell",
+            "cmd": "Command Prompt",
+        }
+        cwd_source_values = {
+            label: value for value, label in cwd_source_labels.items()
+        }
+        terminal_host_values = {
+            label: value for value, label in terminal_host_labels.items()
+        }
+        terminal_shell_values = {
+            label: value for value, label in terminal_shell_labels.items()
+        }
+        cwd_source_var = tk.StringVar(
+            value=cwd_source_labels.get(
+                str(existing_options.get("cwd_source", "active_explorer")),
+                cwd_source_labels["active_explorer"],
+            )
+        )
+        terminal_host_var = tk.StringVar(
+            value=terminal_host_labels.get(
+                str(existing_options.get("host", "auto")),
+                terminal_host_labels["auto"],
+            )
+        )
+        terminal_shell_var = tk.StringVar(
+            value=terminal_shell_labels.get(
+                str(existing_options.get("shell", "default")),
+                terminal_shell_labels["default"],
+            )
+        )
+        terminal_fixed_cwd_var = tk.StringVar(
+            value=str(existing_options.get("fixed_cwd", ""))
+        )
+        terminal_spoken_tail_var = tk.BooleanVar(
+            value=str(existing.get("match", "exact")) == "prefix_tail"
+        )
+
+        terminal_section = ttk.LabelFrame(
+            editor,
+            text=t("Ustawienia terminala", "Terminal settings"),
+            padding=px(12),
+        )
+        terminal_section.grid(row=6, column=0, sticky="ew", pady=(0, px(14)))
+        for terminal_column in range(3):
+            terminal_section.columnconfigure(terminal_column, weight=1)
+
+        for column, (label, variable, values) in enumerate(
+            (
+                (
+                    t("Folder startowy", "Starting folder"),
+                    cwd_source_var,
+                    tuple(cwd_source_values),
+                ),
+                (
+                    t("Aplikacja terminala", "Terminal app"),
+                    terminal_host_var,
+                    tuple(terminal_host_values),
+                ),
+                (
+                    t("Powłoka", "Shell"),
+                    terminal_shell_var,
+                    tuple(terminal_shell_values),
+                ),
+            )
+        ):
+            ttk.Label(
+                terminal_section,
+                text=label,
+                font=(ui_font_family, 9, "bold"),
+            ).grid(row=0, column=column, sticky="w", padx=(0, px(8)))
+            ttk.Combobox(
+                terminal_section,
+                textvariable=variable,
+                values=values,
+                state="readonly",
+            ).grid(row=1, column=column, sticky="ew", padx=(0, px(8)))
+
+        fixed_folder_row = ttk.Frame(terminal_section)
+        fixed_folder_row.grid(
+            row=2,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(px(10), 0),
+        )
+        fixed_folder_row.columnconfigure(0, weight=1)
+        terminal_fixed_cwd_entry = ttk.Entry(
+            fixed_folder_row,
+            textvariable=terminal_fixed_cwd_var,
+        )
+        terminal_fixed_cwd_entry.grid(row=0, column=0, sticky="ew")
+
+        def browse_terminal_folder() -> None:
+            selected = filedialog.askdirectory(
+                parent=dialog,
+                title=t(
+                    "Wybierz folder startowy terminala",
+                    "Choose the terminal starting folder",
+                ),
+                initialdir=(
+                    terminal_fixed_cwd_var.get().strip() or str(Path.home())
+                ),
+            )
+            if selected:
+                terminal_fixed_cwd_var.set(selected)
+
+        terminal_fixed_cwd_button = ttk.Button(
+            fixed_folder_row,
+            text=t("Wybierz…", "Browse…"),
+            command=browse_terminal_folder,
+        )
+        terminal_fixed_cwd_button.grid(
+            row=0,
+            column=1,
+            padx=(px(8), 0),
+        )
+
+        terminal_spoken_tail_check = ttk.Checkbutton(
+            terminal_section,
+            text=t(
+                "Resztę wypowiedzi przygotuj jako szkic polecenia",
+                "Use the rest of the utterance as a command draft",
+            ),
+            variable=terminal_spoken_tail_var,
+        )
+        terminal_spoken_tail_check.grid(
+            row=3,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=(px(10), 0),
+        )
+        ttk.Label(
+            terminal_section,
+            text=t(
+                "Szkic zostanie skopiowany do schowka. Wklejasz go sam przez Ctrl+V "
+                "i sam naciskasz Enter — Mówik nigdy nie uruchamia polecenia.",
+                "The draft is copied to the clipboard. You paste it with Ctrl+V "
+                "and press Enter yourself — Mówik never runs the command.",
+            ),
+            style="Muted.TLabel",
+            wraplength=px(680),
+        ).grid(
+            row=4,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(px(7), 0),
+        )
+
+        value_section = ttk.Frame(editor)
+        value_section.grid(row=7, column=0, sticky="nsew")
+        value_section.columnconfigure(0, weight=1)
+        value_section.rowconfigure(2, weight=1)
+        value_label_var = tk.StringVar()
+        value_hint_var = tk.StringVar()
+        ttk.Label(
+            value_section,
+            textvariable=value_label_var,
+            font=(ui_font_family, 10, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            value_section,
+            textvariable=value_hint_var,
+            style="Muted.TLabel",
+            wraplength=px(700),
+        ).grid(row=1, column=0, sticky="ew", pady=(px(4), px(6)))
+        value_text = tk.Text(
+            value_section,
+            height=8,
+            wrap="word",
+            undo=True,
+            font=(ui_font_family, 10),
+            background=colors["surface"],
+            foreground=colors["text"],
+            insertbackground=colors["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=colors["control_border"],
+            highlightcolor=colors["primary"],
+            padx=px(10),
+            pady=px(9),
+        )
+        value_text.grid(row=2, column=0, sticky="nsew")
+        value_text.insert("1.0", str(existing.get("value", "")))
+
+        confirm_var = tk.BooleanVar(value=bool(existing.get("confirm", False)))
+        confirm_check = ttk.Checkbutton(
+            editor,
+            text=t(
+                "Pytaj o potwierdzenie przed wykonaniem akcji",
+                "Ask for confirmation before running the action",
+            ),
+            variable=confirm_var,
+        )
+        confirm_check.grid(row=8, column=0, sticky="w", pady=(px(12), 0))
+        editor_error_var = tk.StringVar()
+        tk.Label(
+            editor,
+            textvariable=editor_error_var,
+            background=colors["surface"],
+            foreground=colors["danger"],
+            font=(ui_font_family, 9, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=px(700),
+        ).grid(row=9, column=0, sticky="ew", pady=(px(8), 0))
+
+        action_state = {"last": selected_action}
+
+        def refresh_terminal_controls(*args) -> None:
+            source = cwd_source_values.get(
+                cwd_source_var.get(),
+                "active_explorer",
+            )
+            fixed_state = "normal" if source == "fixed" else "disabled"
+            terminal_fixed_cwd_entry.configure(state=fixed_state)
+            terminal_fixed_cwd_button.configure(state=fixed_state)
+
+        def refresh_action_fields(*args) -> None:
+            action = action_values.get(action_var.get(), "paste_text")
+            if action == "open_terminal":
+                value_section.grid_remove()
+                confirm_check.grid_remove()
+                terminal_section.grid()
+                confirm_var.set(False)
+                refresh_terminal_controls()
+                action_state["last"] = action
+                return
+
+            terminal_section.grid_remove()
+            value_section.grid()
+            confirm_check.grid()
+            if action == "paste_text":
+                value_label_var.set(t("Tekst do wklejenia", "Text to insert"))
+                value_hint_var.set(
+                    t(
+                        "Tekst zostanie wklejony dokładnie. Wielowierszowy tekst "
+                        "zawsze wymaga potwierdzenia.",
+                        "Text is inserted exactly. Multi-line text always "
+                        "requires confirmation.",
+                    )
+                )
+                confirm_var.set(False)
+                confirm_check.configure(state="disabled")
+            elif action == "open":
+                value_label_var.set(
+                    t("Program, ścieżka lub adres URL", "App, path, or URL")
+                )
+                value_hint_var.set(
+                    t(
+                        "Wybierz istniejącą lokalną ścieżkę bezwzględną albo adres HTTPS. "
+                        "Skrypty, skróty i ścieżki sieciowe są blokowane.",
+                        "Choose an existing absolute local path or an HTTPS URL. "
+                        "Scripts, shortcuts, and network paths are blocked.",
+                    )
+                )
+                confirm_var.set(True)
+                confirm_check.configure(state="disabled")
+            action_state["last"] = action
+
+        action_var.trace_add("write", refresh_action_fields)
+        cwd_source_var.trace_add("write", refresh_terminal_controls)
+        terminal_spoken_tail_var.trace_add("write", refresh_terminal_controls)
+        refresh_action_fields()
+
+        buttons = ttk.Frame(editor)
+        buttons.grid(row=10, column=0, sticky="e", pady=(px(18), 0))
+
+        def close_editor() -> None:
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        def save_command() -> None:
+            phrase = phrase_var.get().strip()
+            value = value_text.get("1.0", "end-1c")
+            action = action_values.get(action_var.get(), "paste_text")
+            if not normalize_custom_command_phrase(phrase):
+                editor_error_var.set(
+                    t(
+                        "Wpisz frazę zawierającą litery, cyfry lub symbole.",
+                        "Enter a phrase containing letters, numbers, or symbols.",
+                    )
+                )
+                phrase_entry.focus_set()
+                return
+            if "\x00" in phrase or len(phrase) > MAX_CUSTOM_COMMAND_PHRASE_LENGTH:
+                editor_error_var.set(
+                    t(
+                        "Fraza może mieć maksymalnie {limit} znaków.",
+                        "The phrase can contain at most {limit} characters.",
+                        limit=MAX_CUSTOM_COMMAND_PHRASE_LENGTH,
+                    )
+                )
+                phrase_entry.focus_set()
+                return
+            normalized_phrase = normalize_custom_command_phrase(phrase)
+            for other_index, other in enumerate(custom_command_items):
+                if other_index == index:
+                    continue
+                if normalize_custom_command_phrase(other["phrase"]) == normalized_phrase:
+                    editor_error_var.set(
+                        t(
+                            "Istnieje już komenda z taką samą frazą.",
+                            "A command with the same phrase already exists.",
+                        )
+                    )
+                    phrase_entry.focus_set()
+                    return
+            if normalized_phrase in unmanaged_custom_command_phrase_keys():
+                editor_error_var.set(
+                    t(
+                        "Ta fraza występuje w ukrytym, nieprawidłowym wpisie config.json. "
+                        "Najpierw popraw lub usuń ten wpis ręcznie.",
+                        "This phrase appears in a hidden invalid config.json entry. "
+                        "Correct or remove that entry first.",
+                    )
+                )
+                phrase_entry.focus_set()
+                return
+            match_mode = "exact"
+            options: Optional[dict[str, Any]] = None
+            if action == "open_terminal":
+                value = ""
+                match_mode = (
+                    "prefix_tail"
+                    if terminal_spoken_tail_var.get()
+                    else "exact"
+                )
+                cwd_source = cwd_source_values.get(
+                    cwd_source_var.get(),
+                    "active_explorer",
+                )
+                fixed_cwd: Optional[str] = None
+                if cwd_source == "fixed":
+                    raw_fixed_cwd = terminal_fixed_cwd_var.get().strip()
+                    if not raw_fixed_cwd:
+                        editor_error_var.set(
+                            t(
+                                "Wybierz istniejący folder startowy terminala.",
+                                "Choose an existing terminal starting folder.",
+                            )
+                        )
+                        terminal_fixed_cwd_entry.focus_set()
+                        return
+                    candidate = Path(
+                        os.path.expandvars(raw_fixed_cwd)
+                    ).expanduser()
+                    if (
+                        not candidate.is_absolute()
+                        or str(candidate).startswith(("\\\\", "//"))
+                        or not candidate.is_dir()
+                    ):
+                        editor_error_var.set(
+                            t(
+                                "Folder startowy musi być istniejącym lokalnym katalogiem.",
+                                "The starting folder must be an existing local directory.",
+                            )
+                        )
+                        terminal_fixed_cwd_entry.focus_set()
+                        return
+                    fixed_cwd = str(candidate.resolve())
+                options = {
+                    "cwd_source": cwd_source,
+                    "host": terminal_host_values.get(
+                        terminal_host_var.get(),
+                        "auto",
+                    ),
+                    "shell": terminal_shell_values.get(
+                        terminal_shell_var.get(),
+                        "default",
+                    ),
+                    "draft_delivery": "clipboard",
+                }
+                if fixed_cwd is not None:
+                    options["fixed_cwd"] = fixed_cwd
+            else:
+                if not value.strip():
+                    editor_error_var.set(
+                        t(
+                            "Wpisz tekst, ścieżkę albo adres do otwarcia.",
+                            "Enter text, a path, or an address to open.",
+                        )
+                    )
+                    value_text.focus_set()
+                    return
+                if "\x00" in value or len(value) > MAX_CUSTOM_COMMAND_VALUE_LENGTH:
+                    editor_error_var.set(
+                        t(
+                            "Zawartość może mieć maksymalnie {limit} znaków.",
+                            "The content can contain at most {limit} characters.",
+                            limit=MAX_CUSTOM_COMMAND_VALUE_LENGTH,
+                        )
+                    )
+                    value_text.focus_set()
+                    return
+                if action == "open" and any(mark in value for mark in "\r\n"):
+                    editor_error_var.set(
+                        t(
+                            "Program, ścieżka lub adres URL muszą mieścić się w jednym wierszu.",
+                            "The app, path, or URL must fit on one line.",
+                        )
+                    )
+                    value_text.focus_set()
+                    return
+                if action == "open":
+                    try:
+                        value = resolve_custom_command_open_target(value)
+                    except CustomOpenTargetError:
+                        editor_error_var.set(
+                            t(
+                                "Wybierz istniejący lokalny plik lub folder albo poprawny "
+                                "adres HTTPS. Skrypty, skróty i ścieżki sieciowe są niedozwolone.",
+                                "Choose an existing local file or folder, or a valid HTTPS "
+                                "URL. Scripts, shortcuts, and network paths are not allowed.",
+                            )
+                        )
+                        value_text.focus_set()
+                        return
+            command: dict[str, Any] = {
+                "id": str(existing.get("id") or f"cc_{uuid.uuid4().hex}"),
+                "phrase": phrase,
+                "match": match_mode,
+                "action": action,
+                "value": value,
+                "confirm": action == "open",
+            }
+            if options is not None:
+                command["options"] = options
+            if not command_engine.CommandRegistry.from_items(
+                [command]
+            ).definitions:
+                editor_error_var.set(
+                    t(
+                        "Ta konfiguracja komendy nie jest bezpieczna lub kompletna.",
+                        "This command configuration is unsafe or incomplete.",
+                    )
+                )
+                return
+            if index is None:
+                if len(custom_command_items) >= MAX_CUSTOM_COMMANDS:
+                    editor_error_var.set(
+                        t(
+                            "Osiągnięto limit {limit} komend.",
+                            "The limit of {limit} commands has been reached.",
+                            limit=MAX_CUSTOM_COMMANDS,
+                        )
+                    )
+                    return
+                was_empty = not custom_command_items
+                custom_command_items.append(command)
+                if was_empty:
+                    custom_commands_enabled_var.set(True)
+            else:
+                custom_command_items[index] = command
+            update_custom_commands_revision()
+            render_custom_command_cards()
+            close_editor()
+
+        ttk.Button(
+            buttons,
+            text=t("Anuluj", "Cancel"),
+            command=close_editor,
+        ).grid(row=0, column=0, padx=(0, px(8)))
+        ttk.Button(
+            buttons,
+            text=t(
+                "Zapisz zmiany" if editing else "Dodaj komendę",
+                "Save changes" if editing else "Add command",
+            ),
+            style="Accent.TButton",
+            command=save_command,
+        ).grid(row=0, column=1)
+        dialog.protocol("WM_DELETE_WINDOW", close_editor)
+        dialog.bind("<Escape>", lambda event: close_editor())
+        dialog.update_idletasks()
+        width = min(px(760), max(px(600), root.winfo_width() - px(80)))
+        height = min(px(760), max(px(580), root.winfo_height() - px(70)))
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - width) // 2)
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        phrase_entry.focus_set()
+
+    def remove_custom_command(index: int) -> None:
+        if not messagebox.askyesno(
+            t(
+                "{app} — usuń komendę",
+                "{app} — Delete command",
+                app=APP_DISPLAY_NAME,
+            ),
+            t(
+                "Usunąć wybraną komendę?",
+                "Delete the selected command?",
+            ),
+            parent=root,
+        ):
+            return
+        del custom_command_items[index]
+        if not custom_command_items:
+            custom_commands_enabled_var.set(False)
+        update_custom_commands_revision()
+        render_custom_command_cards()
+
+    def render_custom_command_cards() -> None:
+        for child in command_cards.winfo_children():
+            child.destroy()
+        count = len(custom_command_items)
+        custom_command_count_var.set(
+            t(
+                "Zapisano: {count}",
+                "Saved: {count}",
+                count=localized_command_count(count),
+            )
+        )
+        if not custom_command_items:
+            empty = tk.Frame(
+                command_cards,
+                background=colors["surface_alt"],
+                highlightbackground=colors["border"],
+                highlightthickness=1,
+                padx=px(18),
+                pady=px(20),
+            )
+            empty.grid(row=0, column=0, sticky="ew")
+            tk.Label(
+                empty,
+                text=t(
+                    "Nie masz jeszcze własnych komend.",
+                    "You do not have any custom commands yet.",
+                ),
+                background=colors["surface_alt"],
+                foreground=colors["text"],
+                font=(ui_font_family, 11, "bold"),
+            ).grid(row=0, column=0, sticky="w")
+            tk.Label(
+                empty,
+                text=t(
+                    "Dodaj pierwszą frazę i wybierz, co Mówik ma zrobić.",
+                    "Add your first phrase and choose what Mówik should do.",
+                ),
+                background=colors["surface_alt"],
+                foreground=colors["muted"],
+                font=(ui_font_family, 9),
+            ).grid(row=1, column=0, sticky="w", pady=(px(5), 0))
+            return
+
+        for item_index, item in enumerate(custom_command_items):
+            card = tk.Frame(
+                command_cards,
+                background=colors["surface_alt"],
+                highlightbackground=colors["border"],
+                highlightthickness=1,
+                padx=px(14),
+                pady=px(12),
+            )
+            card.grid(
+                row=item_index,
+                column=0,
+                sticky="ew",
+                pady=(0, px(8)),
+            )
+            card.columnconfigure(0, weight=1)
+            tk.Label(
+                card,
+                text=f'“{item["phrase"]}”',
+                background=colors["surface_alt"],
+                foreground=colors["text"],
+                font=(ui_font_family, 10, "bold"),
+                anchor="w",
+                justify="left",
+                wraplength=px(560),
+            ).grid(row=0, column=0, sticky="ew")
+            badges = tk.Frame(card, background=colors["surface_alt"])
+            badges.grid(row=0, column=1, sticky="e", padx=(px(12), 0))
+            tk.Label(
+                badges,
+                text=action_labels.get(item["action"], item["action"]),
+                background=colors["primary_soft"],
+                foreground=colors["primary"],
+                font=(ui_font_family, 8, "bold"),
+                padx=px(8),
+                pady=px(3),
+            ).pack(side="left")
+            if item["action"] == "open_terminal":
+                item_options = item.get("options", {})
+                if not isinstance(item_options, dict):
+                    item_options = {}
+                source_code = str(
+                    item_options.get("cwd_source", "active_explorer")
+                )
+                source_preview = {
+                    "active_explorer": t(
+                        "aktywny Eksplorator",
+                        "active File Explorer",
+                    ),
+                    "fixed": str(item_options.get("fixed_cwd", "")),
+                    "home": t("folder domowy", "home folder"),
+                }.get(source_code, source_code)
+                shell_preview = {
+                    "default": t("domyślna powłoka", "default shell"),
+                    "powershell": "PowerShell",
+                    "cmd": "Command Prompt",
+                }.get(
+                    str(item_options.get("shell", "default")),
+                    str(item_options.get("shell", "default")),
+                )
+                preview = t(
+                    "Folder: {folder} · Powłoka: {shell}",
+                    "Folder: {folder} · Shell: {shell}",
+                    folder=source_preview,
+                    shell=shell_preview,
+                )
+                if item.get("match") == "prefix_tail":
+                    preview += t(
+                        " · reszta wypowiedzi → schowek; bez Enter",
+                        " · utterance tail → clipboard; no Enter",
+                    )
+            else:
+                preview = str(item["value"]).replace("\r", "").replace("\n", " ↵ ")
+            if len(preview) > 125:
+                preview = preview[:122] + "…"
+            tk.Label(
+                card,
+                text=preview,
+                background=colors["surface_alt"],
+                foreground=colors["muted"],
+                font=(ui_font_family, 9),
+                anchor="w",
+                justify="left",
+                wraplength=px(610),
+            ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(px(7), 0))
+            card_actions = ttk.Frame(card, style="Alt.TFrame")
+            card_actions.grid(row=2, column=0, columnspan=2, sticky="e", pady=(px(9), 0))
+            ttk.Button(
+                card_actions,
+                text=t("Edytuj", "Edit"),
+                command=lambda selected=item_index: open_custom_command_editor(
+                    selected
+                ),
+            ).grid(row=0, column=0, padx=(0, px(6)))
+            ttk.Button(
+                card_actions,
+                text=t("Usuń", "Delete"),
+                command=lambda selected=item_index: remove_custom_command(selected),
+            ).grid(row=0, column=1)
+
+    ttk.Button(
+        commands_toolbar,
+        text=t("+ Dodaj komendę", "+ Add command"),
+        style="Accent.TButton",
+        command=open_custom_command_editor,
+    ).grid(row=0, column=1, sticky="e")
+    render_custom_command_cards()
+
+    unmanaged_commands_notice = tk.Frame(
+        commands_tab,
+        background=colors["warning_soft"],
+        highlightbackground=colors["warning_border"],
+        highlightthickness=1,
+        padx=px(16),
+        pady=px(13),
+    )
+    unmanaged_commands_notice.columnconfigure(0, weight=1)
+    unmanaged_commands_notice_var = tk.StringVar()
+    tk.Label(
+        unmanaged_commands_notice,
+        text=t(
+            "Nieobsługiwane wpisy w config.json",
+            "Unsupported entries in config.json",
+        ),
+        background=colors["warning_soft"],
+        foreground=colors["warning"],
+        font=(ui_font_family, 10, "bold"),
+    ).grid(row=0, column=0, sticky="w")
+    tk.Label(
+        unmanaged_commands_notice,
+        textvariable=unmanaged_commands_notice_var,
+        background=colors["warning_soft"],
+        foreground=colors["muted"],
+        font=(ui_font_family, 9),
+        justify="left",
+        anchor="w",
+        wraplength=px(620),
+    ).grid(row=1, column=0, sticky="ew", pady=(px(5), 0))
+
+    def open_config_for_custom_command_repair() -> None:
+        prompt = t(
+            "Panel ustawień zostanie zamknięty, aby późniejszy zapis nie cofnął "
+            "ręcznej naprawy pliku.",
+            "Settings will close so a later save cannot overwrite your manual "
+            "repair of the file.",
+        )
+        if dirty_state["dirty"]:
+            prompt += t(
+                " Niezapisane zmiany zostaną odrzucone.",
+                " Unsaved changes will be discarded.",
+            )
+        if not messagebox.askyesno(
+            t(
+                "{app} — otwórz konfigurację",
+                "{app} — Open configuration",
+                app=APP_DISPLAY_NAME,
+            ),
+            prompt,
+            parent=root,
+        ):
+            return
+        if open_path(CONFIG_PATH):
+            root.destroy()
+
+    ttk.Button(
+        unmanaged_commands_notice,
+        text=t("Otwórz config.json", "Open config.json"),
+        command=open_config_for_custom_command_repair,
+    ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(px(14), 0))
+
+    def refresh_unmanaged_custom_commands_notice() -> None:
+        count = len(unmanaged_custom_command_items)
+        if not count:
+            unmanaged_commands_notice.grid_remove()
+            return
+        unmanaged_commands_notice_var.set(
+            t(
+                "Liczba ukrytych wpisów: {count}. Są nieprawidłowe, niejednoznaczne "
+                "albo pochodzą z nowszej wersji. Nie zostaną usunięte przy zapisie. "
+                "Otwórz konfigurację, aby poprawić je ręcznie; panel zostanie zamknięty.",
+                "Hidden entries: {count}. They are invalid, ambiguous, or come "
+                "from a newer version. They will not be removed when you save. "
+                "Open the configuration to correct them manually; Settings will close.",
+                count=count,
+            )
+        )
+        unmanaged_commands_notice.grid(
+            row=2,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(0, px(14)),
+        )
+
+    refresh_unmanaged_custom_commands_notice()
+
+    commands_notice = tk.Frame(
+        commands_tab,
+        background=colors["warning_soft"],
+        highlightbackground=colors["warning_border"],
+        highlightthickness=1,
+        padx=px(16),
+        pady=px(13),
+    )
+    commands_notice.grid(row=3, column=0, columnspan=3, sticky="ew")
+    tk.Label(
+        commands_notice,
+        text=t("Bezpieczeństwo i prywatność", "Safety and privacy"),
+        background=colors["warning_soft"],
+        foreground=colors["text"],
+        font=(ui_font_family, 10, "bold"),
+    ).grid(row=0, column=0, sticky="w")
+    tk.Label(
+        commands_notice,
+        text=t(
+            "Mówik nie wykonuje zapisanych poleceń systemowych. Może otworzyć widoczny "
+            "terminal i skopiować jednowierszowy szkic do schowka, ale to Ty wklejasz go "
+            "i naciskasz Enter. Otwieranie zawsze wymaga potwierdzenia; skrypty, skróty "
+            "i ścieżki sieciowe są blokowane. Akcje otwierające są też blokowane, gdy "
+            "Mówik działa jako administrator. Nie zapisuj tu haseł ani sekretów.",
+            "Mówik does not execute saved system commands. It can open a visible terminal "
+            "and copy a one-line draft to the clipboard, but you paste it and press Enter. "
+            "Opening always requires confirmation; scripts, shortcuts, and network paths "
+            "are blocked. Open actions are also blocked while Mówik runs as administrator. "
+            "Do not store passwords or secrets here.",
+        ),
+        background=colors["warning_soft"],
+        foreground=colors["muted"],
+        font=(ui_font_family, 9),
+        justify="left",
+        anchor="w",
+        wraplength=px(760),
+    ).grid(row=1, column=0, sticky="ew", pady=(px(5), 0))
+
+    def sync_custom_command_controls(*args) -> None:
+        state = "readonly" if custom_commands_enabled_var.get() else "disabled"
+        custom_trigger_combo.configure(state=state)
+        custom_trigger_detect_button.configure(
+            state="normal" if custom_commands_enabled_var.get() else "disabled"
+        )
+
+    def mark_custom_commands_enabled_touched(*args) -> None:
+        custom_commands_enabled_touched["value"] = True
+
+    custom_commands_enabled_var.trace_add(
+        "write", sync_custom_command_controls
+    )
+    custom_commands_enabled_var.trace_add(
+        "write", mark_custom_commands_enabled_touched
+    )
+    sync_custom_command_controls()
 
     feedback_frame = ttk.LabelFrame(
         sounds_tab,
@@ -4960,7 +6411,7 @@ def run_settings_window() -> int:
         updated = load_config()
         trigger = str(trigger_values.get(trigger_var.get(), trigger_var.get()))
         try:
-            split_trigger(trigger)
+            dictation_trigger_identity = split_trigger(trigger)
         except AppError as exc:
             focus_validation_error("dictation", trigger_combo)
             raise AppError(
@@ -4969,6 +6420,54 @@ def run_settings_window() -> int:
                     "Choose a valid dictation shortcut.",
                 )
             ) from exc
+        custom_trigger = str(
+            trigger_values.get(
+                custom_commands_trigger_var.get(),
+                custom_commands_trigger_var.get(),
+            )
+        )
+        custom_commands_active = bool(custom_commands_enabled_var.get())
+        try:
+            custom_trigger_identity = split_trigger(custom_trigger)
+        except AppError as exc:
+            if custom_commands_active:
+                focus_validation_error("commands", custom_trigger_combo)
+                raise AppError(
+                    t(
+                        "Wybierz prawidłowy przycisk własnych komend.",
+                        "Choose a valid custom-command shortcut.",
+                    )
+                ) from exc
+            custom_trigger = "keyboard:f7"
+            custom_trigger_identity = ("keyboard", "f7")
+        if custom_commands_active and not custom_command_items:
+            focus_validation_error("commands", custom_trigger_combo)
+            raise AppError(
+                t(
+                    "Dodaj co najmniej jedną komendę albo wyłącz tryb komend.",
+                    "Add at least one command or disable command mode.",
+                )
+            )
+        if (
+            custom_commands_active
+            and custom_trigger_identity == dictation_trigger_identity
+        ):
+            focus_validation_error("commands", custom_trigger_combo)
+            raise AppError(
+                t(
+                    "Przycisk komend musi być inny niż przycisk dyktowania.",
+                    "The command shortcut must differ from the dictation shortcut.",
+                )
+            )
+        custom_commands_enabled_for_save = custom_commands_active
+        if (
+            preserve_original_custom_commands_enabled
+            and not custom_commands_enabled_touched["value"]
+            and not custom_command_items
+        ):
+            custom_commands_enabled_for_save = bool(
+                custom_commands_config.get("enabled", False)
+            )
         model = str(model_values.get(model_var.get(), model_var.get())).strip()
         device = str(device_values.get(device_var.get(), device_var.get())).strip()
         language = str(
@@ -5194,6 +6693,24 @@ def run_settings_window() -> int:
         )
         updated.setdefault("voice_commands", {})
         updated["voice_commands"]["enabled"] = bool(voice_commands_var.get())
+        # Zachowaj klucze z nowszych wersji lub ręcznie dodane metadane.
+        # Panel aktualizuje tylko pola, które rzeczywiście rozumie.
+        updated_custom_commands = updated.get("custom_commands", {})
+        if not isinstance(updated_custom_commands, dict):
+            updated_custom_commands = {}
+        else:
+            updated_custom_commands = copy.deepcopy(updated_custom_commands)
+        updated_custom_commands.update(
+            {
+                "schema_version": int(
+                    DEFAULT_CONFIG["custom_commands"]["schema_version"]
+                ),
+                "enabled": custom_commands_enabled_for_save,
+                "trigger": custom_trigger,
+                "items": custom_command_items_for_save(),
+            }
+        )
+        updated["custom_commands"] = updated_custom_commands
         updated.setdefault("ollama_cleanup", {})
         ollama_active = bool(ollama_enabled_var.get())
         updated["ollama_cleanup"].update(
@@ -5244,6 +6761,9 @@ def run_settings_window() -> int:
 
     tracked_variables: list[tk.Variable] = [
         trigger_var,
+        custom_commands_enabled_var,
+        custom_commands_trigger_var,
+        custom_commands_revision_var,
         model_var,
         device_var,
         language_var,
@@ -5385,6 +6905,22 @@ def run_settings_window() -> int:
 
     def restore_defaults() -> None:
         trigger_var.set(ensure_trigger_display(DEFAULT_CONFIG["trigger"]))
+        default_custom_commands = DEFAULT_CONFIG["custom_commands"]
+        custom_commands_enabled_var.set(
+            bool(default_custom_commands["enabled"])
+        )
+        custom_commands_trigger_var.set(
+            ensure_trigger_display(default_custom_commands["trigger"])
+        )
+        custom_command_items.clear()
+        custom_command_items.extend(
+            dict(item) for item in default_custom_commands["items"]
+        )
+        original_custom_command_items_by_key.clear()
+        unmanaged_custom_command_items.clear()
+        update_custom_commands_revision()
+        render_custom_command_cards()
+        refresh_unmanaged_custom_commands_notice()
         model_var.set(display_for_value(model_values, DEFAULT_CONFIG["model"]))
         device_var.set(display_for_value(device_values, DEFAULT_CONFIG["device"]))
         language_var.set(
@@ -5667,12 +7203,51 @@ class MowikApp:
             str(config["trigger"]),
             self.translator,
         )
+        self._custom_command_registry = command_engine.CommandRegistry.from_config(
+            config
+        )
+        self._custom_command_lookup = custom_command_lookup(config)
+        self.command_trigger_type: Optional[str] = None
+        self.command_trigger_name: Optional[str] = None
+        custom_settings = config.get("custom_commands", {})
+        custom_enabled = bool(
+            isinstance(custom_settings, dict)
+            and custom_settings.get("enabled", False)
+            and self._custom_command_registry.definitions
+        )
+        if custom_enabled:
+            try:
+                command_trigger = split_trigger(
+                    str(custom_settings.get("trigger", "keyboard:f7")),
+                    self.translator,
+                )
+                if command_trigger == (self.trigger_type, self.trigger_name):
+                    logging.error(
+                        "Wyłączono własne komendy: skrót koliduje z dyktowaniem"
+                    )
+                else:
+                    self.command_trigger_type, self.command_trigger_name = (
+                        command_trigger
+                    )
+            except AppError:
+                # Ręcznie uszkodzona opcjonalna sekcja nie może wyłączyć F8.
+                logging.exception("Wyłączono własne komendy: nieprawidłowy skrót")
+        self.process_elevated = windows_actions.is_process_elevated()
         self.stop_event = threading.Event()
         self.model_ready = threading.Event()
         self.busy_lock = threading.Lock()
         self.busy = False
+        self._input_lock = threading.Lock()
+        self._pressed_inputs: set[tuple[str, str]] = set()
+        self._active_input: Optional[tuple[tuple[str, str], str]] = None
+        self._command_context_lock = threading.Lock()
+        self._pending_command_context: Optional[
+            command_engine.ExecutionContext
+        ] = None
+        self._pending_command_context_ready: Optional[threading.Event] = None
         self.key_down = False
         self.capture_active = False
+        self.capture_mode: Optional[str] = None
         self._release_started_at: Optional[float] = None
         self.model: Optional[WhisperModel] = None
         self.model_name = ""
@@ -5680,7 +7255,7 @@ class MowikApp:
         self.recorder: Optional[ContinuousRecorder] = None
         self.keyboard_listener: Optional[keyboard.Listener] = None
         self.mouse_listener: Optional[mouse.Listener] = None
-        self.jobs: queue.Queue[Optional[np.ndarray]] = queue.Queue()
+        self.jobs: queue.Queue[Optional[SpeechJob | np.ndarray]] = queue.Queue()
         self.tray: Optional[pystray.Icon] = None
         self.status = self.translator.t("Uruchamianie…", "Starting…")
         self.tray_state = "idle"
@@ -5707,6 +7282,38 @@ class MowikApp:
 
     def _model_status(self, status: str) -> None:
         self.set_status(status, state="processing")
+
+    def _command_mode_enabled(self) -> bool:
+        return bool(
+            self.command_trigger_type
+            and self.command_trigger_name
+            and self._custom_command_registry.definitions
+        )
+
+    def _ready_status(self) -> str:
+        dictation_label = trigger_display_name(
+            str(self.config["trigger"]),
+            self.translator,
+        )
+        if not self._command_mode_enabled():
+            return self.translator.t(
+                "Gotowy — {trigger_label}",
+                "Ready — {trigger_label}",
+                trigger_label=dictation_label,
+            )
+        command_trigger = self.config.get("custom_commands", {}).get(
+            "trigger", "keyboard:f7"
+        )
+        command_label = trigger_display_name(
+            str(command_trigger),
+            self.translator,
+        )
+        return self.translator.t(
+            "Gotowy — dyktowanie: {dictation} · komendy: {commands}",
+            "Ready — dictation: {dictation} · commands: {commands}",
+            dictation=dictation_label,
+            commands=command_label,
+        )
 
     def start(self) -> None:
         self.worker.start()
@@ -5771,24 +7378,38 @@ class MowikApp:
             self.model_name = model_name
             self.model_device = device
             self.model_ready.set()
-            trigger_label = trigger_display_name(
+            dictation_label = trigger_display_name(
                 str(self.config["trigger"]),
                 self.translator,
             )
+            instruction = self.translator.t(
+                "Trzymaj {trigger_label} i mów.",
+                "Hold {trigger_label} and speak.",
+                trigger_label=dictation_label,
+            )
+            if self._command_mode_enabled():
+                command_label = trigger_display_name(
+                    str(
+                        self.config.get("custom_commands", {}).get(
+                            "trigger", "keyboard:f7"
+                        )
+                    ),
+                    self.translator,
+                )
+                instruction = self.translator.t(
+                    "Dyktowanie: {dictation}. Własne komendy: {commands}.",
+                    "Dictation: {dictation}. Custom commands: {commands}.",
+                    dictation=dictation_label,
+                    commands=command_label,
+                )
             self.set_status(
-                self.translator.t(
-                    "Gotowy — {trigger_label}",
-                    "Ready — {trigger_label}",
-                    trigger_label=trigger_label,
-                ),
+                self._ready_status(),
                 notify=self.translator.t(
-                    "Model {model_name} działa na {device}. "
-                    "Trzymaj {trigger_label} i mów.",
-                    "Model {model_name} is running on {device}. "
-                    "Hold {trigger_label} and speak.",
+                    "Model {model_name} działa na {device}. {instruction}",
+                    "Model {model_name} is running on {device}. {instruction}",
                     model_name=model_name,
                     device=device,
-                    trigger_label=trigger_label,
+                    instruction=instruction,
                 ),
                 state="ready",
             )
@@ -5802,36 +7423,134 @@ class MowikApp:
             )
 
     def _on_key_press(self, key) -> None:
-        if self.stop_event.is_set() or self.trigger_type != "keyboard":
-            return
-        if key_name(key) != self.trigger_name:
-            return
-        if not self.key_down:
-            self.key_down = True
-            self.begin_dictation()
+        self._handle_input_event("keyboard", key_name(key), True)
 
     def _on_key_release(self, key) -> None:
-        if self.stop_event.is_set() or self.trigger_type != "keyboard":
-            return
-        if key_name(key) != self.trigger_name:
-            return
-        if self.key_down:
-            self.key_down = False
-            self.end_dictation()
+        self._handle_input_event("keyboard", key_name(key), False)
 
     def _on_mouse_click(self, x, y, button, pressed) -> None:
-        if self.stop_event.is_set() or self.trigger_type != "mouse":
+        self._handle_input_event("mouse", mouse_name(button), bool(pressed))
+
+    def _execution_context_from_windows(
+        self,
+        context: windows_actions.ForegroundContext,
+    ) -> command_engine.ExecutionContext:
+        return command_engine.ExecutionContext(
+            foreground_hwnd=context.hwnd or None,
+            foreground_pid=context.pid or None,
+            explorer_path=(
+                str(context.explorer_path)
+                if context.explorer_path is not None
+                else None
+            ),
+            captured_at=context.captured_at_monotonic or time.monotonic(),
+            process_elevated=self.process_elevated,
+        )
+
+    def _begin_command_context_capture(self) -> None:
+        """Zamroź aktywne okno przy F7 i rozwiąż Explorer poza hookiem."""
+
+        identity = windows_actions.capture_foreground_identity()
+        ready = threading.Event()
+        with self._command_context_lock:
+            self._pending_command_context = self._execution_context_from_windows(
+                identity
+            )
+            self._pending_command_context_ready = ready
+
+        def resolve() -> None:
+            try:
+                resolved = windows_actions.resolve_explorer_context(identity)
+                execution_context = self._execution_context_from_windows(resolved)
+                with self._command_context_lock:
+                    if self._pending_command_context_ready is ready:
+                        self._pending_command_context = execution_context
+            except Exception:
+                # Nie logujemy ścieżki ani szczegółów COM. Brak kontekstu
+                # wyłączy tylko akcję "aktywny Explorer".
+                logging.warning(
+                    "Nie udało się odczytać kontekstu aktywnego Explorera"
+                )
+            finally:
+                ready.set()
+
+        threading.Thread(
+            target=resolve,
+            name="ExplorerContext",
+            daemon=True,
+        ).start()
+
+    def _take_command_context(self) -> command_engine.ExecutionContext:
+        with self._command_context_lock:
+            ready = self._pending_command_context_ready
+        if ready is not None:
+            ready.wait(1.7)
+        with self._command_context_lock:
+            context = self._pending_command_context
+            self._pending_command_context = None
+            self._pending_command_context_ready = None
+        if context is not None:
+            return context
+        return command_engine.ExecutionContext(
+            foreground_hwnd=None,
+            foreground_pid=None,
+            explorer_path=None,
+            captured_at=time.monotonic(),
+            process_elevated=self.process_elevated,
+        )
+
+    def _discard_command_context(self) -> None:
+        with self._command_context_lock:
+            self._pending_command_context = None
+            self._pending_command_context_ready = None
+
+    def _mode_for_input(self, identity: tuple[str, str]) -> Optional[str]:
+        if identity == (self.trigger_type, self.trigger_name):
+            return "dictation"
+        if self._command_mode_enabled() and identity == (
+            self.command_trigger_type,
+            self.command_trigger_name,
+        ):
+            return "custom_command"
+        return None
+
+    def _handle_input_event(
+        self,
+        input_type: str,
+        name: str,
+        pressed: bool,
+    ) -> None:
+        if self.stop_event.is_set() or not name:
             return
-        if mouse_name(button) != self.trigger_name:
-            return
-        if pressed and not self.key_down:
-            self.key_down = True
-            self.begin_dictation()
-        elif not pressed and self.key_down:
-            self.key_down = False
+        identity = (input_type, name)
+        should_begin: Optional[str] = None
+        should_end = False
+        with self._input_lock:
+            if pressed:
+                if identity in self._pressed_inputs:
+                    return
+                self._pressed_inputs.add(identity)
+                mode = self._mode_for_input(identity)
+                if mode is not None and self._active_input is None:
+                    self._active_input = (identity, mode)
+                    self.key_down = True
+                    should_begin = mode
+            else:
+                self._pressed_inputs.discard(identity)
+                if self._active_input is not None and self._active_input[0] == identity:
+                    self._active_input = None
+                    self.key_down = False
+                    should_end = True
+        if should_begin is not None:
+            if should_begin == "custom_command":
+                self._begin_command_context_capture()
+            self.begin_dictation(should_begin)
+        elif should_end:
             self.end_dictation()
 
-    def begin_dictation(self) -> None:
+    def begin_dictation(self, mode: str = "dictation") -> None:
+        if mode not in {"dictation", "custom_command"}:
+            raise ValueError(f"Unknown capture mode: {mode}")
         if not self.model_ready.is_set() or self.recorder is None:
             self.dictation_indicator.error()
             self.beep("error")
@@ -5858,7 +7577,11 @@ class MowikApp:
         try:
             self.recorder.begin()
             self.capture_active = True
-            self.dictation_indicator.recording()
+            self.capture_mode = mode
+            if mode == "custom_command":
+                self.dictation_indicator.recording(command=True)
+            else:
+                self.dictation_indicator.recording()
         except Exception as exc:
             self._release_busy()
             self.dictation_indicator.error()
@@ -5873,7 +7596,12 @@ class MowikApp:
             return
         self.beep("start")
         self.set_status(
-            self.translator.t("Nagrywanie…", "Recording…"),
+            self.translator.t(
+                "Słucham komendy…" if mode == "custom_command" else "Nagrywanie…",
+                "Listening for a command…"
+                if mode == "custom_command"
+                else "Recording…",
+            ),
             state="recording",
         )
 
@@ -5881,19 +7609,30 @@ class MowikApp:
         if not self.capture_active:
             return
         self.capture_active = False
-        self._release_started_at = time.perf_counter()
-        self.dictation_indicator.processing()
+        mode = self.capture_mode or "dictation"
+        self.capture_mode = None
+        released_at = time.perf_counter()
+        self._release_started_at = released_at
+        if mode == "custom_command":
+            self.dictation_indicator.processing(command=True)
+        else:
+            self.dictation_indicator.processing()
         # Kończymy także dłuższy, niezapętlony WAV przypisany do nagrywania.
         self.stop_feedback_sound()
         threading.Thread(
             target=self._finish_dictation_safely,
+            args=(mode, released_at),
             name="PostRoll",
             daemon=True,
         ).start()
 
-    def _finish_dictation_safely(self) -> None:
+    def _finish_dictation_safely(
+        self,
+        mode: str = "dictation",
+        released_at: Optional[float] = None,
+    ) -> None:
         try:
-            self._finish_dictation_after_tail()
+            self._finish_dictation_after_tail(mode, released_at)
         except Exception as exc:
             logging.exception("Nie udało się zakończyć nagrywania")
             self._release_busy()
@@ -5906,16 +7645,24 @@ class MowikApp:
             )
             self.beep("error")
 
-    def _finish_dictation_after_tail(self) -> None:
+    def _finish_dictation_after_tail(
+        self,
+        mode: str = "dictation",
+        released_at: Optional[float] = None,
+    ) -> None:
         post_roll = max(0, int(self.config.get("post_roll_ms", 120))) / 1000
         if post_roll:
             time.sleep(post_roll)
         if self.stop_event.is_set():
+            if mode == "custom_command":
+                self._discard_command_context()
             self._release_busy()
             self.dictation_indicator.hide()
             return
         recorder = self.recorder
         if recorder is None:
+            if mode == "custom_command":
+                self._discard_command_context()
             self._release_busy()
             self.dictation_indicator.hide()
             return
@@ -5927,6 +7674,8 @@ class MowikApp:
             / 1000
         )
         if len(audio) < minimum_samples:
+            if mode == "custom_command":
+                self._discard_command_context()
             self.dictation_indicator.error()
             self.set_status(
                 self.translator.t(
@@ -5938,93 +7687,107 @@ class MowikApp:
             self._release_busy()
             return
         self.set_status(
-            self.translator.t("Rozpoznaję mowę…", "Transcribing…"),
+            self.translator.t(
+                "Rozpoznaję komendę…"
+                if mode == "custom_command"
+                else "Rozpoznaję mowę…",
+                "Recognizing command…"
+                if mode == "custom_command"
+                else "Transcribing…",
+            ),
             state="processing",
         )
-        self.jobs.put(audio)
+        execution_context = (
+            self._take_command_context()
+            if mode == "custom_command"
+            else None
+        )
+        self.jobs.put(
+            SpeechJob(audio, mode, released_at, execution_context)
+        )
 
     def _job_worker(self) -> None:
-        while not self.stop_event.is_set():
+        while True:
             try:
-                audio = self.jobs.get(timeout=0.25)
+                queued_job = self.jobs.get(timeout=0.25)
             except queue.Empty:
+                if self.stop_event.is_set():
+                    break
                 continue
-            if audio is None:
+            if queued_job is None:
+                self.jobs.task_done()
                 break
+            if isinstance(queued_job, SpeechJob):
+                job = queued_job
+            else:
+                # Zgodność z kolejką z wersji 2.6 i prostymi integracjami.
+                job = SpeechJob(np.asarray(queued_job), "dictation", None)
             try:
-                text = self.transcribe(audio)
+                if self.stop_event.is_set():
+                    continue
+                text = self.transcribe(job.audio, mode=job.mode)
+                if self.stop_event.is_set():
+                    continue
                 if not text:
                     self.dictation_indicator.error()
                     self.set_status(
                         self.translator.t(
-                            "Nie wykryłem wyraźnej mowy",
-                            "No clear speech detected",
+                            "Nie rozpoznałem komendy"
+                            if job.mode == "custom_command"
+                            else "Nie wykryłem wyraźnej mowy",
+                            "No command was recognized"
+                            if job.mode == "custom_command"
+                            else "No clear speech detected",
                         ),
                         state="ready",
                     )
                     self.beep("error")
                     continue
-                paste_settings = self.config.get("paste", {})
-                paste_enabled = bool(paste_settings.get("enabled", True))
-                copy_enabled = bool(
-                    paste_settings.get("copy_to_clipboard", True)
-                )
-                if paste_enabled and copy_enabled:
-                    self.set_status(
-                        self.translator.t(
-                            "Wklejam i kopiuję tekst…",
-                            "Pasting and copying text…",
-                        ),
-                        state="processing",
-                    )
-                elif paste_enabled:
-                    self.set_status(
-                        self.translator.t(
-                            "Wklejam tekst…",
-                            "Pasting text…",
-                        ),
-                        state="processing",
-                    )
+
+                if job.mode == "custom_command":
+                    if not self._deliver_custom_command(
+                        text,
+                        job.execution_context,
+                    ):
+                        continue
                 else:
-                    self.set_status(
-                        self.translator.t(
-                            "Kopiuję tekst do schowka…",
-                            "Copying text to the clipboard…",
-                        ),
-                        state="processing",
-                    )
-                paste_text(text, self.config)
-                logging.info(
-                    "Dostarczono tekst (%d znaków; wklejanie=%s; schowek=%s)",
-                    len(text),
-                    paste_enabled,
-                    copy_enabled,
-                )
-                if self._release_started_at is not None:
+                    self._set_text_delivery_status()
+                    if self.stop_event.is_set():
+                        continue
+                    paste_text(text, self.config)
+                    paste_settings = self.config.get("paste", {})
                     logging.info(
-                        "Latencja F8 release -> tekst: %.3f s",
-                        time.perf_counter() - self._release_started_at,
+                        "Dostarczono tekst (%d znaków; wklejanie=%s; schowek=%s)",
+                        len(text),
+                        bool(paste_settings.get("enabled", True)),
+                        bool(paste_settings.get("copy_to_clipboard", True)),
+                    )
+                if job.released_at is not None:
+                    logging.info(
+                        "Latencja release -> wynik (%s): %.3f s",
+                        job.mode,
+                        time.perf_counter() - job.released_at,
                     )
                 self.set_status(
-                    self.translator.t(
-                        "Gotowy — {trigger_label}",
-                        "Ready — {trigger_label}",
-                        trigger_label=trigger_display_name(
-                            str(self.config["trigger"]),
-                            self.translator,
-                        ),
-                    ),
+                    self._ready_status(),
                     state="ready",
                 )
-                self.dictation_indicator.success()
+                if job.mode == "custom_command":
+                    self.dictation_indicator.success(command=True)
+                else:
+                    self.dictation_indicator.success()
                 self.beep("done")
-            except Exception as exc:
-                logging.exception("Błąd przetwarzania dyktowania")
+            except Exception:
+                logging.exception("Błąd przetwarzania trybu %s", job.mode)
                 self.dictation_indicator.error()
                 self.set_status(
                     self.translator.t(
-                        "Błąd dyktowania",
-                        "Dictation error",
+                        "Błąd wykonywania komendy"
+                        if job.mode == "custom_command"
+                        else "Błąd dyktowania",
+                        "Command failed"
+                        if job.mode == "custom_command"
+                        else "Dictation error",
                     ),
                     notify=self._error_notification(),
                     error=True,
@@ -6035,7 +7798,215 @@ class MowikApp:
                 self._release_busy()
                 self.jobs.task_done()
 
-    def transcribe(self, audio: np.ndarray) -> str:
+    def _set_text_delivery_status(self) -> None:
+        paste_settings = self.config.get("paste", {})
+        paste_enabled = bool(paste_settings.get("enabled", True))
+        copy_enabled = bool(paste_settings.get("copy_to_clipboard", True))
+        if paste_enabled and copy_enabled:
+            message = self.translator.t(
+                "Wklejam i kopiuję tekst…",
+                "Pasting and copying text…",
+            )
+        elif paste_enabled:
+            message = self.translator.t("Wklejam tekst…", "Pasting text…")
+        else:
+            message = self.translator.t(
+                "Kopiuję tekst do schowka…",
+                "Copying text to the clipboard…",
+            )
+        self.set_status(message, state="processing")
+
+    def _deliver_custom_command(
+        self,
+        transcript: str,
+        execution_context: Optional[command_engine.ExecutionContext] = None,
+    ) -> bool:
+        if self.stop_event.is_set():
+            return False
+        match = self._custom_command_registry.match(transcript)
+        if match is None:
+            self.dictation_indicator.error()
+            self.set_status(
+                self.translator.t(
+                    "Nie znaleziono pasującej komendy",
+                    "No matching command was found",
+                ),
+                state="ready",
+            )
+            self.beep("error")
+            return False
+
+        if execution_context is None:
+            context = command_engine.ExecutionContext(
+                foreground_hwnd=None,
+                foreground_pid=None,
+                explorer_path=None,
+                captured_at=time.monotonic(),
+                process_elevated=self.process_elevated,
+            )
+        else:
+            # A captured context may be supplied by a delayed recognition job,
+            # but it may never downgrade the process token observed by Mówik.
+            context = command_engine.ExecutionContext(
+                foreground_hwnd=execution_context.foreground_hwnd,
+                foreground_pid=execution_context.foreground_pid,
+                explorer_path=execution_context.explorer_path,
+                captured_at=execution_context.captured_at,
+                process_elevated=(
+                    self.process_elevated or execution_context.process_elevated
+                ),
+            )
+        plan = command_engine.build_action_plan(match, context)
+        if not plan.allowed:
+            reason = plan.denial_reason or "action_denied"
+            if reason == "explorer_path_unavailable":
+                message = self.translator.t(
+                    "Nie mogę ustalić folderu aktywnego Eksploratora",
+                    "The active File Explorer folder could not be determined",
+                )
+            elif reason == "elevated_process_denied":
+                message = self.translator.t(
+                    "Zamknij Mówika uruchomionego jako administrator i otwórz go normalnie",
+                    "Close the elevated Mówik process and start it normally",
+                )
+            else:
+                message = self.translator.t(
+                    "Komenda została zablokowana ze względów bezpieczeństwa",
+                    "The command was blocked for safety",
+                )
+            logging.warning(
+                "Zablokowano własną komendę (akcja=%s; powód=%s)",
+                match.definition.action,
+                reason,
+            )
+            self.dictation_indicator.error()
+            self.set_status(message, state="ready")
+            self.beep("error")
+            return False
+
+        action = plan.action
+        value = plan.payload
+        if plan.requires_confirmation:
+            self.set_status(
+                self.translator.t(
+                    "Czekam na potwierdzenie akcji…",
+                    "Waiting for action confirmation…",
+                ),
+                state="processing",
+            )
+            if not confirm_custom_command_action(
+                action,
+                value,
+                self.translator,
+            ):
+                self.dictation_indicator.hide()
+                self.set_status(
+                    self.translator.t(
+                        "Anulowano akcję komendy",
+                        "Command action was cancelled",
+                    ),
+                    state="ready",
+                )
+                return False
+        elif action == "paste_text":
+            self._set_text_delivery_status()
+        else:
+            self.set_status(
+                self.translator.t(
+                    "Przygotowuję akcję…",
+                    "Preparing action…",
+                ),
+                state="processing",
+            )
+
+        # Zamknięcie Mówika podczas rozpoznawania lub potwierdzenia nie może
+        # pozostawić opóźnionej akcji do wykonania.
+        if self.stop_event.is_set():
+            return False
+        if action == "paste_text" and plan.requires_confirmation:
+            self._set_text_delivery_status()
+        try:
+            if action == "paste_text":
+                paste_text(value, self.config, append_space_override=False)
+            elif action == "open":
+                open_custom_command_target(value)
+            elif action == "open_terminal":
+                options = plan.terminal_options or command_engine.TerminalOptions()
+                windows_context = windows_actions.ForegroundContext(
+                    hwnd=context.foreground_hwnd or 0,
+                    pid=context.foreground_pid or 0,
+                    explorer_path=(
+                        Path(context.explorer_path)
+                        if context.explorer_path
+                        else None
+                    ),
+                    captured_at_monotonic=context.captured_at,
+                )
+                directory = windows_actions.resolve_working_directory(
+                    options.cwd_source,
+                    options.fixed_cwd,
+                    windows_context,
+                )
+                if not directory.ok or directory.path is None:
+                    raise AppError("terminal_working_directory_unavailable")
+                launched = windows_actions.launch_terminal(
+                    options.host,
+                    options.shell,
+                    directory.path,
+                )
+                if not launched.ok or launched.handle is None:
+                    raise AppError("terminal_launch_failed")
+                if value:
+                    if self.stop_event.is_set():
+                        return False
+                    delivery = windows_actions.deliver_terminal_draft(
+                        launched.handle,
+                        value,
+                    )
+                    if delivery.status == "copied_only":
+                        self.set_status(
+                            self.translator.t(
+                                "Terminal otwarty — szkic skopiowano do schowka",
+                                "Terminal opened — draft copied to the clipboard",
+                            ),
+                            notify=self.translator.t(
+                                "Wklej szkic ręcznie przez Ctrl+V; Enter naciskasz sam.",
+                                "Paste the draft with Ctrl+V; you press Enter yourself.",
+                            ),
+                            state="ready",
+                        )
+                    else:
+                        raise AppError("terminal_draft_delivery_failed")
+            else:
+                raise AppError(
+                    self.translator.t(
+                        "Nieznany typ własnej komendy.",
+                        "Unknown custom-command action.",
+                    )
+                )
+        except Exception as exc:
+            # Nie przekazujemy do logu treści ścieżki, szablonu ani polecenia.
+            logging.error(
+                "Akcja własnej komendy nie powiodła się (typ=%s, błąd=%s)",
+                action,
+                type(exc).__name__,
+            )
+            raise AppError(
+                self.translator.t(
+                    "Nie udało się wykonać własnej komendy.",
+                    "The custom command could not be completed.",
+                )
+            ) from None
+        logging.info(
+            "Uruchomiono akcję własnej komendy (akcja=%s; długość=%d)",
+            action,
+            len(value),
+        )
+        return True
+
+    def transcribe(self, audio: np.ndarray, mode: str = "dictation") -> str:
+        if mode not in {"dictation", "custom_command"}:
+            raise ValueError(f"Unknown transcription mode: {mode}")
         pipeline_started = time.perf_counter()
         model = self.model
         if model is None:
@@ -6073,7 +8044,13 @@ class MowikApp:
             audio_input = buffer
 
         dictionary_terms = load_dictionary(self.config)
-        glossary = ", ".join(dictionary_terms)
+        hotword_terms = list(dictionary_terms)
+        if mode == "custom_command":
+            hotword_terms = [
+                definition.phrase
+                for definition in self._custom_command_registry.definitions
+            ] + hotword_terms
+        glossary = ", ".join(hotword_terms)
 
         vad_settings = self.config.get("vad", {})
         vad_enabled = bool(vad_settings.get("enabled", True))
@@ -6116,6 +8093,13 @@ class MowikApp:
             whisper_elapsed / max(0.001, audio_duration),
         )
         transcript = normalize_transcript(transcript)
+        if mode == "custom_command":
+            logging.info(
+                "Pipeline komendy: whisper=%.3f s, razem=%.3f s",
+                whisper_elapsed,
+                time.perf_counter() - pipeline_started,
+            )
+            return transcript
         transcript = apply_voice_commands(transcript, self.config)
         cleanup_started = time.perf_counter()
         transcript = cleanup_with_ollama(
@@ -6324,6 +8308,12 @@ class MowikApp:
         if self.stop_event.is_set():
             return
         self.stop_event.set()
+        with self._input_lock:
+            self._pressed_inputs.clear()
+            self._active_input = None
+            self.key_down = False
+            self.capture_active = False
+            self.capture_mode = None
         self.dictation_indicator.close()
         self.stop_feedback_sound()
         self.model_ready.clear()

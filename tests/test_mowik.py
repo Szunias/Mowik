@@ -4,6 +4,7 @@ import copy
 import io
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 import wave
@@ -87,6 +88,218 @@ class FeedbackConfigTests(unittest.TestCase):
         self.assertFalse(migrated["feedback"]["floating_indicator"])
 
 
+class CustomCommandConfigTests(unittest.TestCase):
+    def test_legacy_config_gains_disabled_f7_command_mode(self) -> None:
+        migrated = mowik.deep_merge(
+            mowik.DEFAULT_CONFIG,
+            {"trigger": "keyboard:f8"},
+        )
+
+        self.assertFalse(migrated["custom_commands"]["enabled"])
+        self.assertEqual(migrated["custom_commands"]["trigger"], "keyboard:f7")
+        self.assertEqual(migrated["custom_commands"]["items"], [])
+
+    def test_phrase_normalization_handles_unicode_case_and_punctuation(self) -> None:
+        self.assertEqual(
+            mowik.normalize_custom_command_phrase(
+                "  „WSTAW—MO\u0301J,\u00a0ADRES…!”  "
+            ),
+            "wstaw mój adres",
+        )
+        self.assertNotEqual(
+            mowik.normalize_custom_command_phrase("mój"),
+            mowik.normalize_custom_command_phrase("moj"),
+        )
+
+    def test_match_requires_the_whole_utterance(self) -> None:
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["custom_commands"]["items"] = [
+            {
+                "phrase": "wklej adres",
+                "action": "paste_text",
+                "value": "Example Street 1",
+            }
+        ]
+
+        self.assertIsNotNone(mowik.match_custom_command("Wklej adres!", config))
+        self.assertIsNone(
+            mowik.match_custom_command("proszę wklej adres", config)
+        )
+        self.assertIsNone(mowik.match_custom_command("wklej adres teraz", config))
+
+    def test_ambiguous_duplicates_are_excluded_but_unique_items_survive(self) -> None:
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["custom_commands"]["items"] = [
+            {"phrase": "Wklej adres", "text": "first"},
+            {"phrase": "wklej, ADRES!", "text": "second"},
+            {
+                "phrase": "otwórz stronę",
+                "action": "open",
+                "value": "https://example.com",
+            },
+        ]
+
+        commands = mowik.configured_custom_commands(config)
+
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["action"], "open")
+        self.assertIsNone(mowik.match_custom_command("wklej adres", config))
+
+    def test_open_defaults_to_confirmation_and_legacy_shell_is_disabled(self) -> None:
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["custom_commands"]["items"] = [
+            {
+                "phrase": "otwórz notatnik",
+                "action": "open",
+                "value": r"C:\Windows\System32\notepad.exe",
+                "confirm": False,
+            },
+            {
+                "phrase": "sprawdź repozytorium",
+                "action": "run_command",
+                "value": "git status",
+                "confirm": "invalid",
+            },
+            {
+                "phrase": "wklej podpis",
+                "action": "paste_text",
+                "value": "Best regards",
+            },
+        ]
+
+        commands = {
+            item["action"]: item for item in mowik.configured_custom_commands(config)
+        }
+
+        self.assertTrue(commands["open"]["confirm"])
+        self.assertNotIn("run_command", commands)
+        self.assertFalse(commands["paste_text"]["confirm"])
+        _, _, unmanaged = mowik.partition_custom_command_items(config)
+        self.assertEqual([item["action"] for item in unmanaged], ["run_command"])
+
+    def test_unmanaged_entries_are_partitioned_for_lossless_settings_save(self) -> None:
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        future = {
+            "phrase": "future action",
+            "action": "future_action",
+            "value": "opaque",
+            "future_metadata": {"keep": True},
+        }
+        config["custom_commands"]["items"] = [
+            {
+                "phrase": "valid action",
+                "action": "paste_text",
+                "value": "ready",
+                "extra": "preserve",
+            },
+            future,
+        ]
+
+        valid, originals, unmanaged = mowik.partition_custom_command_items(config)
+
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(
+            originals[mowik.normalize_custom_command_phrase("valid action")][
+                "extra"
+            ],
+            "preserve",
+        )
+        self.assertEqual(unmanaged, [future])
+
+    def test_open_target_must_be_one_line_and_legacy_shell_is_rejected(self) -> None:
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["custom_commands"]["items"] = [
+            {
+                "phrase": "bad open",
+                "action": "open",
+                "value": "first\nsecond",
+            },
+            {
+                "phrase": "too long",
+                "action": "run_command",
+                "value": "x" * (mowik.MAX_CUSTOM_COMMAND_LINE_LENGTH + 1),
+            },
+        ]
+
+        self.assertEqual(mowik.configured_custom_commands(config), [])
+
+    def test_open_target_allows_only_https_or_existing_safe_local_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory).resolve()
+            document = root / "notes.txt"
+            executable = root / "trusted.exe"
+            script = root / "unsafe.cmd"
+            document.write_text("notes", encoding="utf-8")
+            executable.write_bytes(b"MZ")
+            script.write_text("whoami", encoding="utf-8")
+
+            self.assertEqual(
+                mowik.resolve_custom_command_open_target(str(document)),
+                str(document),
+            )
+            self.assertEqual(
+                mowik.resolve_custom_command_open_target(str(executable)),
+                str(executable),
+            )
+            self.assertEqual(
+                mowik.resolve_custom_command_open_target(str(root)),
+                str(root),
+            )
+            self.assertEqual(
+                mowik.resolve_custom_command_open_target("https://example.com/docs"),
+                "https://example.com/docs",
+            )
+            with mock.patch.object(
+                mowik.windows_actions,
+                "is_local_filesystem_path",
+                return_value=False,
+            ):
+                with self.assertRaises(mowik.CustomOpenTargetError):
+                    mowik.resolve_custom_command_open_target(str(document))
+
+            unsafe = (
+                str(script),
+                "notepad.exe",
+                "http://example.com",
+                "file:///C:/Windows/notepad.exe",
+                "https://user:secret@example.com",
+                "https://example.com\\path",
+                "https://exa\tmple.com",
+                "https://example.com/hidden\u2028line",
+                "https://example.com/hidden\u2029line",
+                "https://example.com/hidden\u200btext",
+                "https://example.com/hidden\u2066text",
+                "https://example.com/hidden\x1btext",
+                r"\\server\share\tool.exe",
+                str(document) + ":payload.exe",
+                str(document) + ".",
+                str(root / "missing.txt"),
+            )
+            for target in unsafe:
+                with self.subTest(target=target):
+                    with self.assertRaises(mowik.CustomOpenTargetError):
+                        mowik.resolve_custom_command_open_target(target)
+
+    def test_open_target_blocklist_matches_the_pure_command_engine(self) -> None:
+        self.assertEqual(
+            mowik.BLOCKED_CUSTOM_OPEN_SUFFIXES,
+            mowik.command_engine.BLOCKED_OPEN_SUFFIXES,
+        )
+
+    def test_open_target_executor_passes_only_the_resolved_value_to_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory).resolve() / "notes.txt"
+            target.write_text("notes", encoding="utf-8")
+            with mock.patch.object(mowik.os, "name", "nt"), mock.patch.object(
+                mowik.os,
+                "startfile",
+                create=True,
+            ) as startfile:
+                mowik.open_custom_command_target(str(target))
+
+        startfile.assert_called_once_with(str(target))
+
+
 class StatusIndicatorTests(unittest.TestCase):
     def test_indicator_position_uses_monitor_work_area(self) -> None:
         self.assertEqual(
@@ -134,6 +347,22 @@ class StatusIndicatorTests(unittest.TestCase):
         second = mowik.render_status_indicator_frame("processing", 4)
 
         self.assertNotEqual(first.tobytes(), second.tobytes())
+
+    def test_command_mode_uses_distinct_indicator_colors(self) -> None:
+        dictation = mowik.render_status_indicator_frame("recording", 3)
+        command = mowik.render_status_indicator_frame("command_recording", 3)
+        command_processing = mowik.render_status_indicator_frame(
+            "command_processing", 4
+        )
+        command_success = mowik.render_status_indicator_frame("command_success")
+        dictation_processing = mowik.render_status_indicator_frame("processing", 4)
+        dictation_success = mowik.render_status_indicator_frame("success")
+
+        self.assertNotEqual(dictation.tobytes(), command.tobytes())
+        self.assertNotEqual(
+            dictation_processing.tobytes(), command_processing.tobytes()
+        )
+        self.assertNotEqual(dictation_success.tobytes(), command_success.tobytes())
 
     def test_disabled_indicator_is_a_no_op(self) -> None:
         indicator = mowik.FloatingStatusIndicator(False)
@@ -252,6 +481,517 @@ class DictationIndicatorFlowTests(unittest.TestCase):
         app.shutdown()
 
         app.dictation_indicator.close.assert_called_once_with()
+
+
+class CustomCommandFlowTests(unittest.TestCase):
+    def make_app(
+        self,
+        *,
+        action: str = "paste_text",
+        value: str = "Hello\nworld",
+        confirm: bool = False,
+        command_trigger: str = "keyboard:f7",
+        match: str = "exact",
+        options: dict | None = None,
+    ) -> mowik.MowikApp:
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["feedback"]["floating_indicator"] = False
+        item = {
+            "phrase": "moja komenda",
+            "action": action,
+            "value": value,
+            "confirm": confirm,
+            "match": match,
+        }
+        if options is not None:
+            item["options"] = options
+        config["custom_commands"] = {
+            "schema_version": 1,
+            "enabled": True,
+            "trigger": command_trigger,
+            "items": [item],
+        }
+        app = mowik.MowikApp(config)
+        app.dictation_indicator = mock.Mock()
+        return app
+
+    def test_f7_and_f8_route_to_separate_modes_without_cross_release(self) -> None:
+        app = self.make_app()
+        app.begin_dictation = mock.Mock()
+        app.end_dictation = mock.Mock()
+        app._begin_command_context_capture = mock.Mock()
+
+        app._handle_input_event("keyboard", "f7", True)
+        app._handle_input_event("keyboard", "f7", True)  # key autorepeat
+        app._handle_input_event("keyboard", "f8", False)
+
+        app.begin_dictation.assert_called_once_with("custom_command")
+        app._begin_command_context_capture.assert_called_once_with()
+        app.end_dictation.assert_not_called()
+
+        app._handle_input_event("keyboard", "f7", False)
+        app.end_dictation.assert_called_once_with()
+
+        app._handle_input_event("keyboard", "f8", True)
+        app._handle_input_event("keyboard", "f8", False)
+        self.assertEqual(
+            app.begin_dictation.call_args_list,
+            [mock.call("custom_command"), mock.call("dictation")],
+        )
+
+    def test_command_capture_uses_violet_indicator_states(self) -> None:
+        app = self.make_app()
+        app.model_ready.set()
+        app.recorder = mock.Mock()
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            mowik.threading, "Thread"
+        ) as thread_class:
+            app.begin_dictation("custom_command")
+            app.end_dictation()
+
+        app.dictation_indicator.recording.assert_called_once_with(command=True)
+        app.dictation_indicator.processing.assert_called_once_with(command=True)
+        thread_class.return_value.start.assert_called_once_with()
+
+    def test_conflicting_manual_shortcut_disables_only_command_mode(self) -> None:
+        with mock.patch.object(mowik.logging, "error") as log_error:
+            app = self.make_app(command_trigger="keyboard:f8")
+
+        self.assertFalse(app._command_mode_enabled())
+        self.assertEqual(app._mode_for_input(("keyboard", "f8")), "dictation")
+        log_error.assert_called_once()
+
+    def test_exact_command_pastes_literal_payload_without_extra_space(self) -> None:
+        app = self.make_app(value="Hello world")
+        app.busy = True
+        app.transcribe = mock.Mock(return_value="Moja komenda.")
+        app.jobs.put(
+            mowik.SpeechJob(
+                np.ones(160, dtype=np.float32),
+                "custom_command",
+            )
+        )
+        app.jobs.put(None)
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            mowik, "paste_text"
+        ) as paste:
+            app._job_worker()
+
+        paste.assert_called_once_with(
+            "Hello world",
+            app.config,
+            append_space_override=False,
+        )
+        app.dictation_indicator.success.assert_called_once_with(command=True)
+        app.dictation_indicator.error.assert_not_called()
+        self.assertFalse(app.busy)
+
+    def test_no_match_never_falls_back_to_dictation(self) -> None:
+        app = self.make_app()
+        app.busy = True
+        app.transcribe = mock.Mock(return_value="inna wypowiedź")
+        app.jobs.put(
+            mowik.SpeechJob(
+                np.ones(160, dtype=np.float32),
+                "custom_command",
+            )
+        )
+        app.jobs.put(None)
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            mowik, "paste_text"
+        ) as paste:
+            app._job_worker()
+
+        paste.assert_not_called()
+        app.dictation_indicator.error.assert_called_once_with()
+        app.dictation_indicator.success.assert_not_called()
+        self.assertFalse(app.busy)
+
+    def test_open_action_requires_configured_confirmation(self) -> None:
+        app = self.make_app(
+            action="open",
+            value=r"C:\Windows\System32\notepad.exe",
+            confirm=True,
+        )
+        app.busy = True
+        app.transcribe = mock.Mock(return_value="moja komenda")
+        app.jobs.put(
+            mowik.SpeechJob(
+                np.ones(160, dtype=np.float32),
+                "custom_command",
+            )
+        )
+        app.jobs.put(None)
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            mowik, "confirm_custom_command_action", return_value=True
+        ) as confirm, mock.patch.object(mowik, "open_custom_command_target") as opened:
+            app._job_worker()
+
+        confirm.assert_called_once_with(
+            "open",
+            r"C:\Windows\System32\notepad.exe",
+            app.translator,
+        )
+        opened.assert_called_once_with(r"C:\Windows\System32\notepad.exe")
+        app.dictation_indicator.success.assert_called_once_with(command=True)
+
+    def test_cancelled_open_action_is_not_started(self) -> None:
+        app = self.make_app(
+            action="open",
+            value=r"C:\Windows\System32\notepad.exe",
+            confirm=True,
+        )
+        app.busy = True
+        app.transcribe = mock.Mock(return_value="moja komenda")
+        app.jobs.put(
+            mowik.SpeechJob(
+                np.ones(160, dtype=np.float32),
+                "custom_command",
+            )
+        )
+        app.jobs.put(None)
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            mowik, "confirm_custom_command_action", return_value=False
+        ), mock.patch.object(mowik, "open_custom_command_target") as opened:
+            app._job_worker()
+
+        opened.assert_not_called()
+        app.dictation_indicator.hide.assert_called_once_with()
+        app.dictation_indicator.error.assert_not_called()
+        app.dictation_indicator.success.assert_not_called()
+        self.assertFalse(app.busy)
+
+    def test_shutdown_during_confirmation_prevents_open_action(self) -> None:
+        app = self.make_app(
+            action="open",
+            value=r"C:\Windows\System32\notepad.exe",
+            confirm=True,
+        )
+
+        def confirm_then_stop(*args, **kwargs):
+            app.stop_event.set()
+            return True
+
+        with mock.patch.object(
+            mowik,
+            "confirm_custom_command_action",
+            side_effect=confirm_then_stop,
+        ), mock.patch.object(mowik, "open_custom_command_target") as opened:
+            result = app._deliver_custom_command("moja komenda")
+
+        self.assertFalse(result)
+        opened.assert_not_called()
+
+    def test_shutdown_during_recognition_prevents_delayed_action(self) -> None:
+        app = self.make_app(
+            action="open",
+            value=r"C:\Windows\System32\notepad.exe",
+            confirm=True,
+        )
+        app.busy = True
+
+        def stop_then_return(*args, **kwargs):
+            app.stop_event.set()
+            return "moja komenda"
+
+        app.transcribe = mock.Mock(side_effect=stop_then_return)
+        app.jobs.put(
+            mowik.SpeechJob(
+                np.ones(160, dtype=np.float32),
+                "custom_command",
+            )
+        )
+        app.jobs.put(None)
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            mowik, "confirm_custom_command_action"
+        ) as confirm, mock.patch.object(mowik, "open_custom_command_target") as opened:
+            app._job_worker()
+
+        confirm.assert_not_called()
+        opened.assert_not_called()
+        app.dictation_indicator.success.assert_not_called()
+        self.assertFalse(app.busy)
+
+    def test_legacy_shell_command_is_never_registered_or_executed(self) -> None:
+        app = self.make_app(action="run_command", value="whoami", confirm=True)
+
+        self.assertFalse(app._custom_command_registry.definitions)
+        self.assertFalse(hasattr(mowik, "run_custom_command_line"))
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            mowik, "open_custom_command_target"
+        ) as opened:
+            result = app._deliver_custom_command("moja komenda")
+
+        self.assertFalse(result)
+        opened.assert_not_called()
+        app.dictation_indicator.error.assert_called_once_with()
+
+    def test_multiline_paste_requires_confirmation_even_when_disabled_in_config(self) -> None:
+        app = self.make_app(action="paste_text", value="first\nsecond", confirm=False)
+
+        with mock.patch.object(
+            mowik, "confirm_custom_command_action", return_value=True
+        ) as confirm, mock.patch.object(mowik, "paste_text") as paste:
+            result = app._deliver_custom_command("moja komenda")
+
+        self.assertTrue(result)
+        confirm.assert_called_once_with(
+            "paste_text",
+            "first\nsecond",
+            app.translator,
+        )
+        paste.assert_called_once_with(
+            "first\nsecond",
+            app.config,
+            append_space_override=False,
+        )
+
+    def test_terminal_tail_opens_captured_folder_and_only_updates_clipboard(self) -> None:
+        app = self.make_app(
+            action="open_terminal",
+            value="",
+            match="prefix_tail",
+            options={
+                "cwd_source": "active_explorer",
+                "host": "auto",
+                "shell": "default",
+                "draft_delivery": "clipboard",
+            },
+        )
+        context = mowik.command_engine.ExecutionContext(
+            101,
+            202,
+            r"C:\Work\Mowik",
+            42.0,
+            False,
+        )
+        directory = mowik.windows_actions.WorkingDirectoryResult(
+            "active_explorer",
+            Path(r"C:\Work\Mowik"),
+        )
+        handle = mowik.windows_actions.TerminalHandle(
+            "windows_terminal",
+            "default",
+            Path(r"C:\Work\Mowik"),
+            303,
+            43.0,
+        )
+        launched = mowik.windows_actions.TerminalLaunchResult("launched", handle)
+        copied = mowik.windows_actions.DraftDeliveryResult(
+            "copied_only",
+            clipboard_updated=True,
+            reason="clipboard_mode",
+        )
+
+        with mock.patch.object(
+            mowik.windows_actions,
+            "resolve_working_directory",
+            return_value=directory,
+        ) as resolve, mock.patch.object(
+            mowik.windows_actions,
+            "launch_terminal",
+            return_value=launched,
+        ) as launch, mock.patch.object(
+            mowik.windows_actions,
+            "deliver_terminal_draft",
+            return_value=copied,
+        ) as deliver, mock.patch.object(
+            mowik,
+            "paste_text",
+        ) as paste, mock.patch.object(
+            mowik,
+            "windows_type_unicode_text",
+        ) as type_text:
+            result = app._deliver_custom_command(
+                "moja komenda git status",
+                context,
+            )
+
+        self.assertTrue(result)
+        resolve.assert_called_once()
+        launch.assert_called_once_with(
+            "auto",
+            "default",
+            Path(r"C:\Work\Mowik"),
+        )
+        deliver.assert_called_once_with(
+            handle,
+            "git status",
+        )
+        paste.assert_not_called()
+        type_text.assert_not_called()
+
+    def test_terminal_without_draft_never_invokes_clipboard_delivery(self) -> None:
+        app = self.make_app(
+            action="open_terminal",
+            value="",
+            match="exact",
+            options={"cwd_source": "home"},
+        )
+        directory = mowik.windows_actions.WorkingDirectoryResult(
+            "home",
+            Path(r"C:\Users\User"),
+        )
+        handle = mowik.windows_actions.TerminalHandle(
+            "console",
+            "cmd",
+            directory.path,
+            303,
+            43.0,
+        )
+        launched = mowik.windows_actions.TerminalLaunchResult("launched", handle)
+
+        with mock.patch.object(
+            mowik.windows_actions,
+            "resolve_working_directory",
+            return_value=directory,
+        ), mock.patch.object(
+            mowik.windows_actions,
+            "launch_terminal",
+            return_value=launched,
+        ), mock.patch.object(
+            mowik.windows_actions,
+            "deliver_terminal_draft",
+        ) as deliver, mock.patch.object(mowik, "paste_text") as paste:
+            result = app._deliver_custom_command("moja komenda")
+
+        self.assertTrue(result)
+        deliver.assert_not_called()
+        paste.assert_not_called()
+
+    def test_shutdown_after_terminal_launch_prevents_draft_delivery(self) -> None:
+        app = self.make_app(
+            action="open_terminal",
+            value="",
+            match="prefix_tail",
+            options={"cwd_source": "home"},
+        )
+        directory = mowik.windows_actions.WorkingDirectoryResult(
+            "home",
+            Path(r"C:\Users\User"),
+        )
+        handle = mowik.windows_actions.TerminalHandle(
+            "console",
+            "cmd",
+            directory.path,
+            303,
+            43.0,
+        )
+        launched = mowik.windows_actions.TerminalLaunchResult("launched", handle)
+
+        def launch_then_stop(*args, **kwargs):
+            app.stop_event.set()
+            return launched
+
+        with mock.patch.object(
+            mowik.windows_actions,
+            "resolve_working_directory",
+            return_value=directory,
+        ), mock.patch.object(
+            mowik.windows_actions,
+            "launch_terminal",
+            side_effect=launch_then_stop,
+        ), mock.patch.object(
+            mowik.windows_actions,
+            "deliver_terminal_draft",
+        ) as deliver:
+            result = app._deliver_custom_command("moja komenda git status")
+
+        self.assertFalse(result)
+        deliver.assert_not_called()
+
+    def test_terminal_here_fails_closed_without_captured_explorer_folder(self) -> None:
+        app = self.make_app(
+            action="open_terminal",
+            value="",
+            options={"cwd_source": "active_explorer"},
+        )
+        context = mowik.command_engine.ExecutionContext(101, 202, None, 42.0, False)
+
+        with mock.patch.object(mowik.windows_actions, "launch_terminal") as launch:
+            result = app._deliver_custom_command("moja komenda", context)
+
+        self.assertFalse(result)
+        launch.assert_not_called()
+
+    def test_open_and_terminal_actions_fail_closed_when_process_is_elevated(self) -> None:
+        elevated = mowik.command_engine.ExecutionContext(
+            101,
+            202,
+            r"C:\Work\Mowik",
+            42.0,
+            True,
+        )
+        for action, value, options in (
+            ("open", r"C:\Windows\System32\notepad.exe", None),
+            ("open_terminal", "", {"cwd_source": "home"}),
+        ):
+            with self.subTest(action=action):
+                app = self.make_app(action=action, value=value, options=options)
+                with mock.patch.object(
+                    mowik, "open_custom_command_target"
+                ) as opened, mock.patch.object(
+                    mowik.windows_actions, "launch_terminal"
+                ) as terminal:
+                    result = app._deliver_custom_command("moja komenda", elevated)
+                self.assertFalse(result)
+                opened.assert_not_called()
+                terminal.assert_not_called()
+
+    def test_current_elevation_cannot_be_downgraded_by_captured_context(self) -> None:
+        stale_non_elevated_context = mowik.command_engine.ExecutionContext(
+            101,
+            202,
+            r"C:\Work\Mowik",
+            42.0,
+            False,
+        )
+        for action, value, options in (
+            ("open", r"C:\Windows\System32\notepad.exe", None),
+            ("open_terminal", "", {"cwd_source": "home"}),
+        ):
+            with self.subTest(action=action):
+                app = self.make_app(action=action, value=value, options=options)
+                app.process_elevated = True
+                with mock.patch.object(
+                    mowik, "open_custom_command_target"
+                ) as opened, mock.patch.object(
+                    mowik.windows_actions, "launch_terminal"
+                ) as terminal:
+                    result = app._deliver_custom_command(
+                        "moja komenda",
+                        stale_non_elevated_context,
+                    )
+                self.assertFalse(result)
+                opened.assert_not_called()
+                terminal.assert_not_called()
+
+    def test_command_transcription_skips_voice_replacements_and_ollama(self) -> None:
+        app = self.make_app()
+        app.model = mock.Mock()
+        segment = mock.Mock(text=" new paragraph. ")
+        info = mock.Mock(language="en", language_probability=1.0)
+        app.model.transcribe.return_value = ([segment], info)
+        app.recorder = mock.Mock(sample_rate=mowik.SAMPLE_RATE)
+        audio = np.tile(np.array([-0.2, 0.2], dtype=np.float32), 800)
+
+        with mock.patch.object(mowik, "load_dictionary", return_value=[]), mock.patch.object(
+            mowik, "apply_voice_commands"
+        ) as voice_commands, mock.patch.object(
+            mowik, "cleanup_with_ollama"
+        ) as cleanup:
+            result = app.transcribe(audio, mode="custom_command")
+
+        self.assertEqual(result, "new paragraph.")
+        voice_commands.assert_not_called()
+        cleanup.assert_not_called()
+
 
 
 class TrayLifecycleTests(unittest.TestCase):
