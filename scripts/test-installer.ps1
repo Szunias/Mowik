@@ -5,6 +5,9 @@ param(
     [string]$Version = '2.7.0',
 
     [Parameter()]
+    [string]$InstallerFileName = "Mowik-$Version-Setup.exe",
+
+    [Parameter()]
     [ValidateSet('english', 'polish')]
     [string[]]$Language = @('english', 'polish'),
 
@@ -26,7 +29,14 @@ Set-StrictMode -Version Latest
 
 $Root = Split-Path -Parent $PSScriptRoot
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
-$Installer = Join-Path $Root "release\Mowik-$Version-Setup.exe"
+if ([IO.Path]::GetFileName($InstallerFileName) -ne $InstallerFileName -or
+    $InstallerFileName -notmatch '^Mowik-[0-9]+\.[0-9]+\.[0-9]+-Setup(?:-UNSIGNED)?\.exe$') {
+    throw "Invalid installer file name: $InstallerFileName"
+}
+if (-not $InstallerFileName.StartsWith("Mowik-$Version-", [StringComparison]::Ordinal)) {
+    throw "Installer file name does not match version ${Version}: $InstallerFileName"
+}
+$Installer = Join-Path (Join-Path $Root 'release') $InstallerFileName
 
 if (-not $env:GITHUB_ACTIONS -and -not $AllowLocalMachineMutation) {
     throw (
@@ -52,6 +62,15 @@ if ($RequireAuthenticode) {
 }
 elseif ($ExpectedSignerThumbprint -or $SignToolPath) {
     throw 'Signature inputs require -RequireAuthenticode.'
+}
+elseif ($InstallerFileName -notlike '*-UNSIGNED.exe') {
+    throw 'An unsigned installer QA run requires the explicit -UNSIGNED.exe file name.'
+}
+else {
+    $InstallerSignature = Get-AuthenticodeSignature -LiteralPath $Installer
+    if ($InstallerSignature.Status -ne [Management.Automation.SignatureStatus]::NotSigned) {
+        throw "Unsigned installer QA expected NotSigned, got $($InstallerSignature.Status)."
+    }
 }
 
 foreach ($SelectedLanguage in $Language) {
@@ -95,6 +114,18 @@ foreach ($SelectedLanguage in $Language) {
                 -ExpectedSignerThumbprint $ExpectedSignerThumbprint `
                 -SignToolPath $SignToolPath
             $MayRunUninstaller = $true
+        }
+        else {
+            foreach ($UnsignedPath in @($AppExe, $Uninstaller)) {
+                $UnsignedSignature = Get-AuthenticodeSignature -LiteralPath $UnsignedPath
+                if ($UnsignedSignature.Status -ne
+                    [Management.Automation.SignatureStatus]::NotSigned) {
+                    throw (
+                        "Unsigned installer QA expected NotSigned for $UnsignedPath, " +
+                        "got $($UnsignedSignature.Status)."
+                    )
+                }
+            }
         }
 
         $App = Start-Process -FilePath $AppExe -ArgumentList '--version' -Wait -PassThru

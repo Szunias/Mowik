@@ -1,2 +1,3 @@
 Mowik 2.7.0
-Opcjonalny wskaźnik dyktowania na ekranie: zielona kropka podczas nagrywania, animacja podczas przetwarzania i znacznik zakończenia; można go włączyć lub wyłączyć w ustawieniach.
+Bezpieczne własne komendy pod osobnym skrótem F7: wklejanie tekstu, otwieranie zaufanych plików lub stron oraz terminal z niewykonywanym automatycznie szkicem polecenia.
+Publiczny instalator 2.7.0 jest niepodpisany; pobieraj go wyłącznie z oficjalnego wydania GitHub i sprawdź SHA-256 z plikiem SHA256SUMS.txt.

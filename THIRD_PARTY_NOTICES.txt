@@ -2,12 +2,16 @@ MÓWIK — INFORMACJE O KOMPONENTACH ZEWNĘTRZNYCH
 
 Mówik korzysta z bibliotek rozwijanych przez niezależnych autorów. Każda z nich
 pozostaje objęta własną licencją. Pełne teksty licencji są dostępne w metadanych
-pakietów oraz w podanych repozytoriach projektów.
+pakietów dołączonych do aplikacji, w katalogu THIRD_PARTY_LICENSES oraz w
+podanych repozytoriach projektów.
 
 Najważniejsze komponenty:
 
 - faster-whisper — MIT — https://github.com/SYSTRAN/faster-whisper
 - CTranslate2 — MIT — https://github.com/OpenNMT/CTranslate2
+- ONNX Runtime — MIT — https://github.com/microsoft/onnxruntime
+- FlatBuffers — Apache-2.0 — https://github.com/google/flatbuffers
+- Hugging Face Tokenizers — Apache-2.0 — https://github.com/huggingface/tokenizers
 - NumPy — BSD-3-Clause — https://github.com/numpy/numpy
 - python-sounddevice — MIT — https://github.com/spatialaudio/python-sounddevice
 - pynput — LGPL-3.0 — https://github.com/moses-palmer/pynput

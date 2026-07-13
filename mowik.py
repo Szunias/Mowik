@@ -15,6 +15,7 @@ import difflib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+import math
 import os
 from pathlib import Path
 import queue
@@ -36,6 +37,7 @@ from functools import lru_cache
 from typing import Any, Optional
 
 import mowik_commands as command_engine
+import mowik_audio_devices as audio_devices
 from mowik_i18n import Translator
 import mowik_windows_actions as windows_actions
 
@@ -178,6 +180,8 @@ APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
 APP_VERSION = "2.7.0"
 MUTEX_NAME = r"Local\MowikLocalDictation"
+SETTINGS_MUTEX_NAME = r"Local\MowikLocalDictation.Settings"
+PROCESS_STARTED_AT_NS = time.time_ns()
 SAMPLE_RATE = 16_000
 CUSTOM_COMMAND_ACTIONS = {
     "paste_text",
@@ -189,6 +193,7 @@ MAX_CUSTOM_COMMAND_PHRASE_LENGTH = 120
 MAX_CUSTOM_COMMAND_VALUE_LENGTH = 50_000
 MAX_CUSTOM_COMMAND_LINE_LENGTH = 8_000
 MAX_CUSTOM_OPEN_TARGET_LENGTH = command_engine.MAX_OPEN_TARGET_LENGTH
+MAX_CUSTOM_COMMAND_CONTEXT_AGE_SECONDS = 120.0
 BLOCKED_CUSTOM_OPEN_SUFFIXES = command_engine.BLOCKED_OPEN_SUFFIXES
 
 APP_ROOT = (
@@ -254,7 +259,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
     },
     "custom_commands": {
-        "schema_version": 1,
+        "schema_version": command_engine.CUSTOM_COMMANDS_SCHEMA_VERSION,
         "enabled": False,
         "trigger": "keyboard:f7",
         "items": [],
@@ -377,6 +382,288 @@ class AppError(RuntimeError):
     pass
 
 
+class OperationCancelled(AppError):
+    """Internal control-flow signal for work cancelled during shutdown."""
+
+
+@dataclass(frozen=True)
+class MicrophoneChoiceState:
+    """One fail-closed Settings snapshot of the available microphones."""
+
+    values: dict[str, Any]
+    selected_label: str
+    unresolved_label: Optional[str] = None
+    error_code: Optional[str] = None
+    blocked_labels: frozenset[str] = frozenset()
+
+
+def microphone_selection_app_error(
+    error_code: str,
+    translator: Translator,
+) -> AppError:
+    """Translate stable selector errors without exposing device metadata."""
+
+    if error_code == audio_devices.ERROR_DEVICE_MISSING:
+        message = translator.t(
+            "Zapisany mikrofon nie jest obecnie dostępny. Wybierz go ponownie "
+            "w ustawieniach.",
+            "The saved microphone is not currently available. Choose it again "
+            "in Settings.",
+        )
+    elif error_code == audio_devices.ERROR_DEVICE_AMBIGUOUS:
+        message = translator.t(
+            "Nie można jednoznacznie rozpoznać zapisanego mikrofonu. Wybierz "
+            "go ponownie w ustawieniach.",
+            "The saved microphone cannot be identified uniquely. Choose it "
+            "again in Settings.",
+        )
+    elif error_code in {
+        audio_devices.ERROR_SELECTOR_MALFORMED,
+        audio_devices.ERROR_SELECTOR_SCHEMA_UNSUPPORTED,
+    }:
+        message = translator.t(
+            "Zapisane ustawienie mikrofonu jest nieprawidłowe lub pochodzi z "
+            "nieobsługiwanej wersji. Wybierz mikrofon ponownie w ustawieniach.",
+            "The saved microphone setting is invalid or comes from an "
+            "unsupported version. Choose the microphone again in Settings.",
+        )
+    elif error_code in {
+        audio_devices.ERROR_LEGACY_INDEX_INVALID,
+        audio_devices.ERROR_DEVICE_NOT_INPUT,
+    }:
+        message = translator.t(
+            "Starsze ustawienie mikrofonu nie wskazuje już prawidłowego wejścia. "
+            "Wybierz mikrofon ponownie w ustawieniach.",
+            "The legacy microphone setting no longer points to a valid input. "
+            "Choose the microphone again in Settings.",
+        )
+    else:
+        message = translator.t(
+            "Nie można bezpiecznie odczytać listy mikrofonów. Sprawdź urządzenia "
+            "audio i spróbuj ponownie.",
+            "The microphone list could not be read safely. Check the audio "
+            "devices and try again.",
+        )
+    return AppError(message)
+
+
+def _microphone_default_label(translator: Translator) -> str:
+    return translator.t(
+        "Domyślny mikrofon Windows",
+        "Default Windows microphone",
+    )
+
+
+def _microphone_unresolved_label(translator: Translator) -> str:
+    return translator.t(
+        "Zapisany mikrofon niedostępny — wybierz ponownie",
+        "Saved microphone unavailable — choose again",
+    )
+
+
+def _microphone_device_label(
+    selector: audio_devices.MicrophoneSelector,
+    device_index: int,
+    translator: Translator,
+    *,
+    ambiguous: bool = False,
+) -> str:
+    input_channels = translator.t(
+        "{count} wej.",
+        "{count} in",
+        count=selector.max_input_channels,
+    )
+    label = (
+        f"{selector.name} — {selector.host_api_name} · {input_channels} · "
+        f"{selector.default_samplerate_hz} Hz · #{device_index}"
+    )
+    if ambiguous:
+        label += translator.t(
+            " · nie można rozróżnić",
+            " · cannot distinguish",
+        )
+    return label
+
+
+def build_microphone_choice_state(
+    configured_value: Any,
+    devices: Any,
+    host_apis: Any,
+    translator: Translator,
+) -> MicrophoneChoiceState:
+    """Build Settings choices and migrate a valid legacy index in memory."""
+
+    device_snapshot = tuple(devices)
+    host_api_snapshot = tuple(host_apis)
+    default_label = _microphone_default_label(translator)
+    values: dict[str, Any] = {default_label: None}
+    labels_by_index: dict[int, str] = {}
+    descriptors_by_index: dict[int, dict[str, Any]] = {}
+    selectors_by_index: dict[int, audio_devices.MicrophoneSelector] = {}
+
+    for index in range(len(device_snapshot)):
+        try:
+            descriptor = audio_devices.build_microphone_selector(
+                index,
+                device_snapshot,
+                host_api_snapshot,
+            )
+        except audio_devices.MicrophoneSelectionError as exc:
+            if exc.code == audio_devices.ERROR_DEVICE_NOT_INPUT:
+                continue
+            raise
+        descriptors_by_index[index] = descriptor
+        selectors_by_index[index] = audio_devices.parse_microphone_selector(
+            descriptor
+        )
+
+    selector_counts: dict[audio_devices.MicrophoneSelector, int] = {}
+    for selector in selectors_by_index.values():
+        selector_counts[selector] = selector_counts.get(selector, 0) + 1
+
+    blocked_labels: set[str] = set()
+    for index, selector in selectors_by_index.items():
+        ambiguous = selector_counts[selector] > 1
+        label = _microphone_device_label(
+            selector,
+            index,
+            translator,
+            ambiguous=ambiguous,
+        )
+        descriptor = descriptors_by_index[index]
+        values[label] = descriptor
+        labels_by_index[index] = label
+        if ambiguous:
+            blocked_labels.add(label)
+
+    if configured_value is None:
+        return MicrophoneChoiceState(
+            values,
+            default_label,
+            blocked_labels=frozenset(blocked_labels),
+        )
+
+    try:
+        selected_index = audio_devices.resolve_microphone_device(
+            configured_value,
+            device_snapshot,
+            host_api_snapshot,
+        )
+        selected_label = labels_by_index[selected_index]
+        if selected_label in blocked_labels:
+            raise audio_devices.MicrophoneSelectionError(
+                audio_devices.ERROR_DEVICE_AMBIGUOUS
+            )
+    except (audio_devices.MicrophoneSelectionError, KeyError) as exc:
+        error_code = (
+            exc.code
+            if isinstance(exc, audio_devices.MicrophoneSelectionError)
+            else audio_devices.ERROR_SNAPSHOT_MALFORMED
+        )
+        unresolved_label = _microphone_unresolved_label(translator)
+        values[unresolved_label] = copy.deepcopy(configured_value)
+        return MicrophoneChoiceState(
+            values,
+            unresolved_label,
+            unresolved_label=unresolved_label,
+            error_code=error_code,
+            blocked_labels=frozenset(blocked_labels),
+        )
+
+    return MicrophoneChoiceState(
+        values,
+        selected_label,
+        blocked_labels=frozenset(blocked_labels),
+    )
+
+
+def build_unavailable_microphone_choice_state(
+    configured_value: Any,
+    translator: Translator,
+    error_code: str = audio_devices.ERROR_SNAPSHOT_UNAVAILABLE,
+) -> MicrophoneChoiceState:
+    """Preserve an explicit selector when PortAudio enumeration is unavailable."""
+
+    default_label = _microphone_default_label(translator)
+    values: dict[str, Any] = {default_label: None}
+    if configured_value is None:
+        return MicrophoneChoiceState(
+            values,
+            default_label,
+            error_code=error_code,
+        )
+    unresolved_label = _microphone_unresolved_label(translator)
+    values[unresolved_label] = copy.deepcopy(configured_value)
+    return MicrophoneChoiceState(
+        values,
+        unresolved_label,
+        unresolved_label=unresolved_label,
+        error_code=error_code,
+    )
+
+
+def microphone_config_value_for_choice(
+    state: MicrophoneChoiceState,
+    selected_label: str,
+    translator: Translator,
+) -> Any:
+    """Return a JSON-ready choice, rejecting unresolved opaque selectors."""
+
+    if (
+        selected_label not in state.values
+        or selected_label == state.unresolved_label
+        or selected_label in state.blocked_labels
+    ):
+        raise AppError(
+            translator.t(
+                "Wybierz dostępny mikrofon albo mikrofon domyślny. Zapisanego "
+                "niedostępnego urządzenia nie można użyć automatycznie.",
+                "Choose an available microphone or the default microphone. "
+                "The saved unavailable device cannot be used automatically.",
+            )
+        )
+    return copy.deepcopy(state.values[selected_label])
+
+
+def resolve_runtime_microphone(
+    configured_value: Any,
+    translator: Translator,
+    device_source: Any = None,
+    host_api_source: Any = None,
+) -> tuple[Optional[int], Optional[Any]]:
+    """Resolve one explicit selector against a single fresh PortAudio snapshot."""
+
+    if configured_value is None:
+        return None, None
+    if device_source is None:
+        device_source = sd.query_devices
+    if host_api_source is None:
+        host_api_source = sd.query_hostapis
+    error_code: Optional[str] = None
+    device_index: Optional[int] = None
+    device_info: Optional[Any] = None
+    try:
+        device_snapshot = tuple(device_source())
+        host_api_snapshot = tuple(host_api_source())
+        device_index = audio_devices.resolve_microphone_device(
+            configured_value,
+            device_snapshot,
+            host_api_snapshot,
+        )
+        if device_index is None:
+            return None, None
+        device_info = device_snapshot[device_index]
+    except audio_devices.MicrophoneSelectionError as exc:
+        error_code = exc.code
+    except Exception:
+        error_code = audio_devices.ERROR_SNAPSHOT_UNAVAILABLE
+    if error_code is not None:
+        # Wyjście z bloku except usuwa niejawny kontekst, który mógłby zawierać
+        # nazwę urządzenia albo szczegóły błędu sterownika.
+        raise microphone_selection_app_error(error_code, translator)
+    return device_index, device_info
+
+
 class CustomOpenTargetError(ValueError):
     """Raised without echoing a potentially sensitive configured target."""
 
@@ -413,19 +700,30 @@ def deep_merge(defaults: dict[str, Any], loaded: dict[str, Any]) -> dict[str, An
     result: dict[str, Any] = {}
     for key, default_value in defaults.items():
         if key not in loaded:
-            result[key] = default_value
+            # Konfiguracja jest dalej modyfikowana przez panel ustawień. Nie
+            # wolno więc zwracać referencji do zagnieżdżonych DEFAULT_CONFIG,
+            # bo zapis starszego config.json zmieniałby fabryczne wartości w
+            # tym samym procesie (włącznie z listą własnych komend).
+            result[key] = copy.deepcopy(default_value)
         elif isinstance(default_value, dict):
-            if isinstance(loaded[key], dict):
+            if key == "custom_commands" and not (
+                command_engine.custom_commands_schema_supported(loaded[key])
+            ):
+                # Nowszy lub nieznany schemat jest nieprzezroczysty dla tej
+                # wersji. Nie wolno do niego wstrzykiwać pól schema-1 ani
+                # zmieniać go przy zapisie niezwiązanych ustawień.
+                result[key] = copy.deepcopy(loaded[key])
+            elif isinstance(loaded[key], dict):
                 result[key] = deep_merge(default_value, loaded[key])
             else:
                 # Zły typ w ręcznie edytowanym config.json nie może
                 # wywrócić programu w trakcie dyktowania.
-                result[key] = default_value
+                result[key] = copy.deepcopy(default_value)
         else:
-            result[key] = loaded[key]
+            result[key] = copy.deepcopy(loaded[key])
     for key, value in loaded.items():
         if key not in result:
-            result[key] = value
+            result[key] = copy.deepcopy(value)
     return result
 
 
@@ -495,14 +793,60 @@ def apply_quick_profile(config: dict[str, Any], profile_name: str) -> dict[str, 
     return result
 
 
-def request_app_restart() -> None:
-    """Poproś działającą instancję o ponowne uruchomienie po zapisie ustawień."""
+def request_app_restart() -> int:
+    """Poproś działającą instancję o restart i zwróć znacznik żądania."""
     ensure_directories()
+    requested_at_ns = time.time_ns()
     temp_path = RESTART_REQUEST_PATH.with_name(
         f"{RESTART_REQUEST_PATH.name}.{os.getpid()}.tmp"
     )
-    temp_path.write_text(f"{time.time():.6f}\n", encoding="ascii")
+    temp_path.write_text(f"v1:{requested_at_ns}\n", encoding="ascii")
     os.replace(temp_path, RESTART_REQUEST_PATH)
+    return requested_at_ns
+
+
+def parse_restart_request_timestamp_ns(value: str) -> Optional[int]:
+    """Odczytaj bieżący format v1 oraz znacznik sekundowy ze starszych wersji."""
+
+    raw = str(value).strip()
+    try:
+        if raw.startswith("v1:"):
+            timestamp_ns = int(raw[3:])
+        else:
+            legacy_seconds = float(raw)
+            if not math.isfinite(legacy_seconds):
+                return None
+            timestamp_ns = int(legacy_seconds * 1_000_000_000)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return timestamp_ns if timestamp_ns > 0 else None
+
+
+def take_fresh_restart_request(not_before_ns: int) -> Optional[str]:
+    """Atomowo przejmij request i odrzuć plik pochodzący ze starego procesu."""
+
+    claimed_path = RESTART_REQUEST_PATH.with_name(
+        f"{RESTART_REQUEST_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.claimed"
+    )
+    try:
+        os.replace(RESTART_REQUEST_PATH, claimed_path)
+    except FileNotFoundError:
+        return None
+    try:
+        request_text = claimed_path.read_text(encoding="ascii").strip()
+    finally:
+        claimed_path.unlink(missing_ok=True)
+    timestamp_ns = parse_restart_request_timestamp_ns(request_text)
+    if timestamp_ns is None or timestamp_ns < max(0, int(not_before_ns)):
+        logging.info("Pominięto nieaktualną prośbę o restart ustawień")
+        return None
+    return request_text
+
+
+def discard_pending_restart_request() -> None:
+    """Usuń request bez odbiorcy przed uruchomieniem nowej instancji."""
+
+    RESTART_REQUEST_PATH.unlink(missing_ok=True)
 
 
 @lru_cache(maxsize=4)
@@ -806,17 +1150,30 @@ def partition_custom_command_items(
     programu. Panel ich nie wykonuje i nie pokazuje jako aktywnych, ale nie może
     ich po cichu usuwać podczas zapisu zupełnie innego ustawienia.
     """
+    settings = config.get("custom_commands", {})
+    if not command_engine.custom_commands_schema_supported(settings):
+        raw_items = settings.get("items", []) if isinstance(settings, dict) else []
+        unmanaged = (
+            [copy.deepcopy(item) for item in raw_items]
+            if isinstance(raw_items, list)
+            else []
+        )
+        return [], {}, unmanaged
+
     valid_items = configured_custom_commands(config)
     valid_keys = {
-        normalize_custom_command_phrase(item["phrase"])
+        (
+            str(item.get("match", command_engine.MATCH_EXACT)),
+            normalize_custom_command_phrase(item["phrase"]),
+        )
         for item in valid_items
     }
-    settings = config.get("custom_commands", {})
     raw_items = settings.get("items", []) if isinstance(settings, dict) else []
     if not isinstance(raw_items, list):
         raw_items = []
 
     original_by_key: dict[str, dict[str, Any]] = {}
+    seen_valid_keys: set[tuple[str, str]] = set()
     unmanaged: list[Any] = []
     for raw_item in raw_items:
         single_config = {
@@ -830,19 +1187,82 @@ def partition_custom_command_items(
             if single
             else ""
         )
+        match_key = (
+            str(single[0].get("match", command_engine.MATCH_EXACT))
+            if single
+            else ""
+        )
+        valid_key = (match_key, normalized)
         if (
-            normalized in valid_keys
-            and normalized not in original_by_key
+            valid_key in valid_keys
+            and valid_key not in seen_valid_keys
             and isinstance(raw_item, dict)
         ):
             original_copy = copy.deepcopy(raw_item)
-            original_by_key[normalized] = original_copy
+            original_by_key.setdefault(normalized, original_copy)
             command_id = single[0].get("id") if single else None
             if isinstance(command_id, str) and command_id:
                 original_by_key[f"id:{command_id}"] = copy.deepcopy(raw_item)
+            seen_valid_keys.add(valid_key)
         else:
             unmanaged.append(copy.deepcopy(raw_item))
     return valid_items, original_by_key, unmanaged
+
+
+def custom_commands_settings_for_save(
+    original: Any,
+    *,
+    enabled: bool,
+    trigger: str,
+    items: list[Any],
+) -> Any:
+    """Update only a schema understood by this build; preserve foreign data."""
+
+    if not command_engine.custom_commands_schema_supported(original):
+        return copy.deepcopy(original)
+    updated = copy.deepcopy(dict(original))
+    updated.update(
+        {
+            "schema_version": command_engine.CUSTOM_COMMANDS_SCHEMA_VERSION,
+            "enabled": enabled is True,
+            "trigger": trigger,
+            "items": copy.deepcopy(items),
+        }
+    )
+    return updated
+
+
+def custom_command_context_denial(
+    context: command_engine.ExecutionContext,
+    *,
+    now: Optional[float] = None,
+    require_foreground: bool = False,
+) -> Optional[str]:
+    """Return a stable denial code for stale or incomplete command context."""
+
+    captured_at = context.captured_at
+    if (
+        type(captured_at) not in (int, float)
+        or not math.isfinite(captured_at)
+        or captured_at <= 0
+    ):
+        return "invalid_command_context"
+    current = time.monotonic() if now is None else now
+    if (
+        type(current) not in (int, float)
+        or not math.isfinite(current)
+        or current < captured_at
+        or current - captured_at > MAX_CUSTOM_COMMAND_CONTEXT_AGE_SECONDS
+    ):
+        return "stale_command_context"
+    if require_foreground and (
+        type(context.foreground_hwnd) is not int
+        or type(context.foreground_pid) is not int
+        or context.foreground_hwnd <= 0
+        or context.foreground_pid <= 0
+    ):
+        return "command_target_unavailable"
+    return None
 
 
 def custom_command_lookup(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -867,6 +1287,24 @@ def match_custom_command(
     return item
 
 
+def format_custom_command_confirmation_preview(
+    action: str,
+    value: str,
+    translator: Optional[Translator] = None,
+) -> str:
+    """Render exact boundaries and line endings without echoing them to logs."""
+
+    if action != "paste_text":
+        return value
+    translator = translator or Translator("pl")
+    visible = value.replace("\r", "␍").replace("\n", "␊\n")
+    return translator.t(
+        "Granice treści: ⟦{visible}⟧\n␍ oznacza CR, a ␊ oznacza LF/Enter.",
+        "Content boundaries: ⟦{visible}⟧\n␍ means CR; ␊ means LF/Enter.",
+        visible=visible,
+    )
+
+
 def confirm_custom_command_action(
     action: str,
     value: str,
@@ -885,7 +1323,11 @@ def confirm_custom_command_action(
             "wklejenie wielowierszowego tekstu",
             "inserting multi-line text",
         )
-    preview = value.strip()
+    preview = format_custom_command_confirmation_preview(
+        action,
+        value,
+        translator,
+    )
     message = translator.t(
         "Mówik rozpoznał komendę proszącą o {action}.\n\n"
         "Czy na pewno chcesz kontynuować?\n\n{preview}",
@@ -1347,9 +1789,70 @@ def windows_set_clipboard_text(
         ) from exc
 
 
+def windows_get_clipboard_text(
+    translator: Optional[Translator] = None,
+) -> str:
+    """Read clipboard text for a last-moment integrity check before Ctrl+V."""
+
+    translator = translator or Translator("auto")
+    if os.name != "nt":
+        raise AppError(
+            translator.t(
+                "Schowek jest obsługiwany wyłącznie na Windowsie.",
+                "The clipboard is supported only on Windows.",
+            )
+        )
+    try:
+        value = pyperclip.paste()
+    except pyperclip.PyperclipException as exc:
+        raise AppError(
+            translator.t(
+                "Nie udało się sprawdzić zawartości schowka.",
+                "The clipboard contents could not be verified.",
+            )
+        ) from exc
+    return value if isinstance(value, str) else str(value)
+
+
+def foreground_identity_matches(expected: tuple[int, int]) -> bool:
+    """Fail closed unless the same positive HWND/PID is still foreground."""
+
+    if (
+        not isinstance(expected, tuple)
+        or len(expected) != 2
+        or type(expected[0]) is not int
+        or type(expected[1]) is not int
+        or expected[0] <= 0
+        or expected[1] <= 0
+    ):
+        return False
+    current = windows_actions.capture_foreground_identity()
+    return (
+        current.is_valid
+        and current.hwnd == expected[0]
+        and current.pid == expected[1]
+    )
+
+
+def require_foreground_identity(
+    expected: tuple[int, int],
+    translator: Optional[Translator] = None,
+) -> None:
+    if foreground_identity_matches(expected):
+        return
+    translator = translator or Translator("auto")
+    raise AppError(
+        translator.t(
+            "Aktywne okno zmieniło się — tekst nie został wklejony.",
+            "The active window changed, so the text was not pasted.",
+        )
+    )
+
+
 def windows_type_unicode_text(
     text: str,
     translator: Optional[Translator] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
     """Wpisz tekst przez Win32 SendInput bez używania schowka."""
     translator = translator or Translator("auto")
@@ -1420,6 +1923,8 @@ def windows_type_unicode_text(
         for index in range(0, len(encoded), 2)
     ]
     for offset in range(0, len(code_units), 256):
+        if cancel_event is not None and cancel_event.is_set():
+            raise OperationCancelled()
         inputs: list[INPUT] = []
         for code_unit in code_units[offset : offset + 256]:
             press = INPUT()
@@ -1460,6 +1965,9 @@ def paste_text(
     config: dict[str, Any],
     *,
     append_space_override: Optional[bool] = None,
+    expected_foreground: Optional[tuple[int, int]] = None,
+    verify_clipboard_before_paste: bool = False,
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
     translator = Translator.from_config(config)
     settings = config.get("paste", {})
@@ -1471,6 +1979,9 @@ def paste_text(
         else bool(append_space_override)
     )
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise OperationCancelled()
+
     if not paste_enabled and not copy_to_clipboard:
         raise AppError(
             translator.t(
@@ -1479,32 +1990,71 @@ def paste_text(
             )
         )
 
-    # Schowek zawiera dokładną transkrypcję. Ewentualną końcową spację
-    # wysyłamy osobno, dzięki czemu nie zostaje dopisana do kopiowanego tekstu.
-    if copy_to_clipboard:
-        windows_set_clipboard_text(text, translator)
+    if expected_foreground is not None and paste_enabled and not copy_to_clipboard:
+        raise AppError(
+            translator.t(
+                "Własne komendy wymagają schowka, aby bezpiecznie wkleić tekst.",
+                "Custom commands require the clipboard for safe text insertion.",
+            )
+        )
+
+    if expected_foreground is not None:
+        require_foreground_identity(expected_foreground, translator)
 
     if not paste_enabled:
+        if cancel_event is not None and cancel_event.is_set():
+            raise OperationCancelled()
+        if copy_to_clipboard:
+            windows_set_clipboard_text(text, translator)
         return
 
     delay = max(0, int(settings.get("delay_ms", 25))) / 1000
     if delay:
         time.sleep(delay)
+    if cancel_event is not None and cancel_event.is_set():
+        raise OperationCancelled()
+    if expected_foreground is not None:
+        require_foreground_identity(expected_foreground, translator)
 
     if copy_to_clipboard:
+        # Ustaw tekst dopiero po opóźnieniu. Następnie sprawdź dokładną
+        # zawartość i fokus bezpośrednio przed pojedynczym Ctrl+V.
+        if cancel_event is not None and cancel_event.is_set():
+            raise OperationCancelled()
+        windows_set_clipboard_text(text, translator)
+        if cancel_event is not None and cancel_event.is_set():
+            raise OperationCancelled()
+        if expected_foreground is not None:
+            require_foreground_identity(expected_foreground, translator)
+        if verify_clipboard_before_paste:
+            if windows_get_clipboard_text(translator) != text:
+                raise AppError(
+                    translator.t(
+                        "Schowek zmienił się — tekst nie został wklejony.",
+                        "The clipboard changed, so the text was not pasted.",
+                    )
+                )
+        if expected_foreground is not None:
+            require_foreground_identity(expected_foreground, translator)
+        if cancel_event is not None and cancel_event.is_set():
+            raise OperationCancelled()
         controller = keyboard.Controller()
         with controller.pressed(keyboard.Key.ctrl):
             controller.press("v")
             controller.release("v")
         if append_space and text and not text[-1].isspace():
             time.sleep(0.02)
+            if cancel_event is not None and cancel_event.is_set():
+                raise OperationCancelled()
+            if expected_foreground is not None:
+                require_foreground_identity(expected_foreground, translator)
             controller.press(keyboard.Key.space)
             controller.release(keyboard.Key.space)
     else:
         payload = text
         if append_space and text and not text[-1].isspace():
             payload += " "
-        windows_type_unicode_text(payload, translator)
+        windows_type_unicode_text(payload, translator, cancel_event)
 
 
 def key_name(key: keyboard.Key | keyboard.KeyCode) -> str:
@@ -2255,10 +2805,49 @@ class FloatingStatusIndicator:
             return False
 
 
-def settings_process_args() -> list[str]:
+def application_process_args() -> list[str]:
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--settings"]
-    return [sys.executable, str(Path(__file__).resolve()), "--settings"]
+        return [sys.executable]
+    return [sys.executable, str(Path(__file__).resolve())]
+
+
+def settings_process_args() -> list[str]:
+    return [*application_process_args(), "--settings"]
+
+
+def is_app_instance_running() -> bool:
+    """Sprawdź mutex głównej aplikacji bez tworzenia nowej instancji."""
+
+    if os.name != "nt":
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenMutexW.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.OpenMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+    SYNCHRONIZE = 0x00100000
+    ctypes.set_last_error(0)
+    handle = kernel32.OpenMutexW(SYNCHRONIZE, False, MUTEX_NAME)
+    if handle:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return True
+    error = ctypes.get_last_error()
+    if error == 2:  # ERROR_FILE_NOT_FOUND
+        return False
+    if error == 5:  # ERROR_ACCESS_DENIED oznacza, że obiekt jednak istnieje.
+        return True
+    raise ctypes.WinError(error)
+
+
+def restart_or_launch_app_after_settings() -> str:
+    """Zastosuj zapis do działającej instancji albo uruchom nową bez stale IPC."""
+
+    if is_app_instance_running():
+        request_app_restart()
+        return "restart_requested"
+    discard_pending_restart_request()
+    subprocess.Popen(application_process_args(), cwd=str(APP_ROOT))
+    return "app_started"
 
 
 def run_settings_window() -> int:
@@ -2275,9 +2864,9 @@ def run_settings_window() -> int:
         raise AppError(
             t(
                 "Brakuje składnika Tkinter. Zainstaluj standardowy 64-bitowy "
-                "Python 3.10–3.12 z python.org albo uruchom "
+                "Python 3.11–3.12 z python.org albo uruchom "
                 "NAPRAW_INSTALACJE.cmd.",
-                "Tkinter is missing. Install standard 64-bit Python 3.10–3.12 "
+                "Tkinter is missing. Install standard 64-bit Python 3.11–3.12 "
                 "from python.org or run NAPRAW_INSTALACJE.cmd.",
             )
         ) from exc
@@ -2736,6 +3325,10 @@ def run_settings_window() -> int:
         "English": "en",
     }
     microphone_values: dict[str, Any] = {}
+    microphone_choice_state: dict[str, Optional[MicrophoneChoiceState]] = {
+        "current": None
+    }
+    microphone_refresh_unset = object()
 
     def display_for_value(
         mapping: dict[str, Any],
@@ -2827,11 +3420,18 @@ def run_settings_window() -> int:
     trigger_var = tk.StringVar(
         value=ensure_trigger_display(config.get("trigger", "keyboard:f8"))
     )
-    custom_commands_config = config.get("custom_commands", {})
+    custom_commands_source = config.get("custom_commands", {})
+    custom_commands_schema_is_supported = (
+        command_engine.custom_commands_schema_supported(custom_commands_source)
+    )
+    custom_commands_config = custom_commands_source
     if not isinstance(custom_commands_config, dict):
         custom_commands_config = {}
     custom_commands_enabled_var = tk.BooleanVar(
-        value=bool(custom_commands_config.get("enabled", False))
+        value=(
+            custom_commands_schema_is_supported
+            and custom_commands_config.get("enabled", False) is True
+        )
     )
     custom_commands_trigger_var = tk.StringVar(
         value=ensure_trigger_display(
@@ -2844,7 +3444,8 @@ def run_settings_window() -> int:
         unmanaged_custom_command_items,
     ) = partition_custom_command_items(config)
     preserve_original_custom_commands_enabled = bool(
-        custom_commands_config.get("enabled", False)
+        custom_commands_schema_is_supported
+        and custom_commands_config.get("enabled", False) is True
         and not custom_command_items
         and unmanaged_custom_command_items
     )
@@ -4150,40 +4751,34 @@ def run_settings_window() -> int:
     )
     microphone_combo.grid(row=0, column=0, sticky="ew")
 
-    def refresh_microphones(selected: Any = None) -> None:
-        if selected is None and microphone_var.get() in microphone_values:
-            selected = microphone_values[microphone_var.get()]
-        microphone_values.clear()
-        microphone_values[
-            t("Domyślny mikrofon Windows", "Default Windows microphone")
-        ] = None
+    def refresh_microphones(selected: Any = microphone_refresh_unset) -> None:
+        if selected is microphone_refresh_unset:
+            current_state = microphone_choice_state["current"]
+            current_label = microphone_var.get()
+            if current_state is not None and current_label in current_state.values:
+                selected = copy.deepcopy(current_state.values[current_label])
+            else:
+                selected = copy.deepcopy(config.get("microphone"))
         try:
-            devices = sd.query_devices()
-            for index, info in enumerate(devices):
-                if int(info.get("max_input_channels", 0)) <= 0:
-                    continue
-                name = str(
-                    info.get(
-                        "name",
-                        t(
-                            "Urządzenie {index}",
-                            "Device {index}",
-                            index=index,
-                        ),
-                    )
-                )
-                microphone_values[f"{index}: {name}"] = index
-        except Exception as exc:
-            logging.warning("Nie udało się pobrać listy mikrofonów: %s", exc)
-        microphone_combo["values"] = list(microphone_values.keys())
-        microphone_var.set(
-            display_for_value(
-                microphone_values,
+            state = build_microphone_choice_state(
                 selected,
-                custom_prefix=t("Zapisane urządzenie", "Saved device"),
+                sd.query_devices(),
+                sd.query_hostapis(),
+                translator,
             )
-        )
+        except Exception:
+            logging.warning(
+                "Nie udało się bezpiecznie odświeżyć listy mikrofonów"
+            )
+            state = build_unavailable_microphone_choice_state(
+                selected,
+                translator,
+            )
+        microphone_choice_state["current"] = state
+        microphone_values.clear()
+        microphone_values.update(state.values)
         microphone_combo["values"] = list(microphone_values.keys())
+        microphone_var.set(state.selected_label)
 
     ttk.Button(
         microphone_row,
@@ -5222,6 +5817,12 @@ def run_settings_window() -> int:
             phrase = phrase_var.get().strip()
             value = value_text.get("1.0", "end-1c")
             action = action_values.get(action_var.get(), "paste_text")
+            requested_match_mode = (
+                command_engine.MATCH_PREFIX_TAIL
+                if action == command_engine.ACTION_OPEN_TERMINAL
+                and terminal_spoken_tail_var.get()
+                else command_engine.MATCH_EXACT
+            )
             if not normalize_custom_command_phrase(phrase):
                 editor_error_var.set(
                     t(
@@ -5245,7 +5846,12 @@ def run_settings_window() -> int:
             for other_index, other in enumerate(custom_command_items):
                 if other_index == index:
                     continue
-                if normalize_custom_command_phrase(other["phrase"]) == normalized_phrase:
+                if (
+                    normalize_custom_command_phrase(other["phrase"])
+                    == normalized_phrase
+                    and str(other.get("match", command_engine.MATCH_EXACT))
+                    == requested_match_mode
+                ):
                     editor_error_var.set(
                         t(
                             "Istnieje już komenda z taką samą frazą.",
@@ -5265,15 +5871,10 @@ def run_settings_window() -> int:
                 )
                 phrase_entry.focus_set()
                 return
-            match_mode = "exact"
+            match_mode = requested_match_mode
             options: Optional[dict[str, Any]] = None
             if action == "open_terminal":
                 value = ""
-                match_mode = (
-                    "prefix_tail"
-                    if terminal_spoken_tail_var.get()
-                    else "exact"
-                )
                 cwd_source = cwd_source_values.get(
                     cwd_source_var.get(),
                     "active_explorer",
@@ -5290,14 +5891,11 @@ def run_settings_window() -> int:
                         )
                         terminal_fixed_cwd_entry.focus_set()
                         return
-                    candidate = Path(
-                        os.path.expandvars(raw_fixed_cwd)
-                    ).expanduser()
-                    if (
-                        not candidate.is_absolute()
-                        or str(candidate).startswith(("\\\\", "//"))
-                        or not candidate.is_dir()
-                    ):
+                    resolved_directory = windows_actions.resolve_working_directory(
+                        "fixed",
+                        raw_fixed_cwd,
+                    )
+                    if not resolved_directory.ok or resolved_directory.path is None:
                         editor_error_var.set(
                             t(
                                 "Folder startowy musi być istniejącym lokalnym katalogiem.",
@@ -5306,7 +5904,7 @@ def run_settings_window() -> int:
                         )
                         terminal_fixed_cwd_entry.focus_set()
                         return
-                    fixed_cwd = str(candidate.resolve())
+                    fixed_cwd = str(resolved_directory.path)
                 options = {
                     "cwd_source": cwd_source,
                     "host": terminal_host_values.get(
@@ -5663,20 +6261,32 @@ def run_settings_window() -> int:
 
     def refresh_unmanaged_custom_commands_notice() -> None:
         count = len(unmanaged_custom_command_items)
-        if not count:
+        if not count and custom_commands_schema_is_supported:
             unmanaged_commands_notice.grid_remove()
             return
-        unmanaged_commands_notice_var.set(
-            t(
-                "Liczba ukrytych wpisów: {count}. Są nieprawidłowe, niejednoznaczne "
-                "albo pochodzą z nowszej wersji. Nie zostaną usunięte przy zapisie. "
-                "Otwórz konfigurację, aby poprawić je ręcznie; panel zostanie zamknięty.",
-                "Hidden entries: {count}. They are invalid, ambiguous, or come "
-                "from a newer version. They will not be removed when you save. "
-                "Open the configuration to correct them manually; Settings will close.",
-                count=count,
+        if not custom_commands_schema_is_supported:
+            unmanaged_commands_notice_var.set(
+                t(
+                    "Własne komendy używają nieobsługiwanego schematu. Ta sekcja "
+                    "pozostanie dokładnie bez zmian i nie zostanie uruchomiona. "
+                    "Otwórz konfigurację, aby poprawić ją ręcznie; panel zostanie zamknięty.",
+                    "Custom commands use an unsupported schema. This section will "
+                    "remain exactly unchanged and will not run. Open the configuration "
+                    "to correct it manually; Settings will close.",
+                )
             )
-        )
+        else:
+            unmanaged_commands_notice_var.set(
+                t(
+                    "Liczba ukrytych wpisów: {count}. Są nieprawidłowe, niejednoznaczne "
+                    "albo pochodzą z nowszej wersji. Nie zostaną usunięte przy zapisie. "
+                    "Otwórz konfigurację, aby poprawić je ręcznie; panel zostanie zamknięty.",
+                    "Hidden entries: {count}. They are invalid, ambiguous, or come "
+                    "from a newer version. They will not be removed when you save. "
+                    "Open the configuration to correct them manually; Settings will close.",
+                    count=count,
+                )
+            )
         unmanaged_commands_notice.grid(
             row=2,
             column=0,
@@ -6465,8 +7075,8 @@ def run_settings_window() -> int:
             and not custom_commands_enabled_touched["value"]
             and not custom_command_items
         ):
-            custom_commands_enabled_for_save = bool(
-                custom_commands_config.get("enabled", False)
+            custom_commands_enabled_for_save = (
+                custom_commands_config.get("enabled", False) is True
             )
         model = str(model_values.get(model_var.get(), model_var.get())).strip()
         device = str(device_values.get(device_var.get(), device_var.get())).strip()
@@ -6507,18 +7117,33 @@ def run_settings_window() -> int:
                     "Choose an interface language.",
                 )
             )
-        if microphone_var.get() not in microphone_values:
+        current_microphone_state = microphone_choice_state["current"]
+        if current_microphone_state is None:
             focus_validation_error("dictation", microphone_combo)
             raise AppError(
-                t("Wybierz mikrofon z listy.", "Choose a microphone from the list.")
+                t(
+                    "Nie udało się wczytać ustawień mikrofonu. Odśwież listę i "
+                    "wybierz urządzenie.",
+                    "The microphone settings could not be loaded. Refresh the "
+                    "list and choose a device.",
+                )
             )
+        try:
+            selected_microphone = microphone_config_value_for_choice(
+                current_microphone_state,
+                microphone_var.get(),
+                translator,
+            )
+        except AppError:
+            focus_validation_error("dictation", microphone_combo)
+            raise
 
         updated["trigger"] = trigger
         updated["model"] = model
         updated["device"] = device
         updated["language"] = language
         updated["ui_language"] = ui_language
-        updated["microphone"] = microphone_values[microphone_var.get()]
+        updated["microphone"] = selected_microphone
         updated["cpu_threads"] = parse_int(
             cpu_threads_var,
             t("Wątki CPU", "CPU threads"),
@@ -6693,24 +7318,14 @@ def run_settings_window() -> int:
         )
         updated.setdefault("voice_commands", {})
         updated["voice_commands"]["enabled"] = bool(voice_commands_var.get())
-        # Zachowaj klucze z nowszych wersji lub ręcznie dodane metadane.
-        # Panel aktualizuje tylko pola, które rzeczywiście rozumie.
-        updated_custom_commands = updated.get("custom_commands", {})
-        if not isinstance(updated_custom_commands, dict):
-            updated_custom_commands = {}
-        else:
-            updated_custom_commands = copy.deepcopy(updated_custom_commands)
-        updated_custom_commands.update(
-            {
-                "schema_version": int(
-                    DEFAULT_CONFIG["custom_commands"]["schema_version"]
-                ),
-                "enabled": custom_commands_enabled_for_save,
-                "trigger": custom_trigger,
-                "items": custom_command_items_for_save(),
-            }
+        # Nowszy/obcy schemat pozostaje nieprzezroczysty. Stary panel nie może
+        # go aktywować, interpretować ani po cichu obniżyć jego wersji.
+        updated["custom_commands"] = custom_commands_settings_for_save(
+            updated.get("custom_commands", {}),
+            enabled=custom_commands_enabled_for_save,
+            trigger=custom_trigger,
+            items=custom_command_items_for_save(),
         )
-        updated["custom_commands"] = updated_custom_commands
         updated.setdefault("ollama_cleanup", {})
         ollama_active = bool(ollama_enabled_var.get())
         updated["ollama_cleanup"].update(
@@ -6801,6 +7416,7 @@ def run_settings_window() -> int:
         "baseline": tuple(variable.get() for variable in tracked_variables),
         "dirty": False,
     }
+    restart_pending = {"value": False}
 
     status_dot = tk.Label(
         footer,
@@ -6826,7 +7442,11 @@ def run_settings_window() -> int:
     def update_status_indicator(*args) -> None:
         if status_level["value"] == "error":
             color = colors["danger"]
-        elif dirty_state["dirty"] or status_level["value"] == "warning":
+        elif (
+            dirty_state["dirty"]
+            or restart_pending["value"]
+            or status_level["value"] == "warning"
+        ):
             color = colors["warning"]
         else:
             color = colors["success"]
@@ -6842,14 +7462,27 @@ def run_settings_window() -> int:
                 "warning",
             )
         elif not dirty_state["dirty"] and was_dirty:
-            set_status(
-                t(
-                    "Wszystko gotowe — ustawienia są zapisane.",
-                    "Everything is ready — settings are saved.",
+            if restart_pending["value"]:
+                set_status(
+                    t(
+                        "Ustawienia są zapisane i czekają na ponowne uruchomienie.",
+                        "Settings are saved and waiting for a restart.",
+                    ),
+                    "warning",
                 )
-            )
+            else:
+                set_status(
+                    t(
+                        "Wszystko gotowe — ustawienia są zapisane.",
+                        "Everything is ready — settings are saved.",
+                    )
+                )
         apply_button.configure(
-            state="normal" if dirty_state["dirty"] else "disabled"
+            state=(
+                "normal"
+                if dirty_state["dirty"] or restart_pending["value"]
+                else "disabled"
+            )
         )
         update_status_indicator()
 
@@ -6859,40 +7492,69 @@ def run_settings_window() -> int:
 
     def save_from_window(apply_now: bool) -> None:
         nonlocal config
+        settings_saved = False
         try:
             updated = collect_config()
             save_config(updated)
+            settings_saved = True
             config = updated
             dirty_state["baseline"] = tuple(
                 variable.get() for variable in tracked_variables
             )
             dirty_state["dirty"] = False
-            apply_button.configure(state="disabled")
             if apply_now:
-                request_app_restart()
-                set_status(
-                    t(
+                runtime_result = restart_or_launch_app_after_settings()
+                restart_pending["value"] = False
+                apply_button.configure(state="disabled")
+                if runtime_result == "restart_requested":
+                    message = t(
                         "Zapisano — Mówik stosuje zmiany…",
                         "Saved — Mówik is applying changes…",
                     )
-                )
+                else:
+                    message = t(
+                        "Zapisano — uruchamiam Mówika…",
+                        "Saved — starting Mówik…",
+                    )
+                set_status(message)
                 root.after(180, root.destroy)
             else:
+                restart_pending["value"] = True
+                apply_button.configure(state="normal")
                 set_status(
                     t(
                         "Zapisano. Zmiany zaczną działać po ponownym uruchomieniu Mówika.",
                         "Saved. Changes take effect after Mówik is restarted.",
-                    )
+                    ),
+                    "warning",
                 )
         except Exception as exc:
-            logging.exception("Nie udało się zapisać ustawień")
-            set_status(
-                t(
-                    "Błąd zapisywania ustawień.",
-                    "Could not save settings.",
-                ),
-                "error",
-            )
+            logging.exception("Nie udało się zapisać lub zastosować ustawień")
+            if settings_saved and apply_now:
+                restart_pending["value"] = True
+                apply_button.configure(state="normal")
+                set_status(
+                    t(
+                        "Ustawienia zapisano, ale nie udało się uruchomić Mówika ponownie.",
+                        "Settings were saved, but Mówik could not be restarted.",
+                    ),
+                    "error",
+                )
+            else:
+                apply_button.configure(
+                    state=(
+                        "normal"
+                        if dirty_state["dirty"] or restart_pending["value"]
+                        else "disabled"
+                    )
+                )
+                set_status(
+                    t(
+                        "Błąd zapisywania ustawień.",
+                        "Could not save settings.",
+                    ),
+                    "error",
+                )
             messagebox.showerror(
                 t(
                     "{app} — błąd ustawień",
@@ -6905,22 +7567,23 @@ def run_settings_window() -> int:
 
     def restore_defaults() -> None:
         trigger_var.set(ensure_trigger_display(DEFAULT_CONFIG["trigger"]))
-        default_custom_commands = DEFAULT_CONFIG["custom_commands"]
-        custom_commands_enabled_var.set(
-            bool(default_custom_commands["enabled"])
-        )
-        custom_commands_trigger_var.set(
-            ensure_trigger_display(default_custom_commands["trigger"])
-        )
-        custom_command_items.clear()
-        custom_command_items.extend(
-            dict(item) for item in default_custom_commands["items"]
-        )
-        original_custom_command_items_by_key.clear()
-        unmanaged_custom_command_items.clear()
-        update_custom_commands_revision()
-        render_custom_command_cards()
-        refresh_unmanaged_custom_commands_notice()
+        if custom_commands_schema_is_supported:
+            default_custom_commands = DEFAULT_CONFIG["custom_commands"]
+            custom_commands_enabled_var.set(
+                bool(default_custom_commands["enabled"])
+            )
+            custom_commands_trigger_var.set(
+                ensure_trigger_display(default_custom_commands["trigger"])
+            )
+            custom_command_items.clear()
+            custom_command_items.extend(
+                dict(item) for item in default_custom_commands["items"]
+            )
+            original_custom_command_items_by_key.clear()
+            unmanaged_custom_command_items.clear()
+            update_custom_commands_revision()
+            render_custom_command_cards()
+            refresh_unmanaged_custom_commands_notice()
         model_var.set(display_for_value(model_values, DEFAULT_CONFIG["model"]))
         device_var.set(display_for_value(device_values, DEFAULT_CONFIG["device"]))
         language_var.set(
@@ -6974,32 +7637,40 @@ def run_settings_window() -> int:
         if dirty_state["dirty"]:
             set_status(
                 t(
-                    "Przywrócono wartości domyślne. Zapisz i uruchom ponownie, aby je zachować.",
-                    "Defaults restored. Save and restart to keep them.",
+                    "Przywrócono domyślne wartości obsługiwanych ustawień. "
+                    "Zapisz i uruchom ponownie, aby je zachować.",
+                    "Supported settings were reset to defaults. Save and restart "
+                    "to keep them.",
                 ),
                 "warning",
             )
         else:
             set_status(
                 t(
-                    "Wszystkie ustawienia mają już wartości domyślne.",
-                    "All settings are already at their defaults.",
+                    "Wszystkie obsługiwane ustawienia mają już wartości domyślne.",
+                    "All supported settings are already at their defaults.",
                 )
             )
 
     def confirm_restore_defaults() -> None:
+        prompt = t(
+            "Przywrócić wszystkie obsługiwane ustawienia, również zaawansowane? "
+            "Nic nie zostanie zapisane, dopóki nie wybierzesz „Zapisz i uruchom ponownie”.",
+            "Reset every supported setting, including advanced options? Nothing is saved "
+            "until you choose “Save and restart”.",
+        )
+        if not custom_commands_schema_is_supported:
+            prompt += t(
+                " Nieobsługiwana sekcja własnych komend pozostanie bez zmian.",
+                " The unsupported custom-command section will remain unchanged.",
+            )
         if not messagebox.askyesno(
             t(
                 "{app} — przywróć wszystkie ustawienia",
                 "{app} — Reset all settings",
                 app=APP_DISPLAY_NAME,
             ),
-            t(
-                "Przywrócić wszystkie ustawienia, również zaawansowane? "
-                "Nic nie zostanie zapisane, dopóki nie wybierzesz „Zapisz i uruchom ponownie”.",
-                "Reset every setting, including advanced options? Nothing is saved "
-                "until you choose “Save and restart”.",
-            ),
+            prompt,
             parent=root,
         ):
             return
@@ -7045,7 +7716,11 @@ def run_settings_window() -> int:
     root.bind("<Control-s>", lambda event: save_from_window(False))
     root.bind(
         "<Control-Return>",
-        lambda event: save_from_window(True) if dirty_state["dirty"] else None,
+        lambda event: (
+            save_from_window(True)
+            if dirty_state["dirty"] or restart_pending["value"]
+            else None
+        ),
     )
     root.bind("<Escape>", lambda event: close_window())
     root.protocol("WM_DELETE_WINDOW", close_window)
@@ -7060,7 +7735,8 @@ class ContinuousRecorder:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         self.sample_rate = SAMPLE_RATE
-        self.device = config.get("microphone")
+        self.device_selector = copy.deepcopy(config.get("microphone"))
+        self.device: Optional[int] = None
         self.pre_roll_samples = 0
         self._set_sample_rate(SAMPLE_RATE)
         self._lock = threading.Lock()
@@ -7068,6 +7744,9 @@ class ContinuousRecorder:
         self._ring_samples = 0
         self._recording = False
         self._recorded: list[np.ndarray] = []
+        self._recording_samples = 0
+        self._released_recording_samples: Optional[int] = None
+        self.last_recording_samples = 0
         self._stream: Optional[sd.InputStream] = None
 
     def _set_sample_rate(self, sample_rate: int) -> None:
@@ -7096,11 +7775,33 @@ class ContinuousRecorder:
         return stream
 
     def start(self) -> None:
-        try:
-            device_info = sd.query_devices(self.device, "input")
-            default_rate = int(round(float(device_info["default_samplerate"])))
-        except Exception:
-            default_rate = SAMPLE_RATE
+        translator = Translator.from_config(self.config)
+        if self.device_selector is None:
+            self.device = None
+            try:
+                device_info = sd.query_devices(None, "input")
+                default_rate = int(
+                    round(float(device_info["default_samplerate"]))
+                )
+            except Exception:
+                default_rate = SAMPLE_RATE
+        else:
+            self.device, device_info = resolve_runtime_microphone(
+                self.device_selector,
+                translator,
+            )
+            default_rate: Optional[int]
+            try:
+                default_rate = int(
+                    round(float(device_info["default_samplerate"]))
+                )
+            except Exception:
+                default_rate = None
+            if default_rate is None:
+                raise microphone_selection_app_error(
+                    audio_devices.ERROR_SNAPSHOT_MALFORMED,
+                    translator,
+                )
 
         attempts: list[tuple[int, str]] = [(SAMPLE_RATE, "low")]
         if default_rate != SAMPLE_RATE:
@@ -7110,10 +7811,21 @@ class ContinuousRecorder:
 
         last_error: Optional[Exception] = None
         seen: set[tuple[int, str]] = set()
+        first_explicit_attempt = True
         for sample_rate, latency in attempts:
             if (sample_rate, latency) in seen:
                 continue
             seen.add((sample_rate, latency))
+            if self.device_selector is not None:
+                if first_explicit_attempt:
+                    first_explicit_attempt = False
+                else:
+                    # PortAudio indices may change after hot-plug. Never carry
+                    # a failed attempt's numeric index into the next attempt.
+                    self.device, _ = resolve_runtime_microphone(
+                        self.device_selector,
+                        translator,
+                    )
             try:
                 self._set_sample_rate(sample_rate)
                 self._stream = self._open_stream(sample_rate, latency)
@@ -7134,7 +7846,7 @@ class ContinuousRecorder:
                 )
 
         raise AppError(
-            Translator.from_config(self.config).t(
+            translator.t(
                 "Nie udało się otworzyć mikrofonu: {error}",
                 "Could not open the microphone: {error}",
                 error=last_error,
@@ -7161,35 +7873,56 @@ class ContinuousRecorder:
         with self._lock:
             if self._recording:
                 self._recorded.append(chunk)
-            else:
-                self._ring.append(chunk)
-                self._ring_samples += len(chunk)
-                while self._ring and self._ring_samples > self.pre_roll_samples:
-                    excess = self._ring_samples - self.pre_roll_samples
-                    oldest = self._ring[0]
-                    if len(oldest) <= excess:
-                        self._ring.popleft()
-                        self._ring_samples -= len(oldest)
-                    else:
-                        # Zachowaj dokładnie zadany pre-roll zamiast tracić cały
-                        # blok (1024 próbki to aż 64 ms przy 16 kHz).
-                        self._ring[0] = oldest[excess:].copy()
-                        self._ring_samples -= excess
+                self._recording_samples += len(chunk)
+            # Ring zawsze opisuje najnowszy dźwięk. Gdyby zatrzymać go na czas
+            # nagrania, szybkie kolejne naciśnięcie dostałoby pre-roll sprzed
+            # poprzedniej wypowiedzi zamiast jej rzeczywistego końca.
+            self._ring.append(chunk)
+            self._ring_samples += len(chunk)
+            while self._ring and self._ring_samples > self.pre_roll_samples:
+                excess = self._ring_samples - self.pre_roll_samples
+                oldest = self._ring[0]
+                if len(oldest) <= excess:
+                    self._ring.popleft()
+                    self._ring_samples -= len(oldest)
+                else:
+                    # Zachowaj dokładnie zadany pre-roll zamiast tracić cały
+                    # blok (1024 próbki to aż 64 ms przy 16 kHz).
+                    self._ring[0] = oldest[excess:].copy()
+                    self._ring_samples -= excess
 
     def begin(self) -> None:
         with self._lock:
             if self._recording:
                 return
             self._recorded = [part.copy() for part in self._ring]
+            self._recording_samples = 0
+            self._released_recording_samples = None
             self._recording = True
+
+    def mark_release(self) -> None:
+        """Snapshot samples captured while the shortcut was physically held."""
+
+        with self._lock:
+            if self._recording and self._released_recording_samples is None:
+                self._released_recording_samples = self._recording_samples
 
     def finish(self) -> np.ndarray:
         with self._lock:
             if not self._recording:
+                self.last_recording_samples = 0
+                self._released_recording_samples = None
                 return np.empty(0, dtype=np.float32)
             self._recording = False
             parts = self._recorded
             self._recorded = []
+            self.last_recording_samples = (
+                self._recording_samples
+                if self._released_recording_samples is None
+                else self._released_recording_samples
+            )
+            self._recording_samples = 0
+            self._released_recording_samples = None
         if not parts:
             return np.empty(0, dtype=np.float32)
         return np.concatenate(parts).astype(np.float32, copy=False)
@@ -7212,7 +7945,7 @@ class MowikApp:
         custom_settings = config.get("custom_commands", {})
         custom_enabled = bool(
             isinstance(custom_settings, dict)
-            and custom_settings.get("enabled", False)
+            and custom_settings.get("enabled", False) is True
             and self._custom_command_registry.definitions
         )
         if custom_enabled:
@@ -7266,6 +7999,10 @@ class MowikApp:
         )
         self._restart_lock = threading.Lock()
         self._restart_started = False
+        # Request zapisany przez poprzedni proces nie może zrestartować
+        # świeżo uruchomionej aplikacji. Próg pochodzi z początku procesu,
+        # więc obejmuje także request wysłany tuż po utworzeniu mutexu.
+        self._restart_requests_not_before_ns = PROCESS_STARTED_AT_NS
         self.worker = threading.Thread(
             target=self._job_worker, name="TranscriptionWorker", daemon=True
         )
@@ -7325,13 +8062,12 @@ class MowikApp:
 
     def _control_watcher(self) -> None:
         while not self.stop_event.wait(0.35):
-            if not RESTART_REQUEST_PATH.exists():
-                continue
             try:
-                request_text = RESTART_REQUEST_PATH.read_text(
-                    encoding="ascii"
-                ).strip()
-                RESTART_REQUEST_PATH.unlink(missing_ok=True)
+                request_text = take_fresh_restart_request(
+                    self._restart_requests_not_before_ns
+                )
+                if request_text is None:
+                    continue
                 logging.info("Odebrano prośbę o restart ustawień: %s", request_text)
                 self.set_status(
                     self.translator.t(
@@ -7344,10 +8080,6 @@ class MowikApp:
                 return
             except Exception:
                 logging.exception("Nie udało się obsłużyć prośby o restart")
-                try:
-                    RESTART_REQUEST_PATH.unlink(missing_ok=True)
-                except OSError:
-                    pass
 
     def _start_listeners(self) -> None:
         self.keyboard_listener = keyboard.Listener(
@@ -7359,6 +8091,7 @@ class MowikApp:
         self.mouse_listener.start()
 
     def _load_runtime(self) -> None:
+        recorder: Optional[ContinuousRecorder] = None
         try:
             self.set_status(
                 self.translator.t(
@@ -7369,11 +8102,19 @@ class MowikApp:
             )
             recorder = ContinuousRecorder(self.config)
             recorder.start()
+            if self.stop_event.is_set():
+                recorder.close()
+                return
             self.recorder = recorder
             model, model_name, device = create_model(
                 self.config,
                 self._model_status,
             )
+            if self.stop_event.is_set():
+                if self.recorder is recorder:
+                    self.recorder = None
+                recorder.close()
+                return
             self.model = model
             self.model_name = model_name
             self.model_device = device
@@ -7413,8 +8154,18 @@ class MowikApp:
                 ),
                 state="ready",
             )
-        except Exception as exc:
+        except Exception:
             logging.exception("Błąd inicjalizacji")
+            self.model_ready.clear()
+            if recorder is not None:
+                if self.recorder is recorder:
+                    self.recorder = None
+                try:
+                    recorder.close()
+                except Exception:
+                    logging.exception("Nie udało się zamknąć mikrofonu po błędzie")
+            if self.stop_event.is_set():
+                return
             self.set_status(
                 self.translator.t("Błąd uruchomienia", "Startup error"),
                 notify=self._error_notification(),
@@ -7582,7 +8333,7 @@ class MowikApp:
                 self.dictation_indicator.recording(command=True)
             else:
                 self.dictation_indicator.recording()
-        except Exception as exc:
+        except Exception:
             self._release_busy()
             self.dictation_indicator.error()
             logging.exception("Nie udało się rozpocząć nagrywania")
@@ -7613,6 +8364,10 @@ class MowikApp:
         self.capture_mode = None
         released_at = time.perf_counter()
         self._release_started_at = released_at
+        recorder = self.recorder
+        mark_release = getattr(recorder, "mark_release", None)
+        if callable(mark_release):
+            mark_release()
         if mode == "custom_command":
             self.dictation_indicator.processing(command=True)
         else:
@@ -7633,7 +8388,7 @@ class MowikApp:
     ) -> None:
         try:
             self._finish_dictation_after_tail(mode, released_at)
-        except Exception as exc:
+        except Exception:
             logging.exception("Nie udało się zakończyć nagrywania")
             self._release_busy()
             self.dictation_indicator.error()
@@ -7668,12 +8423,17 @@ class MowikApp:
             return
         audio = recorder.finish()
         self.beep("stop")
+        recorded_samples = getattr(recorder, "last_recording_samples", None)
+        if not isinstance(recorded_samples, int):
+            # Zachowaj zgodność z prostymi adapterami/test doubles starszych
+            # wersji, które zwracają wyłącznie tablicę audio.
+            recorded_samples = len(audio)
         minimum_samples = int(
             recorder.sample_rate
             * max(0, int(self.config.get("minimum_recording_ms", 250)))
             / 1000
         )
-        if len(audio) < minimum_samples:
+        if recorded_samples < minimum_samples:
             if mode == "custom_command":
                 self._discard_command_context()
             self.dictation_indicator.error()
@@ -7754,7 +8514,11 @@ class MowikApp:
                     self._set_text_delivery_status()
                     if self.stop_event.is_set():
                         continue
-                    paste_text(text, self.config)
+                    paste_text(
+                        text,
+                        self.config,
+                        cancel_event=self.stop_event,
+                    )
                     paste_settings = self.config.get("paste", {})
                     logging.info(
                         "Dostarczono tekst (%d znaków; wklejanie=%s; schowek=%s)",
@@ -7777,6 +8541,9 @@ class MowikApp:
                 else:
                     self.dictation_indicator.success()
                 self.beep("done")
+            except OperationCancelled:
+                logging.info("Anulowano dostarczanie tekstu podczas zamykania")
+                self.dictation_indicator.hide()
             except Exception:
                 logging.exception("Błąd przetwarzania trybu %s", job.mode)
                 self.dictation_indicator.error()
@@ -7815,6 +8582,24 @@ class MowikApp:
                 "Copying text to the clipboard…",
             )
         self.set_status(message, state="processing")
+
+    def _deny_custom_command(
+        self,
+        action: str,
+        reason: str,
+        message: str,
+    ) -> bool:
+        """Reject safely without putting a command payload in diagnostics."""
+
+        logging.warning(
+            "Zablokowano własną komendę (akcja=%s; powód=%s)",
+            action,
+            reason,
+        )
+        self.dictation_indicator.error()
+        self.set_status(message, state="ready")
+        self.beep("error")
+        return False
 
     def _deliver_custom_command(
         self,
@@ -7856,6 +8641,48 @@ class MowikApp:
                     self.process_elevated or execution_context.process_elevated
                 ),
             )
+        requested_action = match.definition.action
+        context_denial = custom_command_context_denial(
+            context,
+            require_foreground=(requested_action == "paste_text"),
+        )
+        if context_denial is not None:
+            if context_denial == "stale_command_context":
+                message = self.translator.t(
+                    "Komenda wygasła — przytrzymaj ponownie przycisk komend",
+                    "The command expired — hold the command shortcut again",
+                )
+            elif context_denial == "command_target_unavailable":
+                message = self.translator.t(
+                    "Nie można bezpiecznie ustalić okna docelowego",
+                    "The target window could not be established safely",
+                )
+            else:
+                message = self.translator.t(
+                    "Kontekst komendy jest nieprawidłowy — spróbuj ponownie",
+                    "The command context is invalid — try again",
+                )
+            return self._deny_custom_command(
+                requested_action,
+                context_denial,
+                message,
+            )
+
+        target_identity: Optional[tuple[int, int]] = None
+        if requested_action == "paste_text":
+            target_identity = (
+                int(context.foreground_hwnd),
+                int(context.foreground_pid),
+            )
+            if not foreground_identity_matches(target_identity):
+                return self._deny_custom_command(
+                    requested_action,
+                    "foreground_changed",
+                    self.translator.t(
+                        "Aktywne okno zmieniło się — tekst nie został wklejony",
+                        "The active window changed, so the text was not pasted",
+                    ),
+                )
         plan = command_engine.build_action_plan(match, context)
         if not plan.allowed:
             reason = plan.denial_reason or "action_denied"
@@ -7886,6 +8713,9 @@ class MowikApp:
 
         action = plan.action
         value = plan.payload
+        multiline_paste = action == "paste_text" and (
+            "\r" in value or "\n" in value
+        )
         if plan.requires_confirmation:
             self.set_status(
                 self.translator.t(
@@ -7923,11 +8753,72 @@ class MowikApp:
         # pozostawić opóźnionej akcji do wykonania.
         if self.stop_event.is_set():
             return False
-        if action == "paste_text" and plan.requires_confirmation:
+        context_denial = custom_command_context_denial(
+            context,
+            require_foreground=(action == "paste_text"),
+        )
+        if context_denial is not None:
+            return self._deny_custom_command(
+                action,
+                context_denial,
+                self.translator.t(
+                    "Komenda wygasła lub utraciła bezpieczny kontekst",
+                    "The command expired or lost its safe context",
+                ),
+            )
+        if target_identity is not None and not foreground_identity_matches(
+            target_identity
+        ):
+            return self._deny_custom_command(
+                action,
+                "foreground_changed_after_confirmation",
+                self.translator.t(
+                    "Aktywne okno zmieniło się — tekst nie został wklejony",
+                    "The active window changed, so the text was not pasted",
+                ),
+            )
+        if action == "paste_text" and plan.requires_confirmation and not multiline_paste:
             self._set_text_delivery_status()
         try:
             if action == "paste_text":
-                paste_text(value, self.config, append_space_override=False)
+                if multiline_paste:
+                    paste_settings = self.config.get("paste", {})
+                    copy_enabled = bool(
+                        isinstance(paste_settings, dict)
+                        and paste_settings.get("copy_to_clipboard") is True
+                    )
+                    if not copy_enabled:
+                        return self._deny_custom_command(
+                            action,
+                            "multiline_clipboard_disabled",
+                            self.translator.t(
+                                "Włącz kopiowanie do schowka, aby użyć tekstu wielowierszowego",
+                                "Enable clipboard copying to use multi-line text",
+                            ),
+                        )
+                    if self.stop_event.is_set():
+                        raise OperationCancelled()
+                    windows_set_clipboard_text(value, self.translator)
+                    self.set_status(
+                        self.translator.t(
+                            "Tekst wielowierszowy skopiowano — wklej go ręcznie przez Ctrl+V",
+                            "Multi-line text copied — paste it manually with Ctrl+V",
+                        ),
+                        notify=self.translator.t(
+                            "Mówik nie wkleił go automatycznie ze względów bezpieczeństwa.",
+                            "Mówik did not paste it automatically for safety.",
+                        ),
+                        state="ready",
+                    )
+                else:
+                    paste_text(
+                        value,
+                        self.config,
+                        append_space_override=False,
+                        expected_foreground=target_identity,
+                        verify_clipboard_before_paste=True,
+                        cancel_event=self.stop_event,
+                    )
             elif action == "open":
                 open_custom_command_target(value)
             elif action == "open_terminal":
@@ -7984,6 +8875,8 @@ class MowikApp:
                         "Unknown custom-command action.",
                     )
                 )
+        except OperationCancelled:
+            raise
         except Exception as exc:
             # Nie przekazujemy do logu treści ścieżki, szablonu ani polecenia.
             logging.error(
@@ -8213,7 +9106,7 @@ class MowikApp:
                 settings_process_args(),
                 cwd=str(APP_ROOT),
             )
-        except Exception as exc:
+        except Exception:
             logging.exception("Nie udało się otworzyć panelu ustawień")
             self.set_status(
                 self.translator.t(
@@ -8260,7 +9153,7 @@ class MowikApp:
                 state="processing",
             )
             self.restart()
-        except Exception as exc:
+        except Exception:
             logging.exception("Nie udało się zastosować profilu %s", profile_name)
             self.set_status(
                 self.translator.t(
@@ -8427,6 +9320,62 @@ class MowikApp:
                 # pętla przetworzy polecenie zamknięcia i zniszczy Tk w tym samym
                 # (głównym) wątku, w którym zostało utworzone.
                 self.dictation_indicator.run()
+
+
+def _create_windows_named_mutex(name: str) -> tuple[int, bool]:
+    if os.name != "nt":
+        raise OSError("Windows named mutexes are unavailable on this platform")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(None, False, name)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(handle), ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+
+
+def settings_already_open_message(translator: Translator) -> tuple[str, str]:
+    return (
+        translator.t(
+            "Centrum Mówika jest już otwarte. Przejdź do istniejącego okna ustawień.",
+            "Mówik Center is already open. Switch to the existing settings window.",
+        ),
+        translator.t(
+            "Mówik — ustawienia",
+            "Mówik — Settings",
+        ),
+    )
+
+
+def show_settings_already_open(translator: Translator) -> None:
+    message, title = settings_already_open_message(translator)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.MessageBoxW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+    ]
+    user32.MessageBoxW.restype = ctypes.c_int
+    # MB_OK | MB_ICONINFORMATION | MB_TOPMOST
+    user32.MessageBoxW(None, message, title, 0x00000040 | 0x00040000)
+
+
+def acquire_settings_instance(
+    translator: Optional[Translator] = None,
+) -> Optional[int]:
+    """Zwróć mutex panelu albo poinformować o już otwartym oknie."""
+
+    translator = translator or Translator("auto")
+    handle, already_exists = _create_windows_named_mutex(SETTINGS_MUTEX_NAME)
+    if not already_exists:
+        return handle
+    try:
+        show_settings_already_open(translator)
+    finally:
+        release_single_instance(handle)
+    return None
 
 
 def acquire_single_instance(
@@ -8653,7 +9602,19 @@ def main() -> int:
         )
         return 0
     if args.settings:
-        return run_settings_window()
+        # Ustaw DPI przed jakimkolwiek oknem (także komunikatem o drugiej
+        # instancji), a mutex trzymaj przez cały czas życia panelu.
+        enable_windows_dpi_awareness()
+        settings_translator = Translator.from_config(load_config())
+        if os.name != "nt":
+            return run_settings_window()
+        settings_mutex_handle = acquire_settings_instance(settings_translator)
+        if settings_mutex_handle is None:
+            return 0
+        try:
+            return run_settings_window()
+        finally:
+            release_single_instance(settings_mutex_handle)
     if args.list_devices:
         return list_devices(cli_translator)
 

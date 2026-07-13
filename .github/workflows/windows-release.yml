@@ -7,41 +7,52 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-installer:
     runs-on: windows-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      release_version: ${{ steps.authorize.outputs.release_version }}
+      tag_commit: ${{ steps.authorize.outputs.tag_commit }}
+      installer_sha256: ${{ steps.capture_payload.outputs.installer_sha256 }}
+      checksum_sha256: ${{ steps.capture_payload.outputs.checksum_sha256 }}
     env:
       PYTHONUTF8: "1"
-      MOWIK_TIMESTAMP_SERVER: "http://timestamp.digicert.com"
+      MOWIK_INNO_SETUP_VERSION: "6.7.1"
+      MOWIK_INNO_SETUP_SHA256: "4D11E8050B6185E0D49BD9E8CC661A7A59F44959A621D31D11033124C4E8A7B0"
+      MOWIK_INNO_SETUP_URL: "https://github.com/jrsoftware/issrc/releases/download/is-6_7_1/innosetup-6.7.1.exe"
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Authorize immutable signing tag
+      - name: Authorize immutable release tag
+        id: authorize
         shell: pwsh
         run: |
           if ($env:GITHUB_REF_TYPE -ne 'tag') {
             throw (
-              'Signing is allowed only when the workflow ref is an existing tag. ' +
+              'Publishing is allowed only when the workflow ref is an existing tag. ' +
               'For workflow_dispatch, select the vMAJOR.MINOR.PATCH tag in the ref picker.'
             )
           }
 
           $tag = $env:GITHUB_REF_NAME
           if ($tag -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
-            throw 'The signing tag must have the exact form vMAJOR.MINOR.PATCH.'
+            throw 'The release tag must have the exact form vMAJOR.MINOR.PATCH.'
           }
           $version = $Matches.version
 
@@ -51,7 +62,7 @@ jobs:
           }
           $tagCommit = (git rev-parse "$tag^{commit}").Trim()
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not peel signing tag $tag to a commit."
+            throw "Could not peel release tag $tag to a commit."
           }
           $eventCommit = (git rev-parse "$env:GITHUB_SHA^{commit}").Trim()
           if ($LASTEXITCODE -ne 0) {
@@ -59,14 +70,14 @@ jobs:
           }
           if (($tagCommit -ine $headCommit) -or ($tagCommit -ine $eventCommit)) {
             throw (
-              "Signing tag $tag, checked-out HEAD and GITHUB_SHA do not resolve " +
+              "Release tag $tag, checked-out HEAD and GITHUB_SHA do not resolve " +
               'to the same commit.'
             )
           }
 
           $remoteLines = @(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not verify signing tag $tag against origin."
+            throw "Could not verify release tag $tag against origin."
           }
           $remoteRefs = @{}
           foreach ($line in $remoteLines) {
@@ -82,15 +93,17 @@ jobs:
           } elseif ($remoteRefs.ContainsKey($tagRef)) {
             $remoteRefs[$tagRef]
           } else {
-            throw "Signing tag $tag does not exist on origin."
+            throw "Release tag $tag does not exist on origin."
           }
           if ($remoteCommit -ine $headCommit) {
-            throw "Signing tag $tag on origin does not point to the checked-out commit."
+            throw "Release tag $tag on origin does not point to the checked-out commit."
           }
 
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "MOWIK_SIGNING_TAG_COMMIT=$headCommit" |
+          "MOWIK_RELEASE_TAG_COMMIT=$headCommit" |
             Out-File -FilePath $env:GITHUB_ENV -Append
+          "release_version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag_commit=$headCommit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Verify release version consistency
         shell: pwsh
@@ -100,183 +113,226 @@ jobs:
         shell: pwsh
         run: |
           python -m venv .venv
-          choco install innosetup --yes --no-progress
 
-      - name: Build and test unsigned application before exposing signing key
-        shell: pwsh
-        run: |
-          ./scripts/build-release.ps1 `
-            -Version $env:RELEASE_VERSION `
-            -PrepareApplicationOnly
-
-          $preparedExe = 'dist/Mowik/Mowik.exe'
-          $preparedHash = (Get-FileHash -LiteralPath $preparedExe -Algorithm SHA256).Hash
-          if ($preparedHash -notmatch '^[0-9A-Fa-f]{64}$') {
-            throw 'Could not establish the prepared Mowik.exe identity.'
+          $innoInstaller = Join-Path `
+            $env:RUNNER_TEMP `
+            "innosetup-$env:MOWIK_INNO_SETUP_VERSION.exe"
+          if (Test-Path -LiteralPath $innoInstaller) {
+            throw 'Refusing to replace an existing temporary Inno Setup installer.'
           }
-          "MOWIK_PREPARED_APP_SHA256=$preparedHash" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Import code-signing certificate
-        shell: pwsh
-        env:
-          WINDOWS_CODE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_CERTIFICATE_BASE64 }}
-          WINDOWS_CODE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_CERTIFICATE_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_CERTIFICATE_BASE64)) {
-            throw 'Missing WINDOWS_CODE_SIGNING_CERTIFICATE_BASE64 repository or environment secret.'
-          }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_CERTIFICATE_PASSWORD)) {
-            throw 'Missing WINDOWS_CODE_SIGNING_CERTIFICATE_PASSWORD repository or environment secret.'
-          }
-
-          $stem = "mowik-signing-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $pfxPath = Join-Path $env:RUNNER_TEMP "$stem.pfx"
-          $cleanupPath = Join-Path $env:RUNNER_TEMP "$stem-imported-thumbprints.txt"
-          if ((Test-Path -LiteralPath $pfxPath) -or (Test-Path -LiteralPath $cleanupPath)) {
-            throw 'Refusing to replace existing temporary signing material.'
-          }
-          "MOWIK_SIGNING_PFX_PATH=$pfxPath" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-          "MOWIK_SIGNING_CERTIFICATE_CLEANUP_PATH=$cleanupPath" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-
-          $before = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { $_.Thumbprint })
           try {
-            $pfxBytes = [Convert]::FromBase64String(
-              $env:WINDOWS_CODE_SIGNING_CERTIFICATE_BASE64.Trim()
-            )
-          } catch {
-            throw 'WINDOWS_CODE_SIGNING_CERTIFICATE_BASE64 is not valid Base64.'
-          }
-          $stream = [IO.File]::Open(
-            $pfxPath,
-            [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::None
-          )
-          try {
-            $stream.Write($pfxBytes, 0, $pfxBytes.Length)
-            $stream.Flush($true)
-          } finally {
-            $stream.Dispose()
-          }
-
-          $password = ConvertTo-SecureString `
-            -String $env:WINDOWS_CODE_SIGNING_CERTIFICATE_PASSWORD `
-            -AsPlainText `
-            -Force
-          $imported = @()
-          $importError = $null
-          try {
-            $imported = @(Import-PfxCertificate `
-              -FilePath $pfxPath `
-              -CertStoreLocation Cert:\CurrentUser\My `
-              -Password $password)
-          } catch {
-            $importError = $_
-          }
-          $after = @(Get-ChildItem Cert:\CurrentUser\My | ForEach-Object { $_.Thumbprint })
-          $newThumbprints = @($after | Where-Object { $_ -notin $before })
-          [IO.File]::WriteAllLines($cleanupPath, $newThumbprints, [Text.Encoding]::ASCII)
-          if ($null -ne $importError) {
-            throw 'Importing the code-signing PFX failed.'
-          }
-
-          $signers = @($imported | Where-Object {
-            $_.HasPrivateKey -and
-            @($_.EnhancedKeyUsageList | Where-Object {
-              $_.ObjectId.Value -eq '1.3.6.1.5.5.7.3.3'
-            }).Count -gt 0
-          })
-          if ($signers.Count -ne 1) {
-            throw "The PFX must contain exactly one code-signing certificate with a private key."
-          }
-
-          $thumbprint = $signers[0].Thumbprint.ToUpperInvariant()
-          Write-Output "::add-mask::$thumbprint"
-          "MOWIK_SIGNING_CERTIFICATE_THUMBPRINT=$thumbprint" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-          Remove-Item -LiteralPath $pfxPath -Force
-
-      - name: Build, sign and verify installer
-        shell: pwsh
-        run: |
-          ./scripts/build-release.ps1 `
-            -Version $env:RELEASE_VERSION `
-            -BuildMode SignedRelease `
-            -SigningCertificateThumbprint $env:MOWIK_SIGNING_CERTIFICATE_THUMBPRINT `
-            -SigningCertificateStore CurrentUser `
-            -TimestampServer $env:MOWIK_TIMESTAMP_SERVER `
-            -UsePreparedApplication `
-            -PreparedAppSha256 $env:MOWIK_PREPARED_APP_SHA256 `
-            -SkipToolInstall
-
-      - name: Remove signing key before installer QA and upload
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath $env:MOWIK_SIGNING_CERTIFICATE_CLEANUP_PATH) {
-            foreach ($thumbprint in (Get-Content -LiteralPath $env:MOWIK_SIGNING_CERTIFICATE_CLEANUP_PATH)) {
-              if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
-                Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -Force
-              }
+            Invoke-WebRequest `
+              -Uri $env:MOWIK_INNO_SETUP_URL `
+              -OutFile $innoInstaller
+            $downloadHash = (
+              Get-FileHash -LiteralPath $innoInstaller -Algorithm SHA256
+            ).Hash.ToUpperInvariant()
+            if ($downloadHash -cne $env:MOWIK_INNO_SETUP_SHA256) {
+              throw 'The Inno Setup installer SHA-256 does not match the pinned release asset.'
             }
-            Remove-Item -LiteralPath $env:MOWIK_SIGNING_CERTIFICATE_CLEANUP_PATH -Force
+
+            $downloadSignature = Get-AuthenticodeSignature -LiteralPath $innoInstaller
+            if ($downloadSignature.Status -ne
+                  [Management.Automation.SignatureStatus]::Valid -or
+                $null -eq $downloadSignature.SignerCertificate -or
+                $downloadSignature.SignerCertificate.Subject -notmatch
+                  '(?:^|,\s*)O=Pyrsys B\.V\.(?:,|$)') {
+              throw 'The pinned Inno Setup installer is not validly signed by Pyrsys B.V.'
+            }
+
+            $innoInstall = Start-Process `
+              -FilePath $innoInstaller `
+              -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-') `
+              -Wait `
+              -PassThru
+            if ($innoInstall.ExitCode -ne 0) {
+              throw "Installing pinned Inno Setup failed with code $($innoInstall.ExitCode)."
+            }
           }
-          if (Test-Path -LiteralPath $env:MOWIK_SIGNING_PFX_PATH) {
-            Remove-Item -LiteralPath $env:MOWIK_SIGNING_PFX_PATH -Force
+          finally {
+            if (Test-Path -LiteralPath $innoInstaller) {
+              Remove-Item -LiteralPath $innoInstaller -Force
+            }
           }
+
+          Import-Module ./scripts/WindowsReleaseTools.psm1 -Force -DisableNameChecking
+          if (-not ${env:ProgramFiles(x86)}) {
+            throw 'The expected 64-bit Windows Program Files path is unavailable.'
+          }
+          $expectedInnoCompiler = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            'Inno Setup 6\ISCC.exe'
+          $innoCompiler = Resolve-InnoCompiler `
+            -InnoCompilerPath $expectedInnoCompiler
+          if ([string]::IsNullOrWhiteSpace($innoCompiler)) {
+            throw 'The pinned Inno Setup compiler was not found after installation.'
+          }
+          "MOWIK_INNO_COMPILER_PATH=$innoCompiler" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build and verify explicitly unsigned release installer
+        shell: pwsh
+        run: |
+          ./scripts/build-release.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -BuildMode UnsignedRelease `
+            -InnoCompilerPath $env:MOWIK_INNO_COMPILER_PATH `
+            -SkipToolInstall
 
       - name: Test English and Polish installation and uninstall
         shell: pwsh
         run: |
           ./scripts/test-installer.ps1 `
             -Version $env:RELEASE_VERSION `
-            -RequireAuthenticode `
-            -ExpectedSignerThumbprint $env:MOWIK_SIGNING_CERTIFICATE_THUMBPRINT
+            -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
 
-      - name: Re-verify immutable release payload
+      - name: Re-verify immutable unsigned release payload
         shell: pwsh
         run: |
           ./scripts/test-release-artifacts.ps1 `
             -Version $env:RELEASE_VERSION `
-            -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup.exe" `
-            -RequireAuthenticode `
-            -ExpectedSignerThumbprint $env:MOWIK_SIGNING_CERTIFICATE_THUMBPRINT
+            -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Capture verified payload identity
+        id: capture_payload
+        shell: pwsh
+        run: |
+          $installer = "release/Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
+          $checksum = 'release/SHA256SUMS.txt'
+          $installerHash = (
+            Get-FileHash -LiteralPath $installer -Algorithm SHA256
+          ).Hash.ToUpperInvariant()
+          $checksumHash = (
+            Get-FileHash -LiteralPath $checksum -Algorithm SHA256
+          ).Hash.ToUpperInvariant()
+          "installer_sha256=$installerHash" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "checksum_sha256=$checksumHash" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload verified unsigned build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Mowik-${{ env.RELEASE_VERSION }}-Windows
+          name: Mowik-${{ env.RELEASE_VERSION }}-Windows-UNSIGNED
           path: |
-            release/Mowik-${{ env.RELEASE_VERSION }}-Setup.exe
+            release/Mowik-${{ env.RELEASE_VERSION }}-Setup-UNSIGNED.exe
             release/SHA256SUMS.txt
           if-no-files-found: error
           compression-level: 0
 
-      - name: Attach files to GitHub Release
-        if: github.ref_type == 'tag'
+  publish-release:
+    needs: build-installer
+    if: github.ref_type == 'tag'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      PYTHONUTF8: "1"
+      RELEASE_VERSION: ${{ needs.build-installer.outputs.release_version }}
+      MOWIK_RELEASE_TAG_COMMIT: ${{ needs.build-installer.outputs.tag_commit }}
+      MOWIK_EXPECTED_INSTALLER_SHA256: ${{ needs.build-installer.outputs.installer_sha256 }}
+      MOWIK_EXPECTED_CHECKSUM_SHA256: ${{ needs.build-installer.outputs.checksum_sha256 }}
+
+    steps:
+      - name: Check out authorized release source without write credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-authorize immutable release tag
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($env:GITHUB_REF_TYPE -ne 'tag' -or
+              $tag -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            throw 'Publishing requires an exact vMAJOR.MINOR.PATCH tag ref.'
+          }
+          if ($Matches.version -cne $env:RELEASE_VERSION) {
+            throw 'The publishing job received a version inconsistent with its tag.'
+          }
+
+          $headCommit = (git rev-parse HEAD).Trim()
+          $eventCommit = (git rev-parse "$env:GITHUB_SHA^{commit}").Trim()
+          if (($LASTEXITCODE -ne 0) -or
+              ($headCommit -ine $env:MOWIK_RELEASE_TAG_COMMIT) -or
+              ($eventCommit -ine $env:MOWIK_RELEASE_TAG_COMMIT)) {
+            throw 'The publishing checkout is not the commit authorized by the build job.'
+          }
+
+          $remoteLines = @(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not verify release tag $tag against origin."
+          }
+          $remoteRefs = @{}
+          foreach ($line in $remoteLines) {
+            $parts = $line -split '\s+', 2
+            if ($parts.Count -eq 2) {
+              $remoteRefs[$parts[1]] = $parts[0]
+            }
+          }
+          $tagRef = "refs/tags/$tag"
+          $peeledTagRef = "$tagRef^{}"
+          $remoteCommit = if ($remoteRefs.ContainsKey($peeledTagRef)) {
+            $remoteRefs[$peeledTagRef]
+          } elseif ($remoteRefs.ContainsKey($tagRef)) {
+            $remoteRefs[$tagRef]
+          } else {
+            throw "Release tag $tag no longer exists on origin."
+          }
+          if ($remoteCommit -ine $env:MOWIK_RELEASE_TAG_COMMIT) {
+            throw "Release tag $tag moved after the artifact was built."
+          }
+
+          ./scripts/test-release-version.ps1 -Version $env:RELEASE_VERSION
+
+      - name: Download unsigned artifact from the isolated build job
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Mowik-${{ env.RELEASE_VERSION }}-Windows-UNSIGNED
+          path: release
+
+      - name: Verify downloaded unsigned release payload
+        shell: pwsh
+        run: |
+          $installer = "release/Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne [Management.Automation.SignatureStatus]::NotSigned) {
+            throw "The downloaded unsigned installer has unexpected signature status $($signature.Status)."
+          }
+          $installerHash = (
+            Get-FileHash -LiteralPath $installer -Algorithm SHA256
+          ).Hash.ToUpperInvariant()
+          $checksumHash = (
+            Get-FileHash -LiteralPath 'release/SHA256SUMS.txt' -Algorithm SHA256
+          ).Hash.ToUpperInvariant()
+          if (($installerHash -ine $env:MOWIK_EXPECTED_INSTALLER_SHA256) -or
+              ($checksumHash -ine $env:MOWIK_EXPECTED_CHECKSUM_SHA256)) {
+            throw 'The downloaded release payload differs from the verified build output.'
+          }
+          ./scripts/test-release-artifacts.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
+
+      - name: Publish verified immutable GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $installer = "release/Mowik-$env:RELEASE_VERSION-Setup.exe"
+          $installer = "release/Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
           $checksum = 'release/SHA256SUMS.txt'
           ./scripts/test-release-artifacts.ps1 `
             -Version $env:RELEASE_VERSION `
-            -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup.exe" `
-            -RequireAuthenticode `
-            -ExpectedSignerThumbprint $env:MOWIK_SIGNING_CERTIFICATE_THUMBPRINT
+            -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
 
-          # Re-check the remote tag immediately before creating the release so
-          # a force-move during the build cannot associate assets with new code.
           function Get-RemoteTagCommit {
             param([Parameter(Mandatory)] [string]$Tag)
 
             $remoteLines = @(git ls-remote origin "refs/tags/$Tag" "refs/tags/$Tag^{}")
             if ($LASTEXITCODE -ne 0) {
-              throw "Could not verify signing tag $Tag against origin."
+              throw "Could not verify release tag $Tag against origin."
             }
             $remoteRefs = @{}
             foreach ($line in $remoteLines) {
@@ -293,12 +349,12 @@ jobs:
             if ($remoteRefs.ContainsKey($tagRef)) {
               return $remoteRefs[$tagRef]
             }
-            throw "Signing tag $Tag no longer exists on origin."
+            throw "Release tag $Tag no longer exists on origin."
           }
 
           $remoteCommit = Get-RemoteTagCommit -Tag $tag
-          if ($remoteCommit -ine $env:MOWIK_SIGNING_TAG_COMMIT) {
-            throw "Signing tag $tag moved while the release was being built."
+          if ($remoteCommit -ine $env:MOWIK_RELEASE_TAG_COMMIT) {
+            throw "Release tag $tag moved while the release was being built."
           }
 
           $null = gh release view $tag --json id 2>$null
@@ -309,10 +365,20 @@ jobs:
             )
           }
 
+          $releaseWarning = @'
+          > [!WARNING]
+          > This Windows installer is **not digitally signed**. Windows may display
+          > **Unknown publisher** or a Microsoft Defender SmartScreen warning.
+          >
+          > Before running it, verify the installer's SHA-256 hash against the included
+          > `SHA256SUMS.txt` file.
+          '@
+
           gh release create $tag `
             --draft `
             --verify-tag `
-            --title "Mówik $env:RELEASE_VERSION" `
+            --title "Mówik $env:RELEASE_VERSION (unsigned Windows build)" `
+            --notes $releaseWarning `
             --generate-notes
           if ($LASTEXITCODE -ne 0) {
             throw "Creating draft GitHub Release $tag failed."
@@ -369,8 +435,8 @@ jobs:
           Assert-ExactReleaseAssets -Release $draft
 
           $remoteCommit = Get-RemoteTagCommit -Tag $tag
-          if ($remoteCommit -ine $env:MOWIK_SIGNING_TAG_COMMIT) {
-            throw "Signing tag $tag moved while draft assets were being uploaded."
+          if ($remoteCommit -ine $env:MOWIK_RELEASE_TAG_COMMIT) {
+            throw "Release tag $tag moved while draft assets were being uploaded."
           }
 
           gh release edit $tag --draft=false
@@ -386,35 +452,3 @@ jobs:
             throw "Release $tag was not published as expected."
           }
           Assert-ExactReleaseAssets -Release $published
-
-      - name: Remove temporary signing material
-        if: always()
-        shell: pwsh
-        run: |
-          $stem = "mowik-signing-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $cleanupPath = if ($env:MOWIK_SIGNING_CERTIFICATE_CLEANUP_PATH) {
-            $env:MOWIK_SIGNING_CERTIFICATE_CLEANUP_PATH
-          } else {
-            Join-Path $env:RUNNER_TEMP "$stem-imported-thumbprints.txt"
-          }
-          $pfxPath = if ($env:MOWIK_SIGNING_PFX_PATH) {
-            $env:MOWIK_SIGNING_PFX_PATH
-          } else {
-            Join-Path $env:RUNNER_TEMP "$stem.pfx"
-          }
-
-          if (Test-Path -LiteralPath $cleanupPath) {
-            foreach ($thumbprint in (Get-Content -LiteralPath $cleanupPath)) {
-              if ($thumbprint -match '^[0-9A-Fa-f]{40}$') {
-                Remove-Item -LiteralPath "Cert:\CurrentUser\My\$thumbprint" `
-                  -Force `
-                  -ErrorAction SilentlyContinue
-              }
-            }
-            Remove-Item -LiteralPath $cleanupPath `
-              -Force `
-              -ErrorAction SilentlyContinue
-          }
-          if (Test-Path -LiteralPath $pfxPath) {
-            Remove-Item -LiteralPath $pfxPath -Force
-          }

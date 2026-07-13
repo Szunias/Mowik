@@ -157,6 +157,11 @@ class ExecutableAndPrivilegeSafetyTests(unittest.TestCase):
         with (
             mock.patch.object(windows_actions.Path, "is_file", return_value=True),
             mock.patch.object(
+                windows_actions,
+                "_is_app_execution_alias",
+                return_value=True,
+            ),
+            mock.patch.object(
                 windows_actions.Path,
                 "resolve",
                 side_effect=OSError("app execution alias"),
@@ -176,6 +181,56 @@ class ExecutableAndPrivilegeSafetyTests(unittest.TestCase):
                     allow_app_execution_alias=True,
                 )
             )
+
+    def test_app_execution_alias_requires_exact_reparse_tag_and_zero_size(
+        self,
+    ) -> None:
+        candidate = Path(
+            r"C:\Users\Test\AppData\Local\Microsoft\WindowsApps\wt.exe"
+        )
+        for tag, size, expected in (
+            (0x8000001B, 0, True),
+            (0x8000001B, 1, False),
+            (0xA000000C, 0, False),  # symbolic-link reparse tag
+            (0, 0, False),
+        ):
+            with self.subTest(tag=hex(tag), size=size):
+                stat = mock.Mock(st_reparse_tag=tag, st_size=size)
+                with mock.patch.object(windows_actions.os, "name", "nt"), mock.patch.object(
+                    windows_actions.os,
+                    "lstat",
+                    return_value=stat,
+                ):
+                    self.assertIs(
+                        windows_actions._is_app_execution_alias(candidate),
+                        expected,
+                    )
+
+    def test_normal_file_or_symlink_cannot_escape_windowsapps_alias_check(
+        self,
+    ) -> None:
+        alias = Path(r"C:\Users\Test\AppData\Local\Microsoft\WindowsApps\wt.exe")
+        with mock.patch.object(
+            windows_actions.Path,
+            "is_file",
+            return_value=True,
+        ), mock.patch.object(
+            windows_actions,
+            "_is_app_execution_alias",
+            return_value=False,
+        ), mock.patch.object(
+            windows_actions.Path,
+            "resolve",
+            side_effect=AssertionError("an untrusted alias must never be followed"),
+        ) as resolve:
+            self.assertIsNone(
+                windows_actions._existing_absolute_executable(
+                    alias,
+                    allow_app_execution_alias=True,
+                )
+            )
+
+        resolve.assert_not_called()
 
     def test_pwsh_and_terminal_roots_come_from_windows_known_folders(self) -> None:
         program_files = Path(r"C:\Program Files")

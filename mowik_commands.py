@@ -50,6 +50,7 @@ MAX_COMMAND_LINE_LENGTH: Final = 8_000
 MAX_OPEN_TARGET_LENGTH: Final = 700
 MAX_CONFIRMED_PASTE_LENGTH: Final = 700
 MAX_COMMAND_ID_LENGTH: Final = 128
+CUSTOM_COMMANDS_SCHEMA_VERSION: Final = 1
 
 _VALID_MATCH_MODES: Final = frozenset({MATCH_EXACT, MATCH_PREFIX_TAIL})
 _VALID_OUTCOMES: Final = frozenset(
@@ -64,9 +65,24 @@ _VALID_TERMINAL_SHELLS: Final = frozenset({"default", "powershell", "cmd"})
 _VALID_DRAFT_DELIVERY: Final = frozenset({"clipboard"})
 BLOCKED_OPEN_SUFFIXES: Final = frozenset(
     {
-        ".bat", ".cmd", ".com", ".cpl", ".hta", ".js", ".jse", ".lnk",
-        ".msi", ".msp", ".pif", ".ps1", ".psm1", ".reg", ".scr",
-        ".url", ".vbe", ".vbs", ".wsf", ".wsh",
+        # Executables, installers, scripts and shortcuts handled directly by
+        # Windows or by commonly installed interpreters.
+        ".ahk", ".appinstaller", ".application", ".appref-ms", ".appx",
+        ".appxbundle", ".bat", ".cmd", ".com", ".cpl", ".gadget", ".hta",
+        ".inf", ".ins", ".isp", ".jar", ".jnlp", ".js", ".jse", ".lnk",
+        ".msh", ".msh1", ".msh1xml", ".msh2", ".msh2xml", ".mshxml",
+        ".msi", ".msix", ".msixbundle", ".msp", ".pif", ".ps1", ".psc1",
+        ".psm1", ".py", ".pyc", ".pyo", ".pyw", ".pyz", ".pyzw", ".reg",
+        ".scf", ".scr", ".sct", ".url", ".vbe", ".vbs", ".vsto", ".ws",
+        ".wsc", ".wsf", ".wsh",
+        # Active Windows containers, management/diagnostic packages and
+        # shell-namespace files which can load code or conceal a network URL.
+        ".chm", ".diagcab", ".diagcfg", ".diagpkg", ".library-ms", ".msc",
+        ".osdx", ".searchconnector-ms", ".settingcontent-ms", ".udl",
+        ".website", ".xaml", ".xbap",
+        # Office add-ins and macro-capable document/template formats.
+        ".docm", ".dotm", ".potm", ".ppa", ".ppam", ".pptm", ".sldm",
+        ".xla", ".xlam", ".xll", ".xlsm", ".xltm",
     }
 )
 
@@ -732,6 +748,16 @@ class CommandRegistry:
                     ValidationIssue(None, "custom_commands_not_object", "custom_commands"),
                 )
             )
+        if not custom_commands_schema_supported(settings):
+            return cls(
+                issues=(
+                    ValidationIssue(
+                        None,
+                        "schema_version_unsupported",
+                        "schema_version",
+                    ),
+                )
+            )
         return cls.from_items(settings.get("items", ()))
 
     def match(self, transcript: Any) -> Optional[MatchResult]:
@@ -912,12 +938,29 @@ def parse_custom_commands(config: Any) -> CommandRegistry:
     return CommandRegistry.from_config(config)
 
 
+def custom_commands_schema_supported(settings: Any) -> bool:
+    """Accept legacy records without a version or the exact current integer.
+
+    ``bool`` is deliberately rejected even though it subclasses ``int`` in
+    Python.  An unknown/future schema must stay opaque and must never be
+    interpreted with older action semantics.
+    """
+
+    if not isinstance(settings, Mapping):
+        return False
+    if "schema_version" not in settings:
+        return True
+    version = settings.get("schema_version")
+    return type(version) is int and version == CUSTOM_COMMANDS_SCHEMA_VERSION
+
+
 __all__ = [
     "ACTION_OPEN",
     "ACTION_OPEN_TERMINAL",
     "ACTION_PASTE_TEXT",
     "ACTION_REGISTRY",
     "BLOCKED_OPEN_SUFFIXES",
+    "CUSTOM_COMMANDS_SCHEMA_VERSION",
     "ActionOutcome",
     "ActionPlan",
     "ActionSpec",
@@ -935,6 +978,7 @@ __all__ = [
     "TerminalOptions",
     "ValidationIssue",
     "build_action_plan",
+    "custom_commands_schema_supported",
     "normalize_command_phrase",
     "parse_custom_commands",
     "sanitize_terminal_draft",

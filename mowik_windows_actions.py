@@ -31,6 +31,7 @@ _TOKEN_ELEVATION_CLASS = 20
 _CREATE_NEW_CONSOLE = 0x00000010
 _CSIDL_LOCAL_APPDATA = 0x001C
 _CSIDL_PROGRAM_FILES = 0x0026
+_IO_REPARSE_TAG_APPEXECLINK = 0x8000001B
 _LOCAL_DRIVE_TYPES = frozenset({2, 3, 5, 6})  # removable, fixed, CD-ROM, RAM disk
 
 
@@ -356,6 +357,21 @@ def resolve_working_directory(
     return WorkingDirectoryResult(normalized, None, "unsupported_source")
 
 
+def _is_app_execution_alias(candidate: Path) -> bool:
+    """Recognize the AppExecLink reparse point created by Windows packages."""
+
+    if os.name != "nt":
+        return False
+    try:
+        stat = os.lstat(candidate)
+    except (OSError, TypeError, ValueError):
+        return False
+    return (
+        getattr(stat, "st_reparse_tag", 0) == _IO_REPARSE_TAG_APPEXECLINK
+        and stat.st_size == 0
+    )
+
+
 def _existing_absolute_executable(
     value: os.PathLike[str] | str,
     *,
@@ -367,20 +383,21 @@ def _existing_absolute_executable(
         candidate = Path(value)
         if not candidate.is_absolute() or not candidate.is_file():
             return None
-        try:
-            return str(candidate.resolve(strict=True))
-        except OSError:
-            # Windows Store app-execution aliases are zero-length reparse
-            # points and cannot be resolved through pathlib, even though
-            # CreateProcess can launch them.  Accept this only for the one
-            # fixed WindowsApps path selected by the caller, never for PATH.
+        if allow_app_execution_alias:
             alias_tail = tuple(part.casefold() for part in candidate.parts[-3:])
-            if allow_app_execution_alias and alias_tail == (
+            if alias_tail != (
                 "microsoft",
                 "windowsapps",
                 "wt.exe",
-            ):
-                return str(candidate)
+            ) or not _is_app_execution_alias(candidate):
+                return None
+            # Launch the package-owned alias itself.  Following a user-created
+            # symlink from this writable directory would defeat trusted-shell
+            # resolution; a real AppExecLink is activated by CreateProcess.
+            return str(candidate)
+        try:
+            return str(candidate.resolve(strict=True))
+        except OSError:
             return None
     except (OSError, RuntimeError, ValueError):
         return None
