@@ -21,14 +21,14 @@ No cloud, no subscription, and no voice uploads.
 </div>
 
 > [!NOTE]
-> The application interface is available in English and Polish. By default, Mówik follows the Windows display language; you can override it in Mówik Center and apply the change with one restart.
+> The application interface is available in English and Polish. By default, Mówik follows the Windows display language; you can override it in Mówik Center with **Save and restart**.
 
 ## Features
 
 - **Push-to-talk**: Mówik transcribes a dictation only while you hold the selected keyboard key or mouse button.
 - **Fully local transcription**: Speech recognition runs on your computer using faster-whisper. Once a model has been downloaded, no internet connection is required.
 - **One-click key detection**: Select **Detect…** and press any keyboard key or mouse button.
-- **Graphical settings panel** in the Windows system tray: configure the model, microphone, voice activity detection, clipboard behavior, sounds, and more without editing JSON files.
+- **Clear graphical settings panel** in the Windows system tray: everyday choices stay visible, while model, GPU/CPU, voice detection, and custom connection details are available on demand under **Advanced settings**.
 - **English and Polish interface** with automatic Windows-language detection and a persistent language selector.
 - **Subtle built-in sound cues and custom WAV files** for recording start, key release, completed text, and errors, with previews and optional looping.
 - **Flexible text output**: paste into the active window, copy to the clipboard, or do both.
@@ -70,17 +70,17 @@ If you are upgrading from the old ZIP-based version 2.2.0 or earlier, use the ne
 
 Right-click the microphone icon next to the Windows clock. It may be hidden under **Show hidden icons**. Select **Settings…**. In the Polish interface these labels are **Pokaż ukryte ikony** and **Panel ustawień…**.
 
-Mówik Center opens with an overview of the active push-to-talk key, microphone, and model. Its sidebar provides access to the remaining settings.
+Mówik Center opens with an overview of the active push-to-talk key, microphone, and quality profile. Its sidebar provides access to the remaining settings. Technical controls stay in expandable **Advanced settings** sections, so the default view contains only the choices needed for everyday dictation.
 
 | English UI | Polish UI | Contents |
 |---|---|---|
-| Home | Start | active shortcut, microphone, model, and essential privacy information |
-| Dictation | Dyktowanie | push-to-talk button, microphone, model, processing device, language, and accuracy |
-| Microphone and speech detection | Mikrofon i wykrywanie mowy | recording pre-roll and tail buffers, sensitivity, and silence detection |
+| Home | Start | active shortcut, microphone, quality profile, interface language, and essential privacy information |
+| Dictation | Dyktowanie | quality profile, shortcut, microphone, and language; model, GPU/CPU, accuracy, and threads under Advanced settings |
+| Microphone and speech | Mikrofon i mowa | automatic speech detection; recording buffers, sensitivity, and detailed silence controls under Advanced settings |
 | Text and dictionary | Tekst i słownik | pasting, copying, trailing space, voice commands, and private vocabulary |
-| Sounds and notifications | Dźwięki i powiadomienia | built-in cues, custom WAV files, previews, looping, and notifications |
-| Integrations | Integracje | optional local LLM correction through Ollama |
-| Help and diagnostics | Pomoc i diagnostyka | quick access to the configuration, privacy-safe log, and application data folder |
+| Sounds | Dźwięki | sound cues and notifications; custom WAV files, previews, and looping under Advanced settings |
+| Integrations | Integracje | optional local LLM correction through Ollama, with connection details under Advanced settings |
+| Help and diagnostics | Pomoc i diagnostyka | privacy-safe log and application data first; direct `config.json` access under Advanced settings |
 
 A colored badge on the system-tray icon indicates the current state: ready, recording, processing, or error.
 
@@ -118,9 +118,9 @@ When clipboard copying is enabled, the clipboard contains the exact transcriptio
 
 ## Custom sounds
 
-In **Sounds and notifications** (**Dźwięki i powiadomienia** in Polish), you can assign a separate sound to each event: push-to-talk pressed, push-to-talk released, text ready, and error.
+In **Sounds** (**Dźwięki** in Polish), expand **Advanced settings** to assign a separate sound to each event: push-to-talk pressed, push-to-talk released, text ready, and error.
 
-Mówik supports uncompressed PCM `.wav` files up to 50 MB. After you save the setting, the selected file is copied to `%APPDATA%\Mowik\sounds`, so it remains available even if the original file is removed. Select **Built-in** (**Wbudowany** in Polish) to restore the application’s short default tone.
+Mówik supports uncompressed PCM `.wav` files up to 50 MB. After you save the setting, the selected file is copied to `%APPDATA%\Mowik\sounds`, so it remains available even if the original file is removed. The field displays **Built-in** (**Wbudowany** in Polish) when the default cue is active; choose **Reset** (**Przywróć**) to return to it.
 
 ## Vocabulary for names and specialist terms
 

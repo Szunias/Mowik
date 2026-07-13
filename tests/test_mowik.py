@@ -49,6 +49,24 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertFalse(model.transcribe.called)
 
 
+class QuickProfileTests(unittest.TestCase):
+    def test_default_auto_model_matches_recommended_profile(self) -> None:
+        self.assertEqual(
+            mowik.matching_quick_profile("auto", "auto", 2),
+            "balanced",
+        )
+
+    def test_profile_matching_includes_processing_device(self) -> None:
+        self.assertIsNone(
+            mowik.matching_quick_profile("large-v3-turbo", "cuda", 2)
+        )
+
+    def test_invalid_accuracy_is_custom(self) -> None:
+        self.assertIsNone(
+            mowik.matching_quick_profile("large-v3-turbo", "auto", "invalid")
+        )
+
+
 class InternationalDictationTests(unittest.TestCase):
     def test_old_config_keeps_transcription_language_and_gains_ui_language(self) -> None:
         migrated = mowik.deep_merge(

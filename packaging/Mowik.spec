@@ -70,6 +70,7 @@ exe = EXE(
     entitlements_file=None,
     icon=str(ROOT / "assets" / "Mowik.ico"),
     version=str(ROOT / "packaging" / "version_info.txt"),
+    manifest=str(ROOT / "packaging" / "Mowik.manifest"),
 )
 
 coll = COLLECT(
