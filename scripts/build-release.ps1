@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.7.1',
+    [string]$Version = '2.7.2',
 
     [Parameter()]
     [ValidateSet('UnsignedLocal', 'UnsignedRelease', 'SignedRelease')]
@@ -88,7 +88,7 @@ function Write-NewAsciiFile {
         [Parameter(Mandatory)] [string]$Value
     )
 
-    $Encoding = [Text.ASCIIEncoding]::new($false)
+    $Encoding = [Text.ASCIIEncoding]::new()
     $Stream = [IO.File]::Open(
         $Path,
         [IO.FileMode]::CreateNew,
