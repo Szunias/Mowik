@@ -1,0 +1,5 @@
+# Trusted installer bootstrap. The bundled/previous pip verifies this wheel
+# before it is allowed to install application dependencies.
+
+pip==26.1.2 \
+    --hash=sha256:382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab

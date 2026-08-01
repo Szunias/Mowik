@@ -41,12 +41,32 @@ function Resolve-SignToolPath {
         [string]$SignToolPath
     )
 
+    function Assert-TrustedSignTool {
+        param([Parameter(Mandatory)] [string]$Path)
+
+        $Tool = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($Tool.PSIsContainer -or $Tool.Name -ine 'signtool.exe') {
+            throw "The SignTool path is not signtool.exe: $Path"
+        }
+        $Signature = Get-AuthenticodeSignature -LiteralPath $Tool.FullName
+        if ($Signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
+            $null -eq $Signature.SignerCertificate -or
+            $Signature.SignerCertificate.Subject -notmatch
+                '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') {
+            throw (
+                'signtool.exe must have a valid Authenticode signature from ' +
+                "Microsoft Corporation: $($Tool.FullName)"
+            )
+        }
+        return $Tool.FullName
+    }
+
     if ($SignToolPath) {
         $Explicit = Get-Item -LiteralPath $SignToolPath -ErrorAction Stop
         if ($Explicit.PSIsContainer -or $Explicit.Name -ine 'signtool.exe') {
             throw "The explicit SignTool path is not signtool.exe: $SignToolPath"
         }
-        return $Explicit.FullName
+        return Assert-TrustedSignTool -Path $Explicit.FullName
     }
 
     $SdkRoots = @()
@@ -68,7 +88,7 @@ function Resolve-SignToolPath {
             foreach ($Architecture in @('x64', 'x86', 'arm64')) {
                 $Candidate = Join-Path $VersionDirectory.FullName "$Architecture\signtool.exe"
                 if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
-                    return (Get-Item -LiteralPath $Candidate).FullName
+                    return Assert-TrustedSignTool -Path $Candidate
                 }
             }
         }
@@ -76,7 +96,7 @@ function Resolve-SignToolPath {
         foreach ($Architecture in @('x64', 'x86', 'arm64')) {
             $Candidate = Join-Path $SdkRoot "$Architecture\signtool.exe"
             if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
-                return (Get-Item -LiteralPath $Candidate).FullName
+                return Assert-TrustedSignTool -Path $Candidate
             }
         }
     }
@@ -149,6 +169,88 @@ function Resolve-InnoCompiler {
         }
     }
     return $null
+}
+
+function Get-ReleaseSourceIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProjectRoot
+    )
+
+    $RootItem = Get-Item -LiteralPath $ProjectRoot -Force -ErrorAction Stop
+    if (-not $RootItem.PSIsContainer -or
+        ($RootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The release source root must be a regular directory: $ProjectRoot"
+    }
+    $RootPath = [IO.Path]::GetFullPath($RootItem.FullName).TrimEnd('\', '/')
+    $RootPrefix = $RootPath + [IO.Path]::DirectorySeparatorChar
+    $Files = [Collections.Generic.Dictionary[string, IO.FileInfo]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+
+    $SourceExtensions = @(
+        '.cmd', '.iss', '.json', '.manifest', '.md', '.ps1', '.psm1',
+        '.py', '.spec', '.txt', '.yaml', '.yml',
+        '.ico', '.png', '.svg', '.wav'
+    )
+    foreach ($File in (Get-ChildItem -LiteralPath $RootPath -File -Force)) {
+        if ($File.Extension -in $SourceExtensions -and $File.Name -ine 'instalacja.log') {
+            if (($File.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Release source must not contain reparse points: $($File.FullName)"
+            }
+            $Files[$File.FullName] = $File
+        }
+    }
+    foreach ($RelativeDirectory in @(
+        '.github\workflows',
+        'assets',
+        'packaging',
+        'scripts',
+        'tests',
+        'THIRD_PARTY_LICENSES'
+    )) {
+        $Directory = Join-Path $RootPath $RelativeDirectory
+        if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+            throw "Missing release source directory: $RelativeDirectory"
+        }
+        foreach ($Item in (Get-ChildItem -LiteralPath $Directory -Recurse -Force)) {
+            if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Release source must not contain reparse points: $($Item.FullName)"
+            }
+            if (-not $Item.PSIsContainer -and $Item.Extension -in $SourceExtensions) {
+                $Files[$Item.FullName] = $Item
+            }
+        }
+    }
+
+    [string[]]$Lines = @(
+        foreach ($File in $Files.Values) {
+            $FullPath = [IO.Path]::GetFullPath($File.FullName)
+            if (-not $FullPath.StartsWith($RootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "A release source file escaped the project root: $FullPath"
+            }
+            $RelativePath = $FullPath.Substring($RootPrefix.Length).Replace('\', '/')
+            if ($RelativePath -match '[\x00-\x1F]' -or
+                $RelativePath -match '(^|/)\.\.?(/|$)') {
+                throw "Release source contains a non-canonical path: $RelativePath"
+            }
+            $Length = $File.Length.ToString([Globalization.CultureInfo]::InvariantCulture)
+            $Hash = (Get-FileHash -LiteralPath $FullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$RelativePath`t$Length`t$Hash"
+        }
+    )
+    [Array]::Sort($Lines, [StringComparer]::Ordinal)
+    $Content = "MOWIK-RELEASE-SOURCE-V1`n" + ($Lines -join "`n") + "`n"
+    $Utf8 = [Text.UTF8Encoding]::new($false)
+    $Hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $Digest = $Hasher.ComputeHash($Utf8.GetBytes($Content))
+    }
+    finally {
+        $Hasher.Dispose()
+    }
+    return (($Digest | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
 function Get-CanonicalDirectoryManifestContent {
@@ -586,17 +688,76 @@ function New-InnoSignToolCommand {
     ) -f $EscapedSignTool, $StoreArguments, $NormalizedThumbprint, $EscapedTimestampServer
 }
 
+function Assert-ExactGitHubReleaseAssets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Release,
+
+        [Parameter(Mandatory)]
+        [string]$ReleaseTag,
+
+        [Parameter(Mandatory)]
+        [ValidateCount(1, 100)]
+        [string[]]$ExpectedPath
+    )
+
+    $ExpectedFiles = @(
+        foreach ($Path in $ExpectedPath) {
+            Get-Item -LiteralPath $Path -ErrorAction Stop
+        }
+    )
+    if (@($ExpectedFiles | Where-Object { $_.PSIsContainer }).Count -gt 0) {
+        throw "Expected GitHub Release assets must be files: $ReleaseTag"
+    }
+
+    $ExpectedNames = @($ExpectedFiles | ForEach-Object { $_.Name } | Sort-Object)
+    if (($ExpectedNames | Select-Object -Unique).Count -ne $ExpectedNames.Count) {
+        throw "Expected GitHub Release asset names must be unique: $ReleaseTag"
+    }
+
+    $ActualAssets = @($Release.assets)
+    $ActualNames = @($ActualAssets | ForEach-Object { $_.name } | Sort-Object)
+    if (($ActualNames.Count -ne $ExpectedNames.Count) -or
+        (($ActualNames -join "`n") -cne ($ExpectedNames -join "`n"))) {
+        throw (
+            "Release $ReleaseTag has an unexpected asset set. Expected: " +
+            ($ExpectedNames -join ', ') + '; found: ' + ($ActualNames -join ', ')
+        )
+    }
+
+    foreach ($File in $ExpectedFiles) {
+        $Asset = @($ActualAssets | Where-Object { $_.name -ceq $File.Name })
+        $ExpectedDigest = 'sha256:' + (
+            Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        if (($Asset.Count -ne 1) -or
+            ([int64]$Asset[0].size -ne $File.Length) -or
+            ($Asset[0].state -cne 'uploaded') -or
+            ($Asset[0].digest -cne $ExpectedDigest)) {
+            throw (
+                "Release asset $($File.Name) has an unexpected size, digest, " +
+                'state or duplicate entry.'
+            )
+        }
+    }
+
+    Write-Host "Exact GitHub Release assets verified: $ReleaseTag" -ForegroundColor Green
+}
+
 Export-ModuleMember -Function @(
     'Normalize-CodeSigningThumbprint',
     'Assert-TimestampServer',
     'Resolve-SignToolPath',
     'Assert-TrustedInnoCompiler',
     'Resolve-InnoCompiler',
+    'Get-ReleaseSourceIdentity',
     'Write-DirectoryIntegrityManifest',
     'Assert-DirectoryIntegrityManifest',
     'Assert-DirectoryIntegrityManifestTransition',
     'Assert-CodeSigningCertificate',
     'Assert-AuthenticodeSignature',
     'Invoke-AuthenticodeSign',
-    'New-InnoSignToolCommand'
+    'New-InnoSignToolCommand',
+    'Assert-ExactGitHubReleaseAssets'
 )

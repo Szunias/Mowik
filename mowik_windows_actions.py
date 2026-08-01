@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import ntpath
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 from typing import Literal, Optional
 import unicodedata
@@ -23,6 +24,7 @@ import unicodedata
 WorkingDirectorySource = Literal["active_explorer", "fixed", "home"]
 LaunchStatus = Literal["launched", "failed"]
 DraftDeliveryStatus = Literal["copied_only", "rejected", "failed"]
+TerminalCleanupStatus = Literal["terminated", "already_exited", "rejected", "failed"]
 
 MAX_DRAFT_LENGTH = 8_000
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -33,6 +35,8 @@ _CSIDL_LOCAL_APPDATA = 0x001C
 _CSIDL_PROGRAM_FILES = 0x0026
 _IO_REPARSE_TAG_APPEXECLINK = 0x8000001B
 _LOCAL_DRIVE_TYPES = frozenset({2, 3, 5, 6})  # removable, fixed, CD-ROM, RAM disk
+_MAX_TERMINAL_CLEANUP_AGE_SECONDS = 30.0
+_EXPLORER_COM_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,8 @@ class TerminalHandle:
     cwd: Path
     launcher_pid: int
     launched_at_monotonic: float
+    launcher_handle: Optional[int] = None
+    _process: Optional[object] = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,24 @@ class DraftDeliveryResult:
     status: DraftDeliveryStatus
     clipboard_updated: bool = False
     reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TerminalCleanupResult:
+    status: TerminalCleanupStatus
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _PathIdentity:
+    """Stable-enough metadata used to detect replacement before CreateProcess."""
+
+    device: int
+    inode: int
+    reparse_tag: int
+    size: int
+    modified_ns: int
+    changed_ns: int
 
 
 def is_process_elevated() -> bool:
@@ -246,6 +270,12 @@ def _canonical_local_directory(value: object) -> Optional[Path]:
 def _explorer_path_from_com(hwnd: int) -> Optional[Path]:
     """Odczytaj ścieżkę przez Shell.Application, jeśli pywin32 jest dostępne."""
 
+    # COM/Shell.Application can block inside a broken Explorer extension.  The
+    # caller already runs this helper off the input hook, but a timeout there
+    # cannot stop a Python thread.  Admit at most one COM resolver so repeated
+    # shortcuts cannot accumulate an unbounded number of stuck COM calls.
+    if not _EXPLORER_COM_LOCK.acquire(blocking=False):
+        return None
     initialized = False
     try:
         # Importy są celowo lokalne: typowa ścieżka startowa Mówika ich nie ładuje.
@@ -275,6 +305,7 @@ def _explorer_path_from_com(hwnd: int) -> Optional[Path]:
                 pythoncom.CoUninitialize()  # type: ignore[name-defined]
             except Exception:
                 pass
+        _EXPLORER_COM_LOCK.release()
 
 
 def capture_foreground_identity() -> ForegroundContext:
@@ -403,6 +434,74 @@ def _existing_absolute_executable(
         return None
 
 
+def _capture_path_identity(
+    value: os.PathLike[str] | str,
+    *,
+    directory: bool = False,
+) -> Optional[_PathIdentity]:
+    """Capture identity without following a last-component reparse point."""
+
+    try:
+        item = os.lstat(value)
+        # Directory timestamps may legitimately change when its contents do.
+        # File metadata is useful for detecting an in-place executable swap.
+        size = 0 if directory else int(item.st_size)
+        modified_ns = 0 if directory else int(item.st_mtime_ns)
+        changed_ns = 0 if directory else int(item.st_ctime_ns)
+        return _PathIdentity(
+            device=int(item.st_dev),
+            inode=int(item.st_ino),
+            reparse_tag=int(getattr(item, "st_reparse_tag", 0)),
+            size=size,
+            modified_ns=modified_ns,
+            changed_ns=changed_ns,
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _same_path(left: os.PathLike[str] | str, right: os.PathLike[str] | str) -> bool:
+    try:
+        return os.path.normcase(os.path.abspath(os.fspath(left))) == os.path.normcase(
+            os.path.abspath(os.fspath(right))
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _revalidate_directory(
+    directory: Path,
+    identity: _PathIdentity,
+) -> Optional[Path]:
+    """Resolve the directory again immediately before process creation."""
+
+    current = _canonical_local_directory(directory)
+    if current is None or not _same_path(current, directory):
+        return None
+    if _capture_path_identity(current, directory=True) != identity:
+        return None
+    return current
+
+
+def _revalidate_executable(
+    executable: str,
+    identity: _PathIdentity,
+    *,
+    allow_app_execution_alias: bool = False,
+) -> Optional[str]:
+    """Repeat executable and identity validation immediately before Popen."""
+
+    current = _existing_absolute_executable(
+        executable,
+        allow_app_execution_alias=allow_app_execution_alias,
+    )
+    if current is None or not _same_path(current, executable):
+        return None
+    if _capture_path_identity(current) != identity:
+        return None
+    return current
+
+
 def _windows_directory() -> Optional[Path]:
     if os.name != "nt":
         return None
@@ -509,6 +608,33 @@ def _classic_arguments(kind: str, executable: str) -> list[str]:
     return [executable, "-NoLogo", "-NoProfile", "-NoExit"]
 
 
+def _process_handle_value(process: object) -> Optional[int]:
+    try:
+        value = int(getattr(process, "_handle", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _terminal_handle(
+    *,
+    host: str,
+    shell: str,
+    cwd: Path,
+    process: object,
+) -> TerminalHandle:
+    pid = int(getattr(process, "pid", 0) or 0)
+    return TerminalHandle(
+        host=host,
+        shell=shell,
+        cwd=cwd,
+        launcher_pid=pid,
+        launched_at_monotonic=time.monotonic(),
+        launcher_handle=_process_handle_value(process),
+        _process=process,
+    )
+
+
 def launch_terminal(
     host: str,
     shell: str,
@@ -521,6 +647,9 @@ def launch_terminal(
     directory = _canonical_local_directory(cwd)
     if directory is None:
         return TerminalLaunchResult("failed", error="invalid_working_directory")
+    directory_identity = _capture_path_identity(directory, directory=True)
+    if directory_identity is None:
+        return TerminalLaunchResult("failed", error="working_directory_identity_unavailable")
 
     requested_host = host.strip().casefold().replace("classic", "console")
     requested_shell = shell.strip().casefold()
@@ -544,26 +673,54 @@ def launch_terminal(
         if shell_kind is None:
             return TerminalLaunchResult("failed", error="requested_shell_unavailable")
 
-    use_wt = requested_host in {"auto", "windows_terminal", "wt"}
+    # ``wt.exe`` is only an app-execution launcher.  It may hand the window to
+    # the packaged Windows Terminal process and exit, leaving us without a
+    # trustworthy process handle for rollback.  Keep explicit WT support for
+    # compatibility, but make ``auto`` choose a classic console whose retained
+    # process handle can be terminated reliably after cancellation/failure.
+    use_wt = requested_host in {"windows_terminal", "wt"}
     wt_path = _find_executable("wt.exe") if use_wt else None
     if requested_host in {"windows_terminal", "wt"} and not wt_path:
         return TerminalLaunchResult("failed", error="windows_terminal_unavailable")
 
     if wt_path:
-        arguments = [
+        wt_identity = _capture_path_identity(wt_path)
+        shell_identity = (
+            _capture_path_identity(shell_path)
+            if shell_kind != "default" and shell_path
+            else None
+        )
+        if wt_identity is None or (
+            shell_kind != "default" and shell_path and shell_identity is None
+        ):
+            return TerminalLaunchResult("failed", error="launch_identity_unavailable")
+        launch_directory = _revalidate_directory(directory, directory_identity)
+        launch_wt = _revalidate_executable(
             wt_path,
+            wt_identity,
+            allow_app_execution_alias=True,
+        )
+        launch_shell = shell_path
+        if shell_kind != "default" and shell_path and shell_identity is not None:
+            launch_shell = _revalidate_executable(shell_path, shell_identity)
+        if launch_directory is None or launch_wt is None or (
+            shell_kind != "default" and shell_path and launch_shell is None
+        ):
+            return TerminalLaunchResult("failed", error="launch_target_changed")
+        arguments = [
+            launch_wt,
             "-w",
             "new",
             "new-tab",
             "--startingDirectory",
-            str(directory),
+            str(launch_directory),
         ]
-        if shell_kind != "default" and shell_path:
-            arguments.extend(_shell_arguments(shell_kind or "", shell_path, embedded=True))
+        if shell_kind != "default" and launch_shell:
+            arguments.extend(_shell_arguments(shell_kind or "", launch_shell, embedded=True))
         try:
             process = subprocess.Popen(
                 arguments,
-                cwd=str(directory),
+                cwd=str(launch_directory),
                 close_fds=True,
                 shell=False,
             )
@@ -571,12 +728,11 @@ def launch_terminal(
             if requested_host != "auto":
                 return TerminalLaunchResult("failed", error="terminal_launch_failed")
         else:
-            handle = TerminalHandle(
+            handle = _terminal_handle(
                 host="windows_terminal",
                 shell=shell_kind or "default",
-                cwd=directory,
-                launcher_pid=process.pid,
-                launched_at_monotonic=time.monotonic(),
+                cwd=launch_directory,
+                process=process,
             )
             return TerminalLaunchResult("launched", handle)
 
@@ -585,25 +741,81 @@ def launch_terminal(
         shell_kind, shell_path = _resolve_shell("auto")
     if shell_kind is None or shell_path is None:
         return TerminalLaunchResult("failed", error="terminal_unavailable")
-    arguments = _classic_arguments(shell_kind, shell_path)
+    shell_identity = _capture_path_identity(shell_path)
+    if shell_identity is None:
+        return TerminalLaunchResult("failed", error="launch_identity_unavailable")
+    launch_directory = _revalidate_directory(directory, directory_identity)
+    launch_shell = _revalidate_executable(shell_path, shell_identity)
+    if launch_directory is None or launch_shell is None:
+        return TerminalLaunchResult("failed", error="launch_target_changed")
+    arguments = _classic_arguments(shell_kind, launch_shell)
     try:
         process = subprocess.Popen(
             arguments,
-            cwd=str(directory),
+            cwd=str(launch_directory),
             creationflags=_CREATE_NEW_CONSOLE,
             close_fds=True,
             shell=False,
         )
     except OSError:
         return TerminalLaunchResult("failed", error="terminal_launch_failed")
-    handle = TerminalHandle(
+    handle = _terminal_handle(
         host="console",
         shell=shell_kind,
-        cwd=directory,
-        launcher_pid=process.pid,
-        launched_at_monotonic=time.monotonic(),
+        cwd=launch_directory,
+        process=process,
     )
     return TerminalLaunchResult("launched", handle)
+
+
+def terminate_terminal(
+    handle: TerminalHandle,
+    *,
+    timeout_seconds: float = 1.0,
+) -> TerminalCleanupResult:
+    """Best-effort cleanup of only the retained, freshly launched process.
+
+    The function never reopens a PID, which avoids terminating an unrelated
+    process after PID reuse.  Windows Terminal's app-execution alias can exit
+    after handing work to the packaged app; that case is reported as failed
+    because there is no trustworthy child-process handle to follow.
+    """
+
+    if not isinstance(handle, TerminalHandle):
+        return TerminalCleanupResult("rejected", "invalid_handle")
+    process = handle._process
+    if process is None:
+        return TerminalCleanupResult("rejected", "process_handle_unavailable")
+    try:
+        pid = int(getattr(process, "pid", 0) or 0)
+    except (TypeError, ValueError):
+        return TerminalCleanupResult("rejected", "process_identity_invalid")
+    if pid <= 0 or pid != handle.launcher_pid:
+        return TerminalCleanupResult("rejected", "process_identity_mismatch")
+    current_handle = _process_handle_value(process)
+    if (
+        handle.launcher_handle is not None
+        and current_handle != handle.launcher_handle
+    ):
+        return TerminalCleanupResult("rejected", "process_handle_mismatch")
+    age = time.monotonic() - handle.launched_at_monotonic
+    if not (0.0 <= age <= _MAX_TERMINAL_CLEANUP_AGE_SECONDS):
+        return TerminalCleanupResult("rejected", "cleanup_window_expired")
+    try:
+        if process.poll() is not None:  # type: ignore[attr-defined]
+            if handle.host == "windows_terminal":
+                return TerminalCleanupResult("failed", "unmanaged_wt_handoff")
+            return TerminalCleanupResult("already_exited")
+        process.terminate()  # type: ignore[attr-defined]
+        timeout = min(2.0, max(0.05, float(timeout_seconds)))
+        try:
+            process.wait(timeout=timeout)  # type: ignore[attr-defined]
+        except subprocess.TimeoutExpired:
+            process.kill()  # type: ignore[attr-defined]
+            process.wait(timeout=timeout)  # type: ignore[attr-defined]
+        return TerminalCleanupResult("terminated")
+    except (AttributeError, OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return TerminalCleanupResult("failed", "termination_failed")
 
 
 def _validate_draft(text: object) -> Optional[str]:
@@ -696,12 +908,14 @@ __all__ = [
     "DraftDeliveryResult",
     "ForegroundContext",
     "TerminalHandle",
+    "TerminalCleanupResult",
     "TerminalLaunchResult",
     "WorkingDirectoryResult",
     "capture_foreground_context",
     "capture_foreground_identity",
     "deliver_terminal_draft",
     "launch_terminal",
+    "terminate_terminal",
     "is_process_elevated",
     "is_local_filesystem_path",
     "resolve_explorer_context",

@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.7.3'
+    [string]$Version = '2.7.4'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,6 +42,44 @@ function Assert-SingleVersionValue {
         throw (
             "Version mismatch in ${RelativePath}: $Description is '$ActualValue', " +
             "expected '$ExpectedValue'."
+        )
+    }
+}
+
+function Assert-ReadmeCurrentVersions {
+    param(
+        [Parameter(Mandatory)] [string]$RelativePath,
+        [Parameter(Mandatory)] [string]$ExpectedValue,
+        [Parameter()] [string[]]$AllowedHistoricalVersion = @('2.2.0')
+    )
+
+    $Path = Join-Path $Root $RelativePath
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Missing file required by release preflight: $RelativePath"
+    }
+
+    $Content = Get-Content -LiteralPath $Path -Raw
+    $Versions = @(
+        [regex]::Matches(
+            $Content,
+            '(?<![0-9.])(?<value>[0-9]+\.[0-9]+\.[0-9]+)(?![0-9.])'
+        ) | ForEach-Object { $_.Groups['value'].Value }
+    )
+    if ($ExpectedValue -cnotin $Versions) {
+        throw "$RelativePath does not mention the current release version $ExpectedValue."
+    }
+
+    $Unexpected = @(
+        $Versions |
+            Where-Object {
+                ($_ -cne $ExpectedValue) -and ($_ -cnotin $AllowedHistoricalVersion)
+            } |
+            Select-Object -Unique
+    )
+    if ($Unexpected.Count -gt 0) {
+        throw (
+            "$RelativePath contains stale release version(s): " +
+            ($Unexpected -join ', ') + "; expected $ExpectedValue."
         )
     }
 }
@@ -130,5 +168,8 @@ $Checks = @(
 foreach ($Check in $Checks) {
     Assert-SingleVersionValue @Check
 }
+
+Assert-ReadmeCurrentVersions -RelativePath 'README.md' -ExpectedValue $Version
+Assert-ReadmeCurrentVersions -RelativePath 'README.pl.md' -ExpectedValue $Version
 
 Write-Host "Mowik $Version release preflight: OK" -ForegroundColor Green

@@ -1,8 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import _tkinter
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs, copy_metadata
+from PyInstaller.utils.hooks.tcl_tk import tcltk_info
 
 
 ROOT = Path(SPECPATH).resolve().parent
@@ -20,6 +23,37 @@ datas = [
     (str(ROOT / "slownik.example.txt"), "."),
     (str(ROOT / "assets" / "Mowik.ico"), "assets"),
 ]
+
+# PyInstaller discovers these directories by initializing Tcl in an isolated
+# subprocess. A restricted build worker can block that probe even though the
+# complete Tcl/Tk payload is installed with CPython. In that case hook-_tkinter
+# still enables its runtime hook, so omitting the payload creates an executable
+# that fails before mowik.py starts.
+if not tcltk_info.available:
+    tcl_root = Path(sys.base_prefix) / "tcl"
+    tcl_data_dir = tcl_root / f"tcl{_tkinter.TCL_VERSION}"
+    tk_data_dir = tcl_root / f"tk{_tkinter.TK_VERSION}"
+    tcl_major_dir = tcl_root / f"tcl{_tkinter.TCL_VERSION.split('.', 1)[0]}"
+
+    missing_tcl_tk_payload = []
+    if not (tcl_data_dir / "init.tcl").is_file():
+        missing_tcl_tk_payload.append(tcl_data_dir / "init.tcl")
+    if not (tk_data_dir / "tk.tcl").is_file():
+        missing_tcl_tk_payload.append(tk_data_dir / "tk.tcl")
+    if not tcl_major_dir.is_dir():
+        missing_tcl_tk_payload.append(tcl_major_dir)
+    if missing_tcl_tk_payload:
+        missing = ", ".join(str(path) for path in missing_tcl_tk_payload)
+        raise FileNotFoundError(
+            "PyInstaller could not discover Tcl/Tk and the CPython fallback "
+            f"payload is incomplete: {missing}"
+        )
+
+    datas += [
+        (str(tcl_data_dir), tcltk_info.TCL_ROOTNAME),
+        (str(tk_data_dir), tcltk_info.TK_ROOTNAME),
+        (str(tcl_major_dir), tcl_major_dir.name),
+    ]
 binaries = []
 hiddenimports = []
 
@@ -47,7 +81,6 @@ redistributed_distributions = (
     "numpy",
     "nvidia-cublas-cu12",
     "nvidia-cuda-nvrtc-cu12",
-    "nvidia-cudnn-cu12",
     "onnxruntime",
     "packaging",
     "Pillow",
@@ -83,12 +116,14 @@ for package in (
     hiddenimports += package_hiddenimports
 
 hiddenimports += [
+    "tkinter",
+    "_tkinter",
     "pythoncom",
     "pywintypes",
     "win32com.client",
 ]
 
-for package in ("nvidia.cublas", "nvidia.cuda_nvrtc", "nvidia.cudnn"):
+for package in ("nvidia.cublas", "nvidia.cuda_nvrtc"):
     binaries += collect_dynamic_libs(package)
 
 a = Analysis(
@@ -97,7 +132,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    hookspath=[str(ROOT / "packaging" / "hooks")],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],

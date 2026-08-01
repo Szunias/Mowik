@@ -3,9 +3,11 @@
 PortAudio's numeric device indices are enumeration positions and may change
 after a reboot or after connecting another audio device.  Schema 1 stores a
 small, non-secret fingerprint made only from values returned by PortAudio:
-the exact device and host-API names, channel counts, and normalized default
-sample rate.  Resolution succeeds only when exactly one current input device
-has the same fingerprint.
+the exact device and host-API names, channel counts, and the default sample
+rate observed when the selection was saved.  The sample rate is descriptive,
+not identity: Windows drivers can legitimately change it between 44.1 and
+48 kHz.  Resolution succeeds only when exactly one current input device has
+the same stable identity.
 
 The module deliberately does not import ``sounddevice``.  Callers provide
 already captured snapshots or zero-argument callbacks, which keeps both the
@@ -235,6 +237,18 @@ def _selector_from_device(
     )
 
 
+def microphone_identity_key(selector: MicrophoneSelector) -> tuple[Any, ...]:
+    """Return the stable part of a selector, excluding mutable sample rate."""
+
+    return (
+        selector.schema_version,
+        selector.name,
+        selector.host_api_name,
+        selector.max_input_channels,
+        selector.max_output_channels,
+    )
+
+
 def build_microphone_selector(
     device_index: int,
     devices: SnapshotProvider,
@@ -316,7 +330,7 @@ def resolve_microphone_device(
             if exc.code == ERROR_DEVICE_NOT_INPUT:
                 continue
             raise
-        if candidate == selector:
+        if microphone_identity_key(candidate) == microphone_identity_key(selector):
             matches.append(index)
     if not matches:
         raise MicrophoneSelectionError(ERROR_DEVICE_MISSING)
@@ -338,6 +352,7 @@ __all__ = [
     "MicrophoneSelectionError",
     "MicrophoneSelector",
     "build_microphone_selector",
+    "microphone_identity_key",
     "parse_microphone_selector",
     "resolve_microphone_device",
 ]

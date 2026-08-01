@@ -66,7 +66,7 @@ Mówik Center keeps everyday controls clear and moves technical options into exp
 - **Clear graphical settings panel** in the Windows system tray: everyday choices stay visible, while model, GPU/CPU, voice detection, and custom connection details are available on demand under **Advanced settings**.
 - **English and Polish interface** with automatic Windows-language detection and a persistent language selector.
 - **Subtle built-in sound cues and custom WAV files** for recording start, key release, completed text, and errors, with previews and optional looping.
-- **Optional on-screen dictation indicator** with a green recording dot, a processing animation, a success check mark, and an error X.
+- **Optional Live Capsule** with a voice-reactive waveform, distinct dictation and command colors, processing animation, and a short final-text preview.
 - **Jarvis-style custom commands** on a separate push-to-talk shortcut: insert saved text, open an app/file/website, or open a terminal in the active File Explorer folder with a safe clipboard draft.
 - **Flexible text output**: paste into the active window, copy to the clipboard, or do both.
 - **Private vocabulary**: provide names, brands, and specialist terms as hints for the speech model.
@@ -96,11 +96,15 @@ The installer requires 64-bit Windows 10 version 1809 or later, or Windows 11. I
 On first launch, Mówik downloads the selected local speech model to `%LOCALAPPDATA%\Mowik\models`. Transcription works offline after that download is complete.
 
 > [!WARNING]
-> The public Mówik 2.7.3 installer is **not digitally signed**. Windows may therefore show **Unknown publisher** or a Microsoft Defender SmartScreen warning. Download the installer only from the [official Mówik GitHub release](https://github.com/Szunias/Mowik/releases/latest) and verify its SHA-256 hash against `SHA256SUMS.txt` from the same release before running it. In PowerShell, use `Get-FileHash .\Mowik-2.7.3-Setup-UNSIGNED.exe -Algorithm SHA256` and compare the complete value. Do not disable Windows security protections to install Mówik.
+> The official Mówik installer is **not digitally signed**. Windows may therefore show **Unknown publisher** or a Microsoft Defender SmartScreen warning. Download the installer only from the [official Mówik GitHub release](https://github.com/Szunias/Mowik/releases/latest) and verify its SHA-256 hash against `SHA256SUMS.txt` from the same release before running it. In PowerShell, use `Get-FileHash .\Mowik-2.7.4-Setup-UNSIGNED.exe -Algorithm SHA256` and compare the complete value. Do not disable Windows security protections to install Mówik.
+
+Official release builds also receive a signed GitHub/Sigstore provenance attestation. With GitHub CLI installed, verify the downloaded installer using `gh attestation verify .\Mowik-2.7.4-Setup-UNSIGNED.exe --repo Szunias/Mowik`. This authenticates the GitHub Actions build identity even though the Windows executable itself remains unsigned.
 
 ### Updating an existing installation
 
 Download and run the newer `Mowik-x.y.z-Setup-UNSIGNED.exe`. The installer detects the existing version, closes it during the update, and replaces only the application files. Your configuration, vocabulary, custom sounds, and downloaded models remain in place.
+
+If an older configuration selected the retired `base` or `medium` model, Mówik safely migrates that selection to `auto` (`large-v3-turbo`) and records the migration in the technical log.
 
 If you are upgrading from the old ZIP-based version 2.2.0 or earlier, use the new installer as well. Existing AppData files are reused automatically, and the installer removes the old startup shortcut. After confirming that the new version works, you may manually delete the old folder containing `.venv`.
 
@@ -157,7 +161,7 @@ When clipboard copying is enabled, the clipboard contains the exact transcriptio
 
 ## Visual feedback and custom sounds
 
-The optional **On-screen dictation indicator** under **Sounds → Feedback** provides immediate visual confirmation without taking focus from the application where you are typing. It shows a small green dot for regular dictation and a distinct violet indicator for custom commands. Both modes have their own processing animation and success check; errors use an X. Clear the checkbox in Mówik Settings to hide the indicator; sound cues and Windows notifications can be configured independently.
+The optional **Live dictation capsule** under **Sounds → Feedback** provides immediate visual confirmation without taking focus from the application where you are typing. During capture it displays a waveform driven by the current microphone level. It then switches to a processing animation and briefly previews the final text after successful delivery. Custom commands use a distinct violet accent, and errors remain clearly marked. The preview exists only on screen and is not added to the technical log. Clear the checkbox in Mówik Settings to hide the capsule; sound cues and Windows notifications can be configured independently.
 
 In **Sounds** (**Dźwięki** in Polish), expand **Advanced settings** to assign a separate sound to each event: push-to-talk pressed, push-to-talk released, text ready, and error.
 
@@ -174,7 +178,7 @@ PostgreSQL
 Mówik
 ```
 
-The vocabulary is passed to the speech model as a prompt. It can improve the recognition of names, brands, abbreviations, and specialist terminology, but it cannot guarantee a specific spelling in every transcription.
+The vocabulary is passed to the speech model as a prompt. It can improve the recognition of names, brands, abbreviations, and specialist terminology, but it cannot guarantee a specific spelling in every transcription. **Maximum number of entries** is a strict read limit; setting it to `0` temporarily loads no vocabulary entries.
 
 ## Voice commands
 
@@ -194,13 +198,13 @@ Terminal commands deliberately use a draft workflow. A command can match the exa
 
 Exact matching is used for text and open actions. Terminal drafts use explicit prefix-and-tail matching: the configured phrase must be at the start on a complete token boundary, and the longest matching phrase wins. There is no fuzzy or substring execution. If an active-Explorer command was started from a virtual location, network path, missing folder, or an unidentifiable window, the action fails closed instead of falling back to another directory.
 
-Mówik captures the Explorer identity when F7 is pressed, not after transcription completes. Open and terminal actions are also blocked if Mówik is running with administrator privileges, preventing child programs from silently inheriting an elevated token. Multi-line insert actions are length-bounded so their confirmation shows the complete content. Command phrases and content remain plain local data in `%APPDATA%\Mowik\config.json`; do not store passwords, tokens, or other secrets there.
+Mówik captures the Explorer identity when F7 is pressed, not after transcription completes. All custom-command actions are blocked if Mówik is running with administrator privileges, preventing automated input or child programs from crossing an elevation boundary. Multi-line insert actions are length-bounded so their confirmation shows the complete content. Command phrases and content remain plain local data in `%APPDATA%\Mowik\config.json`; do not store passwords, tokens, or other secrets there.
 
-The violet on-screen indicator distinguishes command capture from regular green dictation. It uses its own processing animation and success mark, and can be disabled under **Sounds → Feedback**.
+The violet Live Capsule distinguishes command capture from regular cyan dictation. It uses its own processing animation and success state, and can be disabled under **Sounds → Feedback**.
 
 ### Antivirus and SmartScreen transparency
 
-Mówik does not obfuscate code, disable antivirus protection, create Defender exclusions, hide command shells, or download executable updates. The Windows build is one-directory rather than a self-extracting one-file binary, uses an `asInvoker` manifest, keeps autostart opt-in, and does not execute terminal drafts. These choices reduce suspicious behavior but cannot replace Authenticode signing and normal reputation building. The public 2.7.3 installer is unsigned, so an Unknown publisher or SmartScreen warning is possible even when its SHA-256 matches the official release. If antivirus reports the verified official file, submit that exact file as a possible false positive instead of weakening the user's security settings.
+Mówik does not obfuscate code, disable antivirus protection, create Defender exclusions, hide command shells, or download executable updates. The Windows build is one-directory rather than a self-extracting one-file binary, uses an `asInvoker` manifest, keeps autostart opt-in, and does not execute terminal drafts. These choices reduce suspicious behavior but cannot replace Authenticode signing and normal reputation building. The official installer is unsigned, so an Unknown publisher or SmartScreen warning is possible even when its SHA-256 matches the official release. If antivirus reports the verified official file, submit that exact file as a possible false positive instead of weakening the user's security settings.
 
 Hold F7, speak the configured phrase, and release it. If no valid exact or terminal-prefix match is found, Mówik performs no action and never falls back to inserting the utterance as dictation. Command recognition also bypasses voice-command replacements and Ollama correction so the trigger phrase cannot be rewritten unexpectedly.
 
@@ -229,11 +233,13 @@ The microphone remains open while Mówik is running so that it can maintain the 
 
 The `auto` model setting selects the low-latency `large-v3-turbo` model for both GPU and CPU processing. The full `large-v3` model remains available through the **Most accurate** (**Najdokładniejszy** in Polish) profile.
 
-Mówik first attempts to load the model exclusively from its local cache. Once the model has been downloaded, application startup therefore does not depend on a response from the Hugging Face server.
+Mówik first attempts to load the model exclusively from its local cache. Once the model has been downloaded, application startup therefore does not depend on a response from the Hugging Face server. Every supported model is pinned to an immutable Hugging Face revision. If the local snapshot cannot be loaded, normal startup retries that exact revision instead of silently accepting a moving upstream branch.
+
+The source and legacy ZIP distribution also includes `POBIERZ_MODEL_PONOWNIE.cmd`. Exit Mówik before running it; the shortcut invokes `.venv\Scripts\python.exe mowik.py --download-model --console-log` and forcibly refreshes the pinned snapshot. The installed GUI build does not currently expose a **Download model again** button in Mówik Center.
 
 For the best results, use a microphone close to your mouth, reduce background noise, select the language you are speaking instead of automatic detection, maintain a custom vocabulary, and speak in short, clear phrases. No speech-recognition system can guarantee 100% accuracy.
 
-The installer includes its own CUDA 12.9, cuBLAS, and cuDNN runtime, so Mówik does not depend on CUDA libraries installed by other applications. A compatible NVIDIA GPU is selected automatically; CUDA processing uses `float16`, while the automatic CPU fallback uses `int8`. The bundled CUDA runtime supports RTX 50-series GPUs. If the GPU encoder test fails, Mówik records the technical details in the log and continues on the CPU.
+The installer includes its own CUDA 12.9 and cuBLAS runtime, so Mówik does not depend on CUDA libraries installed by other applications. The bundled CTranslate2 handles Whisper convolution without cuDNN, so that unused package is not included. A compatible NVIDIA GPU is selected automatically; CUDA processing uses `float16`, while the automatic CPU fallback uses `int8`. The bundled CUDA runtime supports RTX 50-series GPUs. If the GPU encoder test fails, Mówik records the technical details in the log and continues on the CPU.
 
 In CPU mode, a thread count of `0` enables automatic selection based on the number of physical CPU cores, up to a maximum of 16 threads.
 
@@ -249,16 +255,17 @@ In CPU mode, a thread count of `0` enables automatic selection based on the numb
 | Sounds | `%APPDATA%\Mowik\sounds` |
 | Models | `%LOCALAPPDATA%\Mowik\models` |
 
-Mówik cannot insert text into an application running as administrator unless Mówik itself is also running as administrator. This is a Windows security restriction on simulated keyboard input between processes running with different privilege levels.
+Forcing Mówik to start with **Run as administrator** is unsupported; launch it normally, without elevated privileges. Mówik cannot insert text into an elevated application because Windows blocks simulated keyboard input from a lower-privileged process.
 
 ## Repair, startup, and building
 
 - Running the same installer again repairs application files without deleting user data.
 - Automatic startup is an unchecked, explicit opt-in in the setup wizard. Running the installer again allows you to change that option.
 - The interface language can follow Windows automatically or be set explicitly to English or Polish in Mówik Center.
-- `BUDUJ_EXE.cmd` builds the application directory at `dist\Mowik`.
-- `BUDUJ_INSTALATOR.cmd` runs the tests, builds the application, and creates the explicitly local-only `release\Mowik-x.y.z-Setup-UNSIGNED.exe` together with its SHA-256 checksum. Do not upload an ad-hoc local build as an official release. Official artifacts are built through the GitHub release workflow together with `SHA256SUMS.txt`; the public 2.7.3 installer is also unsigned and may trigger Windows warnings.
-- Reproducible release definitions are stored in `packaging`, and the GitHub Actions workflow is located at `.github/workflows/windows-release.yml`.
+- `BUDUJ_EXE.cmd` builds the application directory at `dist\Mowik`. It uses a separate, recreated build environment and verifies the exact package set and file hashes.
+- `BUDUJ_INSTALATOR.cmd` runs the tests, builds the application in the same clean environment, and creates the explicitly local-only `release\Mowik-x.y.z-Setup-LOCAL-UNSIGNED.exe` together with its SHA-256 checksum. Do not upload an ad-hoc local build as an official release. Official artifacts are built through the GitHub release workflow together with `BUILD-INFO.txt` and `SHA256SUMS.txt`; the official installer is also unsigned and may trigger Windows warnings.
+- Reproducible release definitions are stored in `packaging`; `constraints-release.txt` records the complete dependency set, while the `*-hashed.txt` locks restrict installs to Windows wheels verified with SHA-256. The GitHub Actions workflow is located at `.github/workflows/windows-release.yml`.
+- Automated installer QA performs fresh English and Polish installs, same-version repair, packaged Settings startup, and uninstall on GitHub's current `windows-latest` image. The declared Windows 10 version 1809 minimum and upgrades from older published versions still require a manual VM regression before release; hosted CI does not provide that legacy OS or a physical microphone/model fixture.
 
 ## License
 

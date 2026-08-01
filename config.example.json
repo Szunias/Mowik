@@ -9,6 +9,7 @@
   "pre_roll_ms": 300,
   "post_roll_ms": 120,
   "minimum_recording_ms": 250,
+  "maximum_recording_seconds": 300,
   "minimum_rms": 0.0015,
   "microphone": null,
   "vad": {

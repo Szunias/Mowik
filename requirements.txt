@@ -1,7 +1,8 @@
 faster-whisper==1.2.1
 ctranslate2==4.8.1
-# Exact direct dependency versions keep public build inputs auditable and
-# reduce needless binary/hash churn that resets download reputation.
+# Exact direct dependency versions keep source installs predictable. Frozen
+# builds additionally use constraints-release.txt to lock the full transitive
+# Windows release environment.
 numpy==2.4.6
 sounddevice==0.5.5
 pynput==1.8.2

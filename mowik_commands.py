@@ -786,7 +786,16 @@ class CommandRegistry:
             raw_tokens = _tokens_with_raw_spans(transcript)
             if len(raw_tokens) < phrase_token_count:
                 return None
-            raw_end = raw_tokens[phrase_token_count - 1][2]
+            matched_token = raw_tokens[phrase_token_count - 1]
+            # Jeden surowy znak może po NFKC rozwinąć się do kilku tokenów
+            # (np. U+2100 -> "a/c"). Granicy wewnątrz takiego znaku nie da się
+            # odwzorować na bezpieczny surowy ogon, więc odrzucamy dopasowanie.
+            if (
+                len(raw_tokens) > phrase_token_count
+                and raw_tokens[phrase_token_count][1:] == matched_token[1:]
+            ):
+                return None
+            raw_end = matched_token[2]
             return MatchResult(definition, transcript[raw_end:].lstrip())
         return None
 

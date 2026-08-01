@@ -15,6 +15,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     outputs:
       release_version: ${{ steps.authorize.outputs.release_version }}
       tag_commit: ${{ steps.authorize.outputs.tag_commit }}
@@ -38,6 +40,14 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-gpu.txt
+            constraints-release.txt
+            requirements-bootstrap-hashed.txt
+            requirements-runtime-hashed.txt
+            requirements-gpu-hashed.txt
+            constraints-release-hashed.txt
 
       - name: Authorize immutable release tag
         id: authorize
@@ -97,6 +107,17 @@ jobs:
           }
           if ($remoteCommit -ine $headCommit) {
             throw "Release tag $tag on origin does not point to the checked-out commit."
+          }
+
+          $mainLines = @(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
+          if (($LASTEXITCODE -ne 0) -or ($mainLines.Count -ne 1) -or
+              [string]::IsNullOrWhiteSpace($mainLines[0])) {
+            throw 'Could not resolve the fetched origin/main commit.'
+          }
+          $mainCommit = $mainLines[0].Trim()
+          git merge-base --is-ancestor $tagCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag $tag is not reachable from origin/main."
           }
 
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -191,6 +212,7 @@ jobs:
         run: |
           ./scripts/test-release-artifacts.ps1 `
             -Version $env:RELEASE_VERSION `
+            -ExpectedBuildMode UnsignedRelease `
             -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
 
       - name: Capture verified payload identity
@@ -210,12 +232,21 @@ jobs:
           "checksum_sha256=$checksumHash" |
             Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      - name: Attest verified unsigned release payload
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: |
+            release/Mowik-${{ env.RELEASE_VERSION }}-Setup-UNSIGNED.exe
+            release/BUILD-INFO.txt
+            release/SHA256SUMS.txt
+
       - name: Upload verified unsigned build artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Mowik-${{ env.RELEASE_VERSION }}-Windows-UNSIGNED
           path: |
             release/Mowik-${{ env.RELEASE_VERSION }}-Setup-UNSIGNED.exe
+            release/BUILD-INFO.txt
             release/SHA256SUMS.txt
           if-no-files-found: error
           compression-level: 0
@@ -285,6 +316,17 @@ jobs:
             throw "Release tag $tag moved after the artifact was built."
           }
 
+          $mainLines = @(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
+          if (($LASTEXITCODE -ne 0) -or ($mainLines.Count -ne 1) -or
+              [string]::IsNullOrWhiteSpace($mainLines[0])) {
+            throw 'Could not resolve the fetched origin/main commit before publishing.'
+          }
+          $mainCommit = $mainLines[0].Trim()
+          git merge-base --is-ancestor $env:MOWIK_RELEASE_TAG_COMMIT $mainCommit
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag $tag is not reachable from origin/main before publishing."
+          }
+
           ./scripts/test-release-version.ps1 -Version $env:RELEASE_VERSION
 
       - name: Download unsigned artifact from the isolated build job
@@ -313,6 +355,7 @@ jobs:
           }
           ./scripts/test-release-artifacts.ps1 `
             -Version $env:RELEASE_VERSION `
+            -ExpectedBuildMode UnsignedRelease `
             -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
 
       - name: Publish verified immutable GitHub Release
@@ -320,11 +363,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          Import-Module ./scripts/WindowsReleaseTools.psm1 -Force -DisableNameChecking
           $tag = $env:GITHUB_REF_NAME
           $installer = "release/Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
+          $buildInfo = 'release/BUILD-INFO.txt'
           $checksum = 'release/SHA256SUMS.txt'
           ./scripts/test-release-artifacts.ps1 `
             -Version $env:RELEASE_VERSION `
+            -ExpectedBuildMode UnsignedRelease `
             -InstallerFileName "Mowik-$env:RELEASE_VERSION-Setup-UNSIGNED.exe"
 
           function Get-RemoteTagCommit {
@@ -386,43 +432,9 @@ jobs:
 
           # Upload without replacement. If this or verification fails, retain
           # the draft for manual inspection; never delete a draft here.
-          gh release upload $tag $installer $checksum
+          gh release upload $tag $installer $buildInfo $checksum
           if ($LASTEXITCODE -ne 0) {
             throw "Uploading assets to draft GitHub Release $tag failed."
-          }
-
-          function Assert-ExactReleaseAssets {
-            param([Parameter(Mandatory)] $Release)
-
-            $expectedFiles = @(
-              Get-Item -LiteralPath $installer,
-              Get-Item -LiteralPath $checksum
-            )
-            $expectedNames = @($expectedFiles | ForEach-Object { $_.Name } | Sort-Object)
-            $actualAssets = @($Release.assets)
-            $actualNames = @($actualAssets | ForEach-Object { $_.name } | Sort-Object)
-            if (($actualNames.Count -ne $expectedNames.Count) -or
-                (($actualNames -join "`n") -cne ($expectedNames -join "`n"))) {
-              throw (
-                "Release $tag has an unexpected asset set. Expected: " +
-                ($expectedNames -join ', ') + '; found: ' + ($actualNames -join ', ')
-              )
-            }
-            foreach ($file in $expectedFiles) {
-              $asset = @($actualAssets | Where-Object { $_.name -ceq $file.Name })
-              $expectedDigest = 'sha256:' + (
-                Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
-              ).Hash.ToLowerInvariant()
-              if (($asset.Count -ne 1) -or
-                  ([int64]$asset[0].size -ne $file.Length) -or
-                  ($asset[0].state -cne 'uploaded') -or
-                  ($asset[0].digest -cne $expectedDigest)) {
-                throw (
-                  "Release asset $($file.Name) has an unexpected size, digest, " +
-                  'state or duplicate entry.'
-                )
-              }
-            }
           }
 
           $draft = gh release view $tag --json tagName,isDraft,assets | ConvertFrom-Json
@@ -432,7 +444,10 @@ jobs:
           if (($draft.tagName -cne $tag) -or (-not $draft.isDraft)) {
             throw "Release $tag is not the expected draft."
           }
-          Assert-ExactReleaseAssets -Release $draft
+          Assert-ExactGitHubReleaseAssets `
+            -Release $draft `
+            -ReleaseTag $tag `
+            -ExpectedPath @($installer, $buildInfo, $checksum)
 
           $remoteCommit = Get-RemoteTagCommit -Tag $tag
           if ($remoteCommit -ine $env:MOWIK_RELEASE_TAG_COMMIT) {
@@ -451,4 +466,7 @@ jobs:
           if (($published.tagName -cne $tag) -or $published.isDraft) {
             throw "Release $tag was not published as expected."
           }
-          Assert-ExactReleaseAssets -Release $published
+          Assert-ExactGitHubReleaseAssets `
+            -Release $published `
+            -ReleaseTag $tag `
+            -ExpectedPath @($installer, $buildInfo, $checksum)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -277,6 +278,50 @@ class ExecutableAndPrivilegeSafetyTests(unittest.TestCase):
         ):
             self.assertTrue(windows_actions.is_process_elevated())
 
+    def test_executable_revalidation_rejects_identity_change(self) -> None:
+        executable = r"C:\Users\Test\AppData\Local\Microsoft\WindowsApps\wt.exe"
+        expected = windows_actions._PathIdentity(1, 2, 0x8000001B, 0, 4, 5)
+        replaced = windows_actions._PathIdentity(1, 99, 0, 12, 40, 50)
+
+        with mock.patch.object(
+            windows_actions,
+            "_existing_absolute_executable",
+            return_value=executable,
+        ) as existing, mock.patch.object(
+            windows_actions,
+            "_capture_path_identity",
+            return_value=replaced,
+        ):
+            result = windows_actions._revalidate_executable(
+                executable,
+                expected,
+                allow_app_execution_alias=True,
+            )
+
+        self.assertIsNone(result)
+        existing.assert_called_once_with(
+            executable,
+            allow_app_execution_alias=True,
+        )
+
+    def test_directory_revalidation_rejects_recreated_path(self) -> None:
+        directory = Path(r"C:\Work\Mowik")
+        expected = windows_actions._PathIdentity(1, 2, 0, 0, 0, 0)
+        recreated = windows_actions._PathIdentity(1, 3, 0, 0, 0, 0)
+
+        with mock.patch.object(
+            windows_actions,
+            "_canonical_local_directory",
+            return_value=directory,
+        ), mock.patch.object(
+            windows_actions,
+            "_capture_path_identity",
+            return_value=recreated,
+        ):
+            result = windows_actions._revalidate_directory(directory, expected)
+
+        self.assertIsNone(result)
+
 
 class TerminalLaunchTests(unittest.TestCase):
     def test_terminal_argument_templates_never_execute_or_hide_commands(self) -> None:
@@ -315,6 +360,7 @@ class TerminalLaunchTests(unittest.TestCase):
         directory = Path(r"C:\Work\Mowik")
         wt_path = r"C:\Program Files\WindowsApps\wt.exe"
         process = mock.Mock(pid=4321)
+        identity = windows_actions._PathIdentity(1, 2, 0, 3, 4, 5)
 
         with (
             mock.patch.object(windows_actions.os, "name", "nt"),
@@ -332,6 +378,21 @@ class TerminalLaunchTests(unittest.TestCase):
                 windows_actions,
                 "_resolve_shell",
             ) as resolve_shell,
+            mock.patch.object(
+                windows_actions,
+                "_capture_path_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_revalidate_directory",
+                return_value=directory,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_revalidate_executable",
+                return_value=wt_path,
+            ) as revalidate_executable,
             mock.patch.object(
                 windows_actions.subprocess,
                 "Popen",
@@ -363,14 +424,21 @@ class TerminalLaunchTests(unittest.TestCase):
         self.assertEqual(keyword["cwd"], str(directory))
         self.assertIs(keyword["shell"], False)
         self.assertTrue(keyword["close_fds"])
+        revalidate_executable.assert_called_once_with(
+            wt_path,
+            identity,
+            allow_app_execution_alias=True,
+        )
         assert result.handle is not None
         self.assertEqual(result.handle.host, "windows_terminal")
         self.assertEqual(result.handle.shell, "default")
+        self.assertIs(result.handle._process, process)
 
     def test_classic_host_with_default_shell_maps_to_a_visible_console(self) -> None:
         directory = Path(r"C:\Work\Mowik")
         cmd_path = r"C:\Windows\System32\cmd.exe"
         process = mock.Mock(pid=8765)
+        identity = windows_actions._PathIdentity(1, 2, 0, 3, 4, 5)
 
         with (
             mock.patch.object(windows_actions.os, "name", "nt"),
@@ -389,6 +457,21 @@ class TerminalLaunchTests(unittest.TestCase):
                 "_find_executable",
                 side_effect=AssertionError("classic host must not probe wt.exe"),
             ),
+            mock.patch.object(
+                windows_actions,
+                "_capture_path_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_revalidate_directory",
+                return_value=directory,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_revalidate_executable",
+                return_value=cmd_path,
+            ) as revalidate_executable,
             mock.patch.object(
                 windows_actions.subprocess,
                 "Popen",
@@ -413,9 +496,57 @@ class TerminalLaunchTests(unittest.TestCase):
         self.assertIs(keyword["shell"], False)
         self.assertEqual(keyword["creationflags"], windows_actions._CREATE_NEW_CONSOLE)
         self.assertTrue(keyword["close_fds"])
+        revalidate_executable.assert_called_once_with(cmd_path, identity)
         assert result.handle is not None
         self.assertEqual(result.handle.host, "console")
         self.assertEqual(result.handle.shell, "cmd")
+        self.assertIs(result.handle._process, process)
+
+    def test_auto_prefers_console_with_a_reliably_terminable_handle(self) -> None:
+        directory = Path(r"C:\Work\Mowik")
+        cmd_path = r"C:\Windows\System32\cmd.exe"
+        process = mock.Mock(pid=8765)
+        identity = windows_actions._PathIdentity(1, 2, 0, 3, 4, 5)
+
+        with mock.patch.object(
+            windows_actions.os,
+            "name",
+            "nt",
+        ), mock.patch.object(
+            windows_actions,
+            "_canonical_local_directory",
+            return_value=directory,
+        ), mock.patch.object(
+            windows_actions,
+            "_find_executable",
+            side_effect=AssertionError("auto must not launch the WT alias"),
+        ), mock.patch.object(
+            windows_actions,
+            "_resolve_shell",
+            return_value=("cmd", cmd_path),
+        ), mock.patch.object(
+            windows_actions,
+            "_capture_path_identity",
+            return_value=identity,
+        ), mock.patch.object(
+            windows_actions,
+            "_revalidate_directory",
+            return_value=directory,
+        ), mock.patch.object(
+            windows_actions,
+            "_revalidate_executable",
+            return_value=cmd_path,
+        ), mock.patch.object(
+            windows_actions.subprocess,
+            "Popen",
+            return_value=process,
+        ):
+            result = windows_actions.launch_terminal("auto", "default", directory)
+
+        self.assertTrue(result.ok)
+        assert result.handle is not None
+        self.assertEqual(result.handle.host, "console")
+        self.assertIs(result.handle._process, process)
 
     def test_invalid_directory_is_rejected_before_process_creation(self) -> None:
         with (
@@ -436,6 +567,185 @@ class TerminalLaunchTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "invalid_working_directory")
         popen.assert_not_called()
+
+    def test_changed_directory_is_rejected_immediately_before_popen(self) -> None:
+        directory = Path(r"C:\Work\Mowik")
+        wt_path = r"C:\Users\Test\AppData\Local\Microsoft\WindowsApps\wt.exe"
+        identity = windows_actions._PathIdentity(1, 2, 0, 3, 4, 5)
+
+        with (
+            mock.patch.object(windows_actions.os, "name", "nt"),
+            mock.patch.object(
+                windows_actions,
+                "_canonical_local_directory",
+                return_value=directory,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_capture_path_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_find_executable",
+                return_value=wt_path,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_revalidate_directory",
+                return_value=None,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_revalidate_executable",
+                return_value=wt_path,
+            ),
+            mock.patch.object(windows_actions.subprocess, "Popen") as popen,
+        ):
+            result = windows_actions.launch_terminal(
+                "windows_terminal",
+                "default",
+                directory,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "launch_target_changed")
+        popen.assert_not_called()
+
+    def test_changed_windows_terminal_alias_is_rejected_before_popen(self) -> None:
+        directory = Path(r"C:\Work\Mowik")
+        wt_path = r"C:\Users\Test\AppData\Local\Microsoft\WindowsApps\wt.exe"
+        identity = windows_actions._PathIdentity(1, 2, 0x8000001B, 0, 4, 5)
+
+        with (
+            mock.patch.object(windows_actions.os, "name", "nt"),
+            mock.patch.object(
+                windows_actions,
+                "_canonical_local_directory",
+                return_value=directory,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_capture_path_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_find_executable",
+                return_value=wt_path,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_revalidate_directory",
+                return_value=directory,
+            ),
+            mock.patch.object(
+                windows_actions,
+                "_revalidate_executable",
+                return_value=None,
+            ) as revalidate_executable,
+            mock.patch.object(windows_actions.subprocess, "Popen") as popen,
+        ):
+            result = windows_actions.launch_terminal(
+                "windows_terminal",
+                "default",
+                directory,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "launch_target_changed")
+        revalidate_executable.assert_called_once_with(
+            wt_path,
+            identity,
+            allow_app_execution_alias=True,
+        )
+        popen.assert_not_called()
+
+
+class TerminalCleanupTests(unittest.TestCase):
+    @staticmethod
+    def handle_for(
+        process: object,
+        *,
+        launched_at: float = 99.0,
+        host: str = "console",
+    ):
+        return windows_actions.TerminalHandle(
+            host=host,
+            shell="cmd",
+            cwd=Path(r"C:\Work\Mowik"),
+            launcher_pid=321,
+            launched_at_monotonic=launched_at,
+            launcher_handle=654,
+            _process=process,
+        )
+
+    def test_fresh_retained_process_is_terminated_without_reopening_pid(self) -> None:
+        process = mock.Mock(pid=321, _handle=654)
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        handle = self.handle_for(process)
+
+        with mock.patch.object(windows_actions.time, "monotonic", return_value=100.0):
+            result = windows_actions.terminate_terminal(handle)
+
+        self.assertEqual(result.status, "terminated")
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=1.0)
+        process.kill.assert_not_called()
+
+    def test_timeout_escalates_only_the_retained_process_to_kill(self) -> None:
+        process = mock.Mock(pid=321, _handle=654)
+        process.poll.return_value = None
+        process.wait.side_effect = (
+            windows_actions.subprocess.TimeoutExpired("terminal", 0.1),
+            0,
+        )
+        handle = self.handle_for(process)
+
+        with mock.patch.object(windows_actions.time, "monotonic", return_value=100.0):
+            result = windows_actions.terminate_terminal(
+                handle,
+                timeout_seconds=0.1,
+            )
+
+        self.assertEqual(result.status, "terminated")
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_mismatched_or_expired_identity_is_rejected_without_termination(self) -> None:
+        mismatched = mock.Mock(pid=999, _handle=654)
+        expired = mock.Mock(pid=321, _handle=654)
+
+        with mock.patch.object(windows_actions.time, "monotonic", return_value=100.0):
+            mismatch_result = windows_actions.terminate_terminal(
+                self.handle_for(mismatched)
+            )
+            expired_result = windows_actions.terminate_terminal(
+                self.handle_for(expired, launched_at=1.0)
+            )
+
+        self.assertEqual(mismatch_result.status, "rejected")
+        self.assertEqual(mismatch_result.reason, "process_identity_mismatch")
+        self.assertEqual(expired_result.status, "rejected")
+        self.assertEqual(expired_result.reason, "cleanup_window_expired")
+        mismatched.terminate.assert_not_called()
+        expired.terminate.assert_not_called()
+
+    def test_windows_terminal_handoff_is_not_reported_as_successful_cleanup(
+        self,
+    ) -> None:
+        process = mock.Mock(pid=321, _handle=654)
+        process.poll.return_value = 0
+        handle = self.handle_for(process, host="windows_terminal")
+
+        with mock.patch.object(windows_actions.time, "monotonic", return_value=100.0):
+            result = windows_actions.terminate_terminal(handle)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "unmanaged_wt_handoff")
+        process.terminate.assert_not_called()
 
 
 class TerminalDraftDeliveryTests(unittest.TestCase):
@@ -519,6 +829,17 @@ class TerminalDraftDeliveryTests(unittest.TestCase):
 
 
 class ExplorerIntegrationFailClosedTests(unittest.TestCase):
+    def test_concurrent_or_stuck_com_resolution_fails_closed(self) -> None:
+        lock = threading.Lock()
+        lock.acquire()
+        try:
+            with mock.patch.object(windows_actions, "_EXPLORER_COM_LOCK", lock):
+                result = windows_actions._explorer_path_from_com(123)
+        finally:
+            lock.release()
+
+        self.assertIsNone(result)
+
     def test_missing_pywin32_returns_no_explorer_path(self) -> None:
         with mock.patch.dict(
             sys.modules,

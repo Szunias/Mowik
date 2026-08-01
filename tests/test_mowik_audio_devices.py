@@ -105,6 +105,31 @@ class StableMicrophoneSelectorTests(unittest.TestCase):
 
         self.assertEqual(resolved, 0)
 
+    def test_sample_rate_change_does_not_make_same_device_disappear(self) -> None:
+        selector = audio_devices.build_microphone_selector(
+            2,
+            self.devices,
+            self.host_apis,
+        )
+        changed_rate = [
+            device(
+                "Studio Microphone",
+                1,
+                inputs=2,
+                outputs=2,
+                sample_rate=44_100,
+            )
+        ]
+
+        self.assertEqual(
+            audio_devices.resolve_microphone_device(
+                selector,
+                changed_rate,
+                self.host_apis,
+            ),
+            0,
+        )
+
     def test_missing_device_fails_closed_without_echoing_its_name(self) -> None:
         selector = audio_devices.build_microphone_selector(
             2,

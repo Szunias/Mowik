@@ -2,10 +2,14 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.7.3',
+    [string]$Version = '2.7.4',
 
     [Parameter()]
     [string]$InstallerFileName = "Mowik-$Version-Setup.exe",
+
+    [Parameter(Mandatory)]
+    [ValidateSet('UnsignedLocal', 'UnsignedRelease', 'SignedRelease')]
+    [string]$ExpectedBuildMode,
 
     [Parameter()]
     [switch]$RequireAuthenticode,
@@ -22,10 +26,13 @@ Set-StrictMode -Version Latest
 
 $Root = Split-Path -Parent $PSScriptRoot
 $ReleaseDir = Join-Path $Root 'release'
+$BuildInfoFileName = 'BUILD-INFO.txt'
 $HashFileName = 'SHA256SUMS.txt'
+Import-Module (Join-Path $PSScriptRoot 'WindowsReleaseTools.psm1') -Force -DisableNameChecking
 
 if ([IO.Path]::GetFileName($InstallerFileName) -ne $InstallerFileName -or
-    $InstallerFileName -notmatch '^Mowik-[0-9]+\.[0-9]+\.[0-9]+-Setup(?:-UNSIGNED)?\.exe$') {
+    $InstallerFileName -notmatch
+        '^Mowik-[0-9]+\.[0-9]+\.[0-9]+-Setup(?:-LOCAL-UNSIGNED|-UNSIGNED)?\.exe$') {
     throw "Invalid installer file name: $InstallerFileName"
 }
 if (-not $InstallerFileName.StartsWith("Mowik-$Version-", [StringComparison]::Ordinal)) {
@@ -40,7 +47,7 @@ if (($ReleaseItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
     throw "Release directory must not be a reparse point: $ReleaseDir"
 }
 
-$ExpectedNames = @($InstallerFileName, $HashFileName) | Sort-Object
+$ExpectedNames = @($InstallerFileName, $BuildInfoFileName, $HashFileName) | Sort-Object
 $ActualItems = @(Get-ChildItem -LiteralPath $ReleaseDir -Force)
 $ActualNames = @($ActualItems | ForEach-Object { $_.Name } | Sort-Object)
 if (($ActualNames.Count -ne $ExpectedNames.Count) -or
@@ -53,8 +60,28 @@ if (($ActualNames.Count -ne $ExpectedNames.Count) -or
 if (@($ActualItems | Where-Object { $_.PSIsContainer }).Count -gt 0) {
     throw 'Release payload must contain files only.'
 }
+$ExpectedInstallerName = switch ($ExpectedBuildMode) {
+    'SignedRelease' { "Mowik-$Version-Setup.exe" }
+    'UnsignedRelease' { "Mowik-$Version-Setup-UNSIGNED.exe" }
+    'UnsignedLocal' { "Mowik-$Version-Setup-LOCAL-UNSIGNED.exe" }
+}
+if ($InstallerFileName -cne $ExpectedInstallerName) {
+    throw (
+        "Installer name '$InstallerFileName' does not match build mode " +
+        "'$ExpectedBuildMode'."
+    )
+}
+if (($ExpectedBuildMode -eq 'SignedRelease') -ne [bool]$RequireAuthenticode) {
+    throw 'Only SignedRelease can require Authenticode, and it must require it.'
+}
+if (@($ActualItems | Where-Object {
+    ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+}).Count -gt 0) {
+    throw 'Release payload must not contain reparse points.'
+}
 
 $Installer = Join-Path $ReleaseDir $InstallerFileName
+$BuildInfoPath = Join-Path $ReleaseDir $BuildInfoFileName
 $HashPath = Join-Path $ReleaseDir $HashFileName
 if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
     throw "Installer not found: $Installer"
@@ -62,12 +89,34 @@ if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $HashPath -PathType Leaf)) {
     throw "Checksum file not found: $HashPath"
 }
+if (-not (Test-Path -LiteralPath $BuildInfoPath -PathType Leaf)) {
+    throw "Build information file not found: $BuildInfoPath"
+}
 
 $Hash = (Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash.ToLowerInvariant()
-$ExpectedHashLine = "$Hash  $InstallerFileName"
+$SourceIdentity = Get-ReleaseSourceIdentity -ProjectRoot $Root
+$ExpectedBuildInfo = @(
+    'MOWIK-RELEASE-BUILD-INFO-V2'
+    "version`t$Version"
+    "build-mode`t$ExpectedBuildMode"
+    "installer`t$InstallerFileName"
+    "installer-sha256`t$Hash"
+    "source-sha256`t$SourceIdentity"
+) -join "`n"
+$RawBuildInfo = [IO.File]::ReadAllText($BuildInfoPath, [Text.Encoding]::ASCII)
+if ($RawBuildInfo -cne ($ExpectedBuildInfo + "`n")) {
+    throw 'BUILD-INFO.txt does not match the current release source and installer.'
+}
+$BuildInfoHash = (
+    Get-FileHash -LiteralPath $BuildInfoPath -Algorithm SHA256
+).Hash.ToLowerInvariant()
+$ExpectedHashFile = @(
+    "$Hash  $InstallerFileName"
+    "$BuildInfoHash  $BuildInfoFileName"
+) -join "`n"
 $RawHashFile = [IO.File]::ReadAllText($HashPath, [Text.Encoding]::ASCII)
-if (($RawHashFile -cne ($ExpectedHashLine + "`n")) -and
-    ($RawHashFile -cne ($ExpectedHashLine + "`r`n"))) {
+if (($RawHashFile -cne ($ExpectedHashFile + "`n")) -and
+    ($RawHashFile -cne ($ExpectedHashFile.Replace("`n", "`r`n") + "`r`n"))) {
     throw 'SHA256SUMS.txt is non-canonical or does not match the installer.'
 }
 
@@ -75,13 +124,12 @@ if ($RequireAuthenticode) {
     if ([string]::IsNullOrWhiteSpace($ExpectedSignerThumbprint)) {
         throw '-RequireAuthenticode requires -ExpectedSignerThumbprint.'
     }
-    Import-Module (Join-Path $PSScriptRoot 'WindowsReleaseTools.psm1') -Force -DisableNameChecking
     Assert-AuthenticodeSignature `
         -Path $Installer `
         -ExpectedSignerThumbprint $ExpectedSignerThumbprint `
         -SignToolPath $SignToolPath
 }
-elseif ($InstallerFileName -notlike '*-UNSIGNED.exe') {
+elseif ($ExpectedBuildMode -eq 'SignedRelease') {
     throw 'An unsigned artifact must use the explicit -UNSIGNED.exe file name.'
 }
 

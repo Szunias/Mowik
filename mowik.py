@@ -9,9 +9,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import contextmanager
+import hashlib
 import io
 import ctypes
+from ctypes import wintypes
 import difflib
+import gc
+import ipaddress
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -26,6 +31,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,7 +40,138 @@ import wave
 from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+
+APP_NAME = "Mowik"
+APP_DISPLAY_NAME = "Mówik"
+APP_VERSION = "2.7.4"
+
+
+def _run_early_read_only_probe(
+    *,
+    executed_as_main: Optional[bool] = None,
+    argv: Optional[list[str]] = None,
+) -> None:
+    """Handle build probes without importing the application dependency stack."""
+
+    if executed_as_main is None:
+        executed_as_main = __name__ == "__main__"
+    if not executed_as_main:
+        return
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments == ["--version"]:
+        print(f"{APP_DISPLAY_NAME} {APP_VERSION}")
+        raise SystemExit(0)
+    if arguments != ["--runtime-gui-smoke-test"]:
+        return
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        root.update_idletasks()
+        root.destroy()
+    except Exception as exc:
+        print(f"Tk GUI smoke test failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    raise SystemExit(0)
+
+
+def _early_windows_process_is_elevated() -> bool:
+    """Query elevation using only the standard library; uncertainty denies."""
+
+    if os.name != "nt":
+        return False
+
+    class TOKEN_ELEVATION(ctypes.Structure):
+        _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+    token = wintypes.HANDLE()
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE),
+        ]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            0x0008,  # TOKEN_QUERY
+            ctypes.byref(token),
+        ):
+            return True
+        elevation = TOKEN_ELEVATION()
+        returned = wintypes.DWORD(0)
+        if not advapi32.GetTokenInformation(
+            token,
+            20,  # TokenElevation
+            ctypes.byref(elevation),
+            ctypes.sizeof(elevation),
+            ctypes.byref(returned),
+        ):
+            return True
+        return bool(elevation.TokenIsElevated)
+    except (AttributeError, OSError, ValueError):
+        return True
+    finally:
+        if token:
+            try:
+                ctypes.WinDLL("kernel32").CloseHandle(token)
+            except (AttributeError, OSError):
+                pass
+
+
+def _reject_elevated_runtime_before_native_imports(
+    *,
+    executed_as_main: Optional[bool] = None,
+    argv: Optional[list[str]] = None,
+) -> None:
+    """Stop the elevated app before user-writable native packages are loaded."""
+
+    if executed_as_main is None:
+        executed_as_main = __name__ == "__main__"
+    if not executed_as_main or os.name != "nt":
+        return
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments in (["--version"], ["--runtime-gui-smoke-test"]):
+        return
+    if not _early_windows_process_is_elevated():
+        return
+    message = (
+        "Ze względów bezpieczeństwa Mówika nie można uruchamiać z "
+        "uprawnieniami administratora. Uruchom program normalnie.\n\n"
+        "For security reasons, Mówik cannot run with administrator "
+        "privileges. Start the application normally."
+    )
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            message,
+            "Mówik — uruchomienie zablokowane / startup blocked",
+            0x10,
+        )
+    except (AttributeError, OSError):
+        print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+_run_early_read_only_probe()
+_reject_elevated_runtime_before_native_imports()
 
 import mowik_commands as command_engine
 import mowik_audio_devices as audio_devices
@@ -127,7 +264,7 @@ def configure_cuda_dll_search_paths() -> tuple[Path, ...]:
     if provider_root is not None:
         candidates.extend(
             provider_root / package / "bin"
-            for package in ("cuda_nvrtc", "cuda_runtime", "cudnn")
+            for package in ("cuda_nvrtc", "cuda_runtime")
         )
     added: list[Path] = []
     seen: set[str] = set()
@@ -169,20 +306,40 @@ import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from faster_whisper.audio import pad_or_trim
+import huggingface_hub
+from huggingface_hub.errors import LocalEntryNotFoundError
 import ctranslate2
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from pynput import keyboard, mouse
 import pystray
 import pyperclip
 
 
-APP_NAME = "Mowik"
-APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.7.3"
 MUTEX_NAME = r"Local\MowikLocalDictation"
 SETTINGS_MUTEX_NAME = r"Local\MowikLocalDictation.Settings"
+CONFIG_WRITE_MUTEX_NAME = r"Local\MowikLocalDictation.ConfigWrite"
 PROCESS_STARTED_AT_NS = time.time_ns()
 SAMPLE_RATE = 16_000
+DEFAULT_MAXIMUM_RECORDING_SECONDS = 300
+MAXIMUM_RECORDING_SECONDS = 3_600
+MAX_RECORDING_BUFFER_BYTES = 256 * 1024 * 1024
+MAX_RECORDING_PIPELINE_BUFFERS = 3
+MAX_CAPTURE_SAMPLE_RATE = 384_000
+MAX_CONFIG_FILE_BYTES = 16 * 1024 * 1024
+MAX_DICTIONARY_FILE_BYTES = 8 * 1024 * 1024
+MAX_PENDING_EXPLORER_CONTEXTS = 2
+MAX_OLLAMA_TIMEOUT_SECONDS = 600
+RESTART_ACK_TIMEOUT_SECONDS = 2.0
+RESTART_MUTEX_WAIT_SECONDS = 15.0
+RESTART_STARTED_TIMEOUT_SECONDS = 25.0
+CLIPBOARD_WRITE_RETRY_DELAYS = (0.05, 0.10)
+MODEL_ALLOW_PATTERNS = (
+    "config.json",
+    "preprocessor_config.json",
+    "model.bin",
+    "tokenizer.json",
+    "vocabulary.*",
+)
 CUSTOM_COMMAND_ACTIONS = {
     "paste_text",
     "open",
@@ -195,6 +352,25 @@ MAX_CUSTOM_COMMAND_LINE_LENGTH = 8_000
 MAX_CUSTOM_OPEN_TARGET_LENGTH = command_engine.MAX_OPEN_TARGET_LENGTH
 MAX_CUSTOM_COMMAND_CONTEXT_AGE_SECONDS = 120.0
 BLOCKED_CUSTOM_OPEN_SUFFIXES = command_engine.BLOCKED_OPEN_SUFFIXES
+MODEL_SOURCES: dict[str, tuple[str, str]] = {
+    "tiny": (
+        "Systran/faster-whisper-tiny",
+        "d90ca5fe260221311c53c58e660288d3deb8d356",
+    ),
+    "small": (
+        "Systran/faster-whisper-small",
+        "536b0662742c02347bc0e980a01041f333bce120",
+    ),
+    "large-v3-turbo": (
+        "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+        "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+    ),
+    "large-v3": (
+        "Systran/faster-whisper-large-v3",
+        "edaa852ec7e145841d8ffdb056a99866b5f0a478",
+    ),
+}
+LEGACY_REMOVED_MODELS = frozenset({"base", "medium"})
 
 APP_ROOT = (
     Path(sys.executable).resolve().parent
@@ -212,6 +388,8 @@ MODEL_DIR = LOCALDATA_DIR / "models"
 LOG_PATH = LOCALDATA_DIR / "mowik.log"
 CONTROL_DIR = LOCALDATA_DIR / "control"
 RESTART_REQUEST_PATH = CONTROL_DIR / "restart.request"
+RESTART_ACK_PATH = CONTROL_DIR / "restart.ack"
+RESTART_STARTED_PATH = CONTROL_DIR / "restart.started"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "trigger": "keyboard:f8",
@@ -224,6 +402,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "pre_roll_ms": 300,
     "post_roll_ms": 120,
     "minimum_recording_ms": 250,
+    "maximum_recording_seconds": DEFAULT_MAXIMUM_RECORDING_SECONDS,
     "minimum_rms": 0.0015,
     "microphone": None,
     "vad": {
@@ -382,8 +561,34 @@ class AppError(RuntimeError):
     pass
 
 
+class ElevatedRuntimeError(AppError):
+    """The per-user application was started with unsafe elevated rights."""
+
+
+class ConfigConflict(AppError):
+    """The on-disk configuration changed after an editor loaded it."""
+
+
 class OperationCancelled(AppError):
     """Internal control-flow signal for work cancelled during shutdown."""
+
+
+class RecordingDeadlineTimer(threading.Thread):
+    """A cancellable daemon deadline independent of patched Thread factories."""
+
+    def __init__(self, delay: float, callback, args: tuple[Any, ...]) -> None:
+        super().__init__(name="RecordingLimit", daemon=True)
+        self._delay = max(0.0, float(delay))
+        self._callback = callback
+        self._args = args
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    def run(self) -> None:
+        if not self._cancelled.wait(self._delay):
+            self._callback(*self._args)
 
 
 @dataclass(frozen=True)
@@ -517,13 +722,14 @@ def build_microphone_choice_state(
             descriptor
         )
 
-    selector_counts: dict[audio_devices.MicrophoneSelector, int] = {}
+    selector_counts: dict[tuple[Any, ...], int] = {}
     for selector in selectors_by_index.values():
-        selector_counts[selector] = selector_counts.get(selector, 0) + 1
+        identity = audio_devices.microphone_identity_key(selector)
+        selector_counts[identity] = selector_counts.get(identity, 0) + 1
 
     blocked_labels: set[str] = set()
     for index, selector in selectors_by_index.items():
-        ambiguous = selector_counts[selector] > 1
+        ambiguous = selector_counts[audio_devices.microphone_identity_key(selector)] > 1
         label = _microphone_device_label(
             selector,
             index,
@@ -633,8 +839,65 @@ def resolve_runtime_microphone(
 ) -> tuple[Optional[int], Optional[Any]]:
     """Resolve one explicit selector against a single fresh PortAudio snapshot."""
 
+    device_index, device_info, _ = _resolve_runtime_microphone_with_identity(
+        configured_value,
+        translator,
+        device_source,
+        host_api_source,
+    )
+    return device_index, device_info
+
+
+def _prefer_wasapi_equivalent(
+    device_index: int,
+    devices: tuple[Any, ...],
+    host_apis: tuple[Any, ...],
+) -> int:
+    """Map a legacy MME endpoint to one unambiguous same-name WASAPI input."""
+
+    selected = audio_devices.parse_microphone_selector(
+        audio_devices.build_microphone_selector(device_index, devices, host_apis)
+    )
+    if "wasapi" in selected.host_api_name.casefold():
+        return device_index
+    normalized_name = " ".join(selected.name.split()).casefold()
+    candidates: list[int] = []
+    for index in range(len(devices)):
+        try:
+            candidate = audio_devices.parse_microphone_selector(
+                audio_devices.build_microphone_selector(index, devices, host_apis)
+            )
+        except audio_devices.MicrophoneSelectionError as exc:
+            if exc.code == audio_devices.ERROR_DEVICE_NOT_INPUT:
+                continue
+            raise
+        if (
+            "wasapi" in candidate.host_api_name.casefold()
+            and " ".join(candidate.name.split()).casefold() == normalized_name
+            and candidate.max_input_channels == selected.max_input_channels
+            and candidate.max_output_channels == selected.max_output_channels
+        ):
+            candidates.append(index)
+    if len(candidates) > 1:
+        # WASAPI is only an optional optimization for a device that was
+        # already resolved unambiguously.  Multiple same-name alternatives
+        # must not make the exact endpoint saved by the user unusable.
+        return device_index
+    return candidates[0] if candidates else device_index
+
+
+def _resolve_runtime_microphone_with_identity(
+    configured_value: Any,
+    translator: Translator,
+    device_source: Any = None,
+    host_api_source: Any = None,
+    *,
+    prefer_wasapi: bool = True,
+) -> tuple[Optional[int], Optional[Any], Optional[dict[str, Any]]]:
+    """Resolve a microphone and capture its identity from the same snapshot."""
+
     if configured_value is None:
-        return None, None
+        return None, None, None
     if device_source is None:
         device_source = sd.query_devices
     if host_api_source is None:
@@ -642,6 +905,7 @@ def resolve_runtime_microphone(
     error_code: Optional[str] = None
     device_index: Optional[int] = None
     device_info: Optional[Any] = None
+    device_identity: Optional[dict[str, Any]] = None
     try:
         device_snapshot = tuple(device_source())
         host_api_snapshot = tuple(host_api_source())
@@ -651,8 +915,19 @@ def resolve_runtime_microphone(
             host_api_snapshot,
         )
         if device_index is None:
-            return None, None
+            return None, None, None
+        if prefer_wasapi:
+            device_index = _prefer_wasapi_equivalent(
+                device_index,
+                device_snapshot,
+                host_api_snapshot,
+            )
         device_info = device_snapshot[device_index]
+        device_identity = audio_devices.build_microphone_selector(
+            device_index,
+            device_snapshot,
+            host_api_snapshot,
+        )
     except audio_devices.MicrophoneSelectionError as exc:
         error_code = exc.code
     except Exception:
@@ -661,7 +936,7 @@ def resolve_runtime_microphone(
         # Wyjście z bloku except usuwa niejawny kontekst, który mógłby zawierać
         # nazwę urządzenia albo szczegóły błędu sterownika.
         raise microphone_selection_app_error(error_code, translator)
-    return device_index, device_info
+    return device_index, device_info, device_identity
 
 
 class CustomOpenTargetError(ValueError):
@@ -677,23 +952,51 @@ def ensure_directories() -> None:
 
 
 def setup_logging(console: bool = False) -> None:
-    ensure_directories()
-    handlers: list[logging.Handler] = [
-        RotatingFileHandler(
-            LOG_PATH,
-            maxBytes=2_000_000,
-            backupCount=3,
-            encoding="utf-8",
+    elevated = os.name == "nt" and windows_actions.is_process_elevated()
+    file_handler_error: Optional[OSError] = None
+    if elevated:
+        # Logging is initialized before first-run config creation.  Do not let
+        # an elevated process create/rotate a file through user-controlled
+        # LOCALAPPDATA before the elevated-write guard aborts startup.
+        handlers: list[logging.Handler] = (
+            [logging.StreamHandler(sys.stdout)]
+            if console
+            else [logging.NullHandler()]
         )
-    ]
-    if console:
-        handlers.append(logging.StreamHandler(sys.stdout))
+    else:
+        try:
+            ensure_directories()
+            handlers = [
+                RotatingFileHandler(
+                    LOG_PATH,
+                    maxBytes=2_000_000,
+                    backupCount=3,
+                    encoding="utf-8",
+                )
+            ]
+        except OSError as exc:
+            # A locked, read-only, or unavailable log file must not make both
+            # normal startup and the top-level fatal-error handler crash.
+            file_handler_error = exc
+            handlers = (
+                [logging.StreamHandler(sys.stdout)]
+                if console
+                else [logging.NullHandler()]
+            )
+        else:
+            if console:
+                handlers.append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
         handlers=handlers,
         force=True,
     )
+    if file_handler_error is not None:
+        logging.warning(
+            "Nie udało się otworzyć pliku logu; używam wyjścia awaryjnego: %s",
+            file_handler_error,
+        )
 
 
 def deep_merge(defaults: dict[str, Any], loaded: dict[str, Any]) -> dict[str, Any]:
@@ -727,23 +1030,231 @@ def deep_merge(defaults: dict[str, Any], loaded: dict[str, Any]) -> dict[str, An
     return result
 
 
-def create_default_files() -> None:
-    ensure_directories()
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(
-            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+def migrate_legacy_config_values(config: dict[str, Any]) -> None:
+    """Keep configurations from older releases on a supported local model."""
+
+    configured_model = str(config.get("model", "")).strip().lower()
+    if configured_model in LEGACY_REMOVED_MODELS:
+        logging.warning(
+            "Zmieniono wycofany model %s na auto (large-v3-turbo)",
+            configured_model,
         )
-    if not DICTIONARY_PATH.exists():
-        DICTIONARY_PATH.write_text(DICTIONARY_TEMPLATE, encoding="utf-8")
+        config["model"] = "auto"
 
 
-def load_config() -> dict[str, Any]:
+def validate_config_types(config: dict[str, Any]) -> None:
+    """Reject malformed known settings before they reach audio or OS code."""
+
+    translator = Translator.from_config(config)
+
+    def invalid(path: str) -> AppError:
+        return AppError(
+            translator.t(
+                "Nieprawidłowa wartość w config.json: {path}",
+                "Invalid value in config.json: {path}",
+                path=path,
+            )
+        )
+
+    def require_string(path: str, value: Any, *, nonempty: bool = False) -> None:
+        if not isinstance(value, str) or (nonempty and not value.strip()):
+            raise invalid(path)
+
+    def require_bool(path: str, value: Any) -> None:
+        if type(value) is not bool:
+            raise invalid(path)
+
+    def require_int(path: str, value: Any, minimum: int, maximum: int) -> None:
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise invalid(path)
+
+    def require_number(path: str, value: Any, minimum: float, maximum: float) -> None:
+        if type(value) not in (int, float):
+            raise invalid(path)
+        numeric = float(value)
+        if not math.isfinite(numeric) or not minimum <= numeric <= maximum:
+            raise invalid(path)
+
+    for key in ("trigger", "ui_language", "language", "model", "device"):
+        require_string(key, config.get(key), nonempty=True)
+    require_int("cpu_threads", config.get("cpu_threads"), 0, 256)
+    require_int("beam_size", config.get("beam_size"), 1, 10)
+    require_int("pre_roll_ms", config.get("pre_roll_ms"), 0, 2_000)
+    require_int("post_roll_ms", config.get("post_roll_ms"), 0, 2_000)
+    require_int(
+        "minimum_recording_ms",
+        config.get("minimum_recording_ms"),
+        0,
+        10_000,
+    )
+    require_int(
+        "maximum_recording_seconds",
+        config.get("maximum_recording_seconds"),
+        1,
+        MAXIMUM_RECORDING_SECONDS,
+    )
+    if config["minimum_recording_ms"] > config["maximum_recording_seconds"] * 1_000:
+        raise invalid("minimum_recording_ms <= maximum_recording_seconds * 1000")
+    require_number("minimum_rms", config.get("minimum_rms"), 0.0, 1.0)
+
+    section_specs = {
+        "vad": (
+            ("enabled", "bool", 0, 0),
+            ("threshold", "number", 0.0, 1.0),
+            ("min_speech_duration_ms", "int", 0, 10_000),
+            ("min_silence_duration_ms", "int", 0, 10_000),
+            ("speech_pad_ms", "int", 0, 3_000),
+        ),
+        "dictionary": (
+            ("enabled", "bool", 0, 0),
+            ("max_terms", "int", 0, 5_000),
+        ),
+        "paste": (
+            ("enabled", "bool", 0, 0),
+            ("copy_to_clipboard", "bool", 0, 0),
+            ("append_space", "bool", 0, 0),
+            ("delay_ms", "int", 0, 5_000),
+        ),
+        "feedback": (
+            ("sounds", "bool", 0, 0),
+            ("notifications", "bool", 0, 0),
+            ("floating_indicator", "bool", 0, 0),
+            ("loop_recording_sound", "bool", 0, 0),
+        ),
+        "voice_commands": (("enabled", "bool", 0, 0),),
+        "ollama_cleanup": (
+            ("enabled", "bool", 0, 0),
+            ("url", "string", 0, 0),
+            ("model", "string", 0, 0),
+            (
+                "timeout_seconds",
+                "int",
+                1,
+                MAX_OLLAMA_TIMEOUT_SECONDS,
+            ),
+        ),
+    }
+    for section_name, specs in section_specs.items():
+        section = config.get(section_name)
+        if not isinstance(section, dict):
+            raise invalid(section_name)
+        for field, kind, minimum, maximum in specs:
+            path = f"{section_name}.{field}"
+            value = section.get(field)
+            if kind == "bool":
+                require_bool(path, value)
+            elif kind == "int":
+                require_int(path, value, int(minimum), int(maximum))
+            elif kind == "number":
+                require_number(path, value, float(minimum), float(maximum))
+            else:
+                require_string(path, value)
+
+    paste = config["paste"]
+    if not paste["enabled"] and not paste["copy_to_clipboard"]:
+        raise invalid("paste.enabled + paste.copy_to_clipboard")
+
+    custom_sounds = config["feedback"].get("custom_sounds")
+    if not isinstance(custom_sounds, dict):
+        raise invalid("feedback.custom_sounds")
+    for kind in ("start", "stop", "done", "error"):
+        require_string(f"feedback.custom_sounds.{kind}", custom_sounds.get(kind))
+
+
+def create_default_files() -> None:
+    config_missing = not CONFIG_PATH.exists()
+    dictionary_missing = not DICTIONARY_PATH.exists()
+    if config_missing or dictionary_missing:
+        # ``load_config`` also runs during an elevated startup.  Never let that
+        # first-run path create files through a lower-integrity APPDATA reparse
+        # point before the normal settings-write guard has a chance to run.
+        require_non_elevated_config_write(DEFAULT_CONFIG)
+    if os.name == "nt" and windows_actions.is_process_elevated():
+        # Existing files may be read by an elevated diagnostic run, but avoid
+        # even idempotent mkdir calls in user-controlled data directories.
+        return
+    ensure_directories()
+    with config_write_guard():
+        _create_text_file_exclusive(
+            CONFIG_PATH,
+            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
+        )
+        _create_text_file_exclusive(DICTIONARY_PATH, DICTIONARY_TEMPLATE)
+
+
+def _create_text_file_exclusive(path: Path, payload: str) -> bool:
+    """Publish a complete first-run file without overwriting another writer."""
+
+    temporary_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    descriptor = os.open(temporary_path, flags, 0o600)
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            descriptor = -1
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+
+
+def _read_config_payload(
+    translator: Optional[Translator] = None,
+    *,
+    missing_ok: bool = False,
+) -> Optional[bytes]:
+    """Read config through a hard byte ceiling before JSON decoding."""
+
+    translator = translator or Translator("auto")
+    try:
+        with CONFIG_PATH.open("rb") as config_file:
+            payload = config_file.read(MAX_CONFIG_FILE_BYTES + 1)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise
+    except OSError as exc:
+        raise AppError(
+            translator.t(
+                "Nie można odczytać {path}: {error}",
+                "Could not read {path}: {error}",
+                path=CONFIG_PATH,
+                error=exc,
+            )
+        ) from exc
+    if len(payload) > MAX_CONFIG_FILE_BYTES:
+        raise AppError(
+            translator.t(
+                "Plik config.json jest zbyt duży (maksymalnie {limit} MiB).",
+                "config.json is too large (maximum {limit} MiB).",
+                limit=MAX_CONFIG_FILE_BYTES // (1024 * 1024),
+            )
+        )
+    return payload
+
+
+def load_config_with_revision() -> tuple[dict[str, Any], str]:
     create_default_files()
     fallback_translator = Translator("auto")
     try:
-        loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = _read_config_payload(fallback_translator)
+        assert payload is not None
+        loaded = json.loads(payload.decode("utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AppError(
             fallback_translator.t(
                 "Nie można odczytać {path}: {error}",
@@ -759,22 +1270,196 @@ def load_config() -> dict[str, Any]:
                 "config.json must contain a JSON object.",
             )
         )
-    return deep_merge(DEFAULT_CONFIG, loaded)
+    config = deep_merge(DEFAULT_CONFIG, loaded)
+    migrate_legacy_config_values(config)
+    validate_config_types(config)
+    return config, hashlib.sha256(payload).hexdigest()
 
 
-def save_config(config: dict[str, Any]) -> None:
-    """Zapisz konfigurację atomowo, aby nie pozostawić uciętego JSON-a."""
-    ensure_directories()
-    temp_path = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.{os.getpid()}.tmp")
-    payload = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+def load_config() -> dict[str, Any]:
+    return load_config_with_revision()[0]
+
+
+_CONFIG_REVISION_UNSET = object()
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
+def require_non_elevated_config_write(config: dict[str, Any]) -> None:
+    """Do not let a lower-integrity user directory redirect elevated writes."""
+
+    if os.name != "nt" or not windows_actions.is_process_elevated():
+        return
+    raise AppError(
+        Translator.from_config(config).t(
+            "Nie zapisuję ustawień z uprawnieniami administratora. "
+            "Uruchom Mówika normalnie i spróbuj ponownie.",
+            "Settings are not saved while Mówik is running as administrator. "
+            "Start Mówik normally and try again.",
+        )
+    )
+
+
+def require_non_elevated_runtime(
+    translator: Optional[Translator] = None,
+) -> None:
+    """Reject an elevated per-user runtime before it touches user data."""
+
+    if os.name != "nt" or not windows_actions.is_process_elevated():
+        return
+    translator = translator or Translator("auto")
+    raise ElevatedRuntimeError(
+        translator.t(
+            "Ze względów bezpieczeństwa Mówika nie można uruchamiać z "
+            "uprawnieniami administratora. Zamknij tę instancję i uruchom "
+            "program normalnie.",
+            "For security reasons, Mówik cannot run with administrator "
+            "privileges. Close this instance and start the application "
+            "normally.",
+        )
+    )
+
+
+def config_file_revision(
+    translator: Optional[Translator] = None,
+) -> Optional[str]:
+    translator = translator or Translator("auto")
     try:
-        temp_path.write_text(payload, encoding="utf-8")
+        payload = _read_config_payload(translator, missing_ok=True)
+    except AppError as exc:
+        if not isinstance(exc.__cause__, OSError):
+            raise
+        raise AppError(
+            translator.t(
+                "Nie udało się sprawdzić pliku config.json: {error}",
+                "Could not inspect config.json: {error}",
+                error=exc.__cause__,
+            )
+        ) from exc
+    if payload is None:
+        return None
+    return hashlib.sha256(payload).hexdigest()
+
+
+@contextmanager
+def config_write_guard():
+    """Serialize config replacement in this process and across Windows processes."""
+
+    with _CONFIG_WRITE_LOCK:
+        handle: Optional[int] = None
+        kernel32 = None
+        if os.name == "nt":
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_bool,
+                ctypes.c_wchar_p,
+            ]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint
+            kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+            kernel32.ReleaseMutex.restype = ctypes.c_bool
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_bool
+            raw_handle = kernel32.CreateMutexW(None, False, CONFIG_WRITE_MUTEX_NAME)
+            if not raw_handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            handle = int(raw_handle)
+            wait_result = int(
+                kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0xFFFFFFFF)
+            )
+            if wait_result not in {0, 0x80}:  # WAIT_OBJECT_0 / WAIT_ABANDONED
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
+                raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            yield
+        finally:
+            if handle is not None and kernel32 is not None:
+                kernel32.ReleaseMutex(ctypes.c_void_p(handle))
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def _serialize_config_payload(
+    config: dict[str, Any],
+    translator: Optional[Translator] = None,
+) -> bytes:
+    """Serialize exactly what will be written and enforce the read ceiling."""
+
+    translator = translator or Translator.from_config(config)
+    payload_bytes = (
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    if len(payload_bytes) > MAX_CONFIG_FILE_BYTES:
+        raise AppError(
+            translator.t(
+                "Konfiguracja jest zbyt duża do zapisania (maksymalnie {limit} MiB).",
+                "The configuration is too large to save (maximum {limit} MiB).",
+                limit=MAX_CONFIG_FILE_BYTES // (1024 * 1024),
+            )
+        )
+    return payload_bytes
+
+
+def save_config(
+    config: dict[str, Any],
+    *,
+    expected_revision: Any = _CONFIG_REVISION_UNSET,
+) -> str:
+    """Zapisz konfigurację atomowo, aby nie pozostawić uciętego JSON-a."""
+    validate_config_types(config)
+    require_non_elevated_config_write(config)
+    translator = Translator.from_config(config)
+    payload_bytes = _serialize_config_payload(config, translator)
+    ensure_directories()
+    with config_write_guard():
+        return _write_config_locked(payload_bytes, expected_revision, translator)
+
+
+def _write_config_locked(
+    payload_bytes: bytes,
+    expected_revision: Any,
+    translator: Optional[Translator] = None,
+) -> str:
+    """Write config while the caller owns ``config_write_guard``."""
+
+    translator = translator or Translator("auto")
+    if (
+        expected_revision is not _CONFIG_REVISION_UNSET
+        and config_file_revision(translator) != expected_revision
+    ):
+        raise ConfigConflict(
+            translator.t(
+                "Plik config.json został zmieniony w innym oknie. "
+                "Otwórz Ustawienia ponownie i spróbuj jeszcze raz.",
+                "config.json changed in another window. "
+                "Reopen Settings and try again.",
+            )
+        )
+    temp_path = CONFIG_PATH.with_name(
+        f".{CONFIG_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    descriptor: Optional[int] = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+        descriptor = os.open(temp_path, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as temp_file:
+            descriptor = None
+            temp_file.write(payload_bytes)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
         os.replace(temp_path, CONFIG_PATH)
     finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
             pass
+    return hashlib.sha256(payload_bytes).hexdigest()
 
 
 def apply_quick_profile(config: dict[str, Any], profile_name: str) -> dict[str, Any]:
@@ -803,6 +1488,111 @@ def request_app_restart() -> int:
     temp_path.write_text(f"v1:{requested_at_ns}\n", encoding="ascii")
     os.replace(temp_path, RESTART_REQUEST_PATH)
     return requested_at_ns
+
+
+def acknowledge_restart_request(request_text: str) -> None:
+    """Publish an atomic acknowledgement for the Settings process."""
+
+    ensure_directories()
+    temp_path = RESTART_ACK_PATH.with_name(
+        f"{RESTART_ACK_PATH.name}.{os.getpid()}.tmp"
+    )
+    temp_path.write_text(f"{str(request_text).strip()}\n", encoding="ascii")
+    os.replace(temp_path, RESTART_ACK_PATH)
+
+
+def wait_for_restart_ack(
+    requested_at_ns: int,
+    timeout: float = RESTART_ACK_TIMEOUT_SECONDS,
+) -> bool:
+    """Wait briefly until the running instance claims this restart request."""
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        try:
+            acknowledged = RESTART_ACK_PATH.read_text(encoding="ascii")
+        except (FileNotFoundError, OSError, UnicodeError):
+            acknowledged = ""
+        timestamp_ns = parse_restart_request_timestamp_ns(acknowledged)
+        if timestamp_ns is not None and timestamp_ns == int(requested_at_ns):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+
+
+def announce_restart_started(requested_at_ns: int) -> None:
+    """Atomically confirm that the replacement instance actually started."""
+
+    if isinstance(requested_at_ns, bool) or not isinstance(requested_at_ns, int):
+        raise ValueError("restart timestamp must be an integer")
+    if requested_at_ns <= 0:
+        raise ValueError("restart timestamp must be positive")
+    ensure_directories()
+    temp_path = RESTART_STARTED_PATH.with_name(
+        f"{RESTART_STARTED_PATH.name}.{os.getpid()}.tmp"
+    )
+    temp_path.write_text(
+        f"v2:started:{requested_at_ns}\n",
+        encoding="ascii",
+    )
+    os.replace(temp_path, RESTART_STARTED_PATH)
+
+
+def parse_restart_started_timestamp_ns(value: str) -> Optional[int]:
+    """Parse only the versioned confirmation emitted by a new instance."""
+
+    raw = str(value).strip()
+    prefix = "v2:started:"
+    if not raw.startswith(prefix):
+        return None
+    timestamp_text = raw[len(prefix) :]
+    if not timestamp_text.isascii() or not timestamp_text.isdecimal():
+        return None
+    try:
+        timestamp_ns = int(timestamp_text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return timestamp_ns if timestamp_ns > 0 else None
+
+
+def parse_restart_started_cli_token(value: str) -> int:
+    """Require the canonical positive integer passed by the restart parent."""
+
+    raw = str(value)
+    if not raw.isascii() or not raw.isdecimal():
+        raise argparse.ArgumentTypeError("restart token must be a positive integer")
+    try:
+        timestamp_ns = int(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError(
+            "restart token must be a positive integer"
+        ) from exc
+    if timestamp_ns <= 0 or raw != str(timestamp_ns):
+        raise argparse.ArgumentTypeError("restart token must be a positive integer")
+    return timestamp_ns
+
+
+def wait_for_restart_started(
+    requested_at_ns: int,
+    timeout: float = RESTART_STARTED_TIMEOUT_SECONDS,
+) -> bool:
+    """Wait for a matching v2 start confirmation, never for receipt alone."""
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        try:
+            confirmation = RESTART_STARTED_PATH.read_text(encoding="ascii")
+        except (FileNotFoundError, OSError, UnicodeError):
+            confirmation = ""
+        timestamp_ns = parse_restart_started_timestamp_ns(confirmation)
+        if timestamp_ns is not None and timestamp_ns == int(requested_at_ns):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
 
 
 def parse_restart_request_timestamp_ns(value: str) -> Optional[int]:
@@ -855,23 +1645,34 @@ def _load_dictionary_snapshot(
 ) -> tuple[str, ...]:
     # modified_ns i file_size są częścią klucza cache; sam odczyt zawsze dotyczy
     # stałej ścieżki prywatnego słownika.
-    try:
-        lines = DICTIONARY_PATH.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    del modified_ns
+    if limit <= 0:
+        return ()
+    if file_size > MAX_DICTIONARY_FILE_BYTES:
+        logging.warning(
+            "Pominięto słownik większy niż %d MiB: %s",
+            MAX_DICTIONARY_FILE_BYTES // (1024 * 1024),
+            DICTIONARY_PATH,
+        )
         return ()
     terms: list[str] = []
     seen: set[str] = set()
-    for line in lines:
-        value = line.strip()
-        if not value or value.startswith("#"):
-            continue
-        normalized = value.casefold()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        terms.append(value)
-        if limit and len(terms) >= limit:
-            break
+    try:
+        with DICTIONARY_PATH.open("r", encoding="utf-8-sig") as dictionary_file:
+            for line in dictionary_file:
+                value = line.strip()
+                if not value or value.startswith("#"):
+                    continue
+                normalized = value.casefold()
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                terms.append(value)
+                if len(terms) >= limit:
+                    break
+    except (OSError, UnicodeError) as exc:
+        logging.warning("Pominięto nieczytelny słownik %s: %s", DICTIONARY_PATH, exc)
+        return ()
     return tuple(terms)
 
 
@@ -946,6 +1747,14 @@ def resolve_model_plan(
         model_name = "large-v3-turbo"
     else:
         model_name = requested_model
+    if model_name not in MODEL_SOURCES:
+        raise AppError(
+            translator.t(
+                "Nieobsługiwany model: {model_name}.",
+                "Unsupported model: {model_name}.",
+                model_name=model_name,
+            )
+        )
 
     compute_type = "float16" if device == "cuda" else "int8"
     return model_name, device, compute_type
@@ -968,15 +1777,66 @@ def load_model_local_first(
     kwargs: dict[str, Any],
     status_callback=None,
     translator: Optional[Translator] = None,
+    *,
+    force_download: bool = False,
 ) -> WhisperModel:
     """Załaduj cache bez odpytywania Hugging Face; sieć tylko przy braku plików."""
     translator = translator or Translator("pl")
+    repo_id, revision = MODEL_SOURCES[model_name]
+    local_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in {"download_root", "revision"}
+    }
+
+    def snapshot_complete(snapshot_path: str | os.PathLike[str]) -> bool:
+        path = Path(snapshot_path)
+        required = ("config.json", "model.bin", "tokenizer.json")
+        return all((path / name).is_file() for name in required) and any(
+            path.glob("vocabulary.*")
+        )
+
+    if force_download:
+        if status_callback:
+            status_callback(
+                translator.t(
+                    "Pobieram ponownie model {model_name}…",
+                    "Downloading model {model_name} again…",
+                    model_name=model_name,
+                )
+            )
+        model_path = huggingface_hub.snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=str(MODEL_DIR),
+            force_download=True,
+            allow_patterns=MODEL_ALLOW_PATTERNS,
+        )
+        if not snapshot_complete(model_path):
+            raise AppError(
+                translator.t(
+                    "Pobrany model {model_name} jest niekompletny.",
+                    "Downloaded model {model_name} is incomplete.",
+                    model_name=model_name,
+                )
+            )
+        return WhisperModel(model_path, **local_kwargs)
+
     try:
-        return WhisperModel(model_name, local_files_only=True, **kwargs)
-    except Exception as local_error:
+        model_path = huggingface_hub.snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=str(MODEL_DIR),
+            local_files_only=True,
+            allow_patterns=MODEL_ALLOW_PATTERNS,
+        )
+        if not snapshot_complete(model_path):
+            raise LocalEntryNotFoundError(
+                f"Incomplete cached snapshot for {model_name}"
+            )
+    except LocalEntryNotFoundError as local_error:
         logging.info(
-            "Model %s nie uruchomił się wyłącznie z lokalnego cache (%s); "
-            "sprawdzam/pobieram pliki.",
+            "Brak kompletnego modelu %s w lokalnym cache (%s); pobieram pliki.",
             model_name,
             local_error,
         )
@@ -988,7 +1848,22 @@ def load_model_local_first(
                     model_name=model_name,
                 )
             )
-        return WhisperModel(model_name, local_files_only=False, **kwargs)
+        model_path = huggingface_hub.snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=str(MODEL_DIR),
+            local_files_only=False,
+            allow_patterns=MODEL_ALLOW_PATTERNS,
+        )
+        if not snapshot_complete(model_path):
+            raise AppError(
+                translator.t(
+                    "Model {model_name} jest niekompletny.",
+                    "Model {model_name} is incomplete.",
+                    model_name=model_name,
+                )
+            )
+    return WhisperModel(model_path, **local_kwargs)
 
 
 def warm_up_cuda_model(model: WhisperModel, config: dict[str, Any]) -> None:
@@ -1001,7 +1876,7 @@ def warm_up_cuda_model(model: WhisperModel, config: dict[str, Any]) -> None:
 
 
 def create_model(
-    config: dict[str, Any], status_callback=None
+    config: dict[str, Any], status_callback=None, *, force_download: bool = False
 ) -> tuple[WhisperModel, str, str]:
     translator = Translator.from_config(config)
     model_name, device, compute_type = resolve_model_plan(config, translator)
@@ -1019,6 +1894,7 @@ def create_model(
         "device": device,
         "compute_type": compute_type,
         "download_root": str(MODEL_DIR),
+        "revision": MODEL_SOURCES[model_name][1],
     }
     cpu_threads = resolve_cpu_threads(config)
     if device == "cpu":
@@ -1031,12 +1907,14 @@ def create_model(
         compute_type,
         cpu_threads if device == "cpu" else "n/d",
     )
+    model: Optional[WhisperModel] = None
     try:
         model = load_model_local_first(
             model_name,
             kwargs,
             status_callback,
             translator,
+            force_download=force_download,
         )
         if device == "cuda":
             if status_callback:
@@ -1057,6 +1935,24 @@ def create_model(
         if device != "cuda":
             raise
 
+        error_summary = f"{type(exc).__name__}: {exc}"
+        # Traceback rozgrzewki przechowuje argument ``model`` w swojej ramce.
+        # Samo nadpisanie zmiennej lokalnej nie zwolniłoby wtedy pamięci GPU.
+        failed_model = model
+        model = None
+        current_frame = sys._getframe()
+        traceback_cursor = exc.__traceback__
+        while traceback_cursor is not None:
+            if traceback_cursor.tb_frame is not current_frame:
+                try:
+                    traceback_cursor.tb_frame.clear()
+                except RuntimeError:
+                    pass
+            traceback_cursor = traceback_cursor.tb_next
+        exc.__traceback__ = None
+        del failed_model
+        gc.collect()
+
         # Automatyczny bezpiecznik: jeżeli CUDA jest wykryta, ale brakuje bibliotek
         # lub sterownik jest niezgodny, program nadal ma działać na CPU.
         # Używamy już pobranego modelu, aby po błędzie CUDA nie ściągać
@@ -1075,7 +1971,9 @@ def create_model(
                 )
             )
         logging.warning(
-            "Fallback CPU po błędzie CUDA (%s). Model: %s", exc, fallback_model
+            "Fallback CPU po błędzie CUDA (%s). Model: %s",
+            error_summary,
+            fallback_model,
         )
         model = load_model_local_first(
             fallback_model,
@@ -1083,6 +1981,7 @@ def create_model(
                 "device": "cpu",
                 "compute_type": "int8",
                 "download_root": str(MODEL_DIR),
+                "revision": MODEL_SOURCES[fallback_model][1],
                 "cpu_threads": cpu_threads,
             },
             status_callback,
@@ -1394,14 +2293,37 @@ def resolve_custom_command_open_target(value: str) -> str:
     return str(resolved)
 
 
-def open_custom_command_target(value: str) -> None:
+def open_custom_command_target(
+    value: str,
+    translator: Optional[Translator] = None,
+) -> None:
+    translator = translator or Translator("auto")
     if os.name != "nt":
-        raise AppError("Opening custom-command targets is supported on Windows.")
+        raise AppError(
+            translator.t(
+                "Otwieranie celów własnych komend jest obsługiwane na Windowsie.",
+                "Opening custom-command targets is supported on Windows.",
+            )
+        )
     try:
         target = resolve_custom_command_open_target(value)
     except CustomOpenTargetError as exc:
-        raise AppError("The configured open target is unavailable or unsafe.") from exc
-    os.startfile(target)  # type: ignore[attr-defined]
+        raise AppError(
+            translator.t(
+                "Skonfigurowany cel otwierania jest niedostępny lub niebezpieczny.",
+                "The configured open target is unavailable or unsafe.",
+            )
+        ) from exc
+    try:
+        os.startfile(target)  # type: ignore[attr-defined]
+    except OSError as exc:
+        raise AppError(
+            translator.t(
+                "Nie udało się otworzyć skonfigurowanego celu: {error}",
+                "Could not open the configured target: {error}",
+                error=exc,
+            )
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -1410,6 +2332,8 @@ class SpeechJob:
     mode: str = "dictation"
     released_at: Optional[float] = None
     execution_context: Optional[command_engine.ExecutionContext] = None
+    delivery_foreground: Optional[tuple[int, int]] = None
+    sample_rate: Optional[int] = None
 
 
 def apply_voice_commands(text: str, config: dict[str, Any]) -> str:
@@ -1444,7 +2368,15 @@ def strip_llm_wrapping(text: str) -> str:
         value,
         flags=re.IGNORECASE,
     )
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'", "„", "”"}:
+    quote_pairs = {
+        ('"', '"'),
+        ("'", "'"),
+        ("„", "”"),
+        ("“", "”"),
+        ("«", "»"),
+        ("‹", "›"),
+    }
+    if len(value) >= 2 and (value[0], value[-1]) in quote_pairs:
         value = value[1:-1].strip()
     return value
 
@@ -1487,6 +2419,70 @@ def llm_result_is_safe(original: str, corrected: str) -> bool:
     return True
 
 
+class _RejectOllamaRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep a validated loopback request from being redirected off-host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_local_ollama_request(
+    request: urllib.request.Request,
+    timeout: int,
+):
+    # Do not inherit HTTP_PROXY/registry proxy settings: the transcript must
+    # travel directly to the already validated loopback endpoint.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _RejectOllamaRedirects(),
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def normalize_ollama_base_url(
+    value: Any,
+    translator: Optional[Translator] = None,
+) -> str:
+    """Allow transcripts to be sent only to an explicit local Ollama endpoint."""
+
+    translator = translator or Translator("auto")
+    raw = str(value).strip().rstrip("/")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise AppError(
+            translator.t(
+                "Adres Ollamy jest nieprawidłowy.",
+                "The Ollama address is invalid.",
+            )
+        ) from exc
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    local_host = hostname == "localhost"
+    if hostname and not local_host:
+        try:
+            local_host = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            local_host = False
+    if (
+        parsed.scheme.casefold() != "http"
+        or not local_host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or port is None and parsed.netloc.endswith(":")
+    ):
+        raise AppError(
+            translator.t(
+                "Ollama musi używać lokalnego adresu HTTP (localhost, 127.0.0.1 lub ::1).",
+                "Ollama must use a local HTTP address (localhost, 127.0.0.1, or ::1).",
+            )
+        )
+    return raw
+
+
 def cleanup_with_ollama(
     text: str, config: dict[str, Any], dictionary_terms: list[str]
 ) -> str:
@@ -1498,8 +2494,17 @@ def cleanup_with_ollama(
         logging.warning("Korekta Ollama włączona, ale nie podano nazwy modelu")
         return text
 
-    base_url = str(settings.get("url", "http://127.0.0.1:11434")).rstrip("/")
-    timeout = max(1, int(settings.get("timeout_seconds", 45)))
+    try:
+        base_url = normalize_ollama_base_url(
+            settings.get("url", "http://127.0.0.1:11434")
+        )
+    except AppError:
+        logging.warning("Zablokowano nielokalny lub nieprawidłowy adres Ollamy")
+        return text
+    timeout = min(
+        MAX_OLLAMA_TIMEOUT_SECONDS,
+        max(1, int(settings.get("timeout_seconds", 45))),
+    )
     transcription_language = str(config.get("language", "auto")).strip().lower()
     glossary = ", ".join(dictionary_terms[:80])
     if transcription_language == "pl":
@@ -1545,12 +2550,27 @@ def cleanup_with_ollama(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
-        corrected = strip_llm_wrapping(
-            str(body.get("message", {}).get("content", ""))
-        )
-    except (OSError, ValueError, urllib.error.URLError) as exc:
+        with _open_local_ollama_request(request, timeout) as response:
+            response_bytes = response.read(1_048_577)
+            if len(response_bytes) > 1_048_576:
+                raise ValueError("Ollama response exceeds the safe size limit")
+            body = json.loads(response_bytes.decode("utf-8"))
+        if not isinstance(body, dict):
+            raise ValueError("Ollama response must be a JSON object")
+        message = body.get("message")
+        if not isinstance(message, dict):
+            raise ValueError("Ollama response is missing the message object")
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError("Ollama response message content must be text")
+        corrected = strip_llm_wrapping(content)
+    except (
+        OSError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        urllib.error.URLError,
+    ) as exc:
         logging.warning("Korekta Ollama niedostępna: %s", exc)
         return text
 
@@ -1668,6 +2688,54 @@ def resolve_sound_path(value: Any) -> Optional[Path]:
     return path
 
 
+def _path_is_reparse_point(path: Path) -> bool:
+    """Treat symlinks and Windows reparse points as untrusted at runtime."""
+
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    return path.is_symlink() or bool(attributes & 0x0400)
+
+
+def runtime_sound_path(value: Any) -> Optional[Path]:
+    """Resolve only a local WAV stored below Mówik's private sounds folder."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("/", "\\")
+    if normalized.startswith("\\\\") or normalized.startswith("\\?\\"):
+        return None
+    configured = Path(raw).expanduser()
+    candidate = configured if configured.is_absolute() else APPDATA_DIR / configured
+    try:
+        lexical_root = Path(os.path.abspath(SOUNDS_DIR))
+        lexical_candidate = Path(os.path.abspath(candidate))
+        relative_parts = lexical_candidate.relative_to(lexical_root).parts
+    except (OSError, ValueError):
+        return None
+    if _path_is_reparse_point(APPDATA_DIR) or _path_is_reparse_point(SOUNDS_DIR):
+        return None
+    current = lexical_root
+    for part in relative_parts:
+        current /= part
+        if _path_is_reparse_point(current):
+            return None
+    try:
+        root = SOUNDS_DIR.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if _path_is_reparse_point(root):
+        return None
+    if resolved.suffix.casefold() != ".wav" or not resolved.is_file():
+        return None
+    return resolved
+
+
 def validate_wave_file(
     path: Path,
     translator: Optional[Translator] = None,
@@ -1751,18 +2819,145 @@ def import_custom_sound(
     return str(Path("sounds") / destination.name)
 
 
+def save_config_with_custom_sounds(
+    config: dict[str, Any],
+    sound_sources: dict[str, Any],
+    translator: Optional[Translator] = None,
+    *,
+    expected_revision: Any = _CONFIG_REVISION_UNSET,
+) -> str:
+    """Replace custom WAVs and config as one rollback-capable operation."""
+
+    translator = translator or Translator("auto")
+    validate_config_types(config)
+    require_non_elevated_config_write(config)
+    payload_bytes = _serialize_config_payload(config, translator)
+    ensure_directories()
+    # The revision check, sound replacements, config replacement, and any
+    # rollback must share one cross-process critical section.  Otherwise a
+    # losing Settings window could restore its backup over the winner's WAV.
+    with config_write_guard():
+        backups: dict[Path, Optional[Path]] = {}
+        staged_sources: dict[Path, Path] = {}
+        try:
+            if (
+                expected_revision is not _CONFIG_REVISION_UNSET
+                and config_file_revision(translator) != expected_revision
+            ):
+                raise ConfigConflict(
+                    translator.t(
+                        "Plik config.json został zmieniony w innym oknie. "
+                        "Otwórz Ustawienia ponownie i spróbuj jeszcze raz.",
+                        "config.json changed in another window. "
+                        "Reopen Settings and try again.",
+                    )
+                )
+
+            prepared: dict[str, tuple[Path, Path]] = {}
+            for kind in sorted(CUSTOM_SOUND_KINDS):
+                source = resolve_sound_path(sound_sources.get(kind, ""))
+                if source is None:
+                    continue
+                source = source.resolve()
+                destination = (SOUNDS_DIR / f"{kind}.wav").resolve()
+                validate_wave_file(source, translator)
+                prepared[kind] = (source, destination)
+
+            # A user may select another managed sound as a source (for
+            # example, copy the current start.wav to the stop cue). Snapshot
+            # those cross-references before replacing any destination, or the
+            # outcome would depend on alphabetical processing order.
+            managed_destinations = {
+                (SOUNDS_DIR / f"{kind}.wav").resolve()
+                for kind in CUSTOM_SOUND_KINDS
+            }
+            for source, destination in prepared.values():
+                if source == destination or source not in managed_destinations:
+                    continue
+                if source in staged_sources:
+                    continue
+                staged = SOUNDS_DIR / (
+                    f".{source.name}.{os.getpid()}.{uuid.uuid4().hex}.staged.wav"
+                )
+                staged_sources[source] = staged
+                shutil.copy2(source, staged)
+                validate_wave_file(staged, translator)
+
+            for kind in sorted(prepared):
+                source, destination = prepared[kind]
+                if source == destination:
+                    continue
+                backup: Optional[Path] = None
+                if destination.exists():
+                    backup = destination.with_name(
+                        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.bak"
+                    )
+                    shutil.copy2(destination, backup)
+                backups[destination] = backup
+                import_custom_sound(
+                    kind,
+                    str(staged_sources.get(source, source)),
+                    translator,
+                )
+            # The revision was checked before touching any WAV.  Passing the
+            # sentinel avoids a redundant read while the same guard is held.
+            return _write_config_locked(
+                payload_bytes,
+                _CONFIG_REVISION_UNSET,
+                translator,
+            )
+        except Exception:
+            for destination, backup in reversed(tuple(backups.items())):
+                try:
+                    if backup is None:
+                        destination.unlink(missing_ok=True)
+                    elif backup.exists():
+                        os.replace(backup, destination)
+                except OSError:
+                    logging.exception("Nie udało się wycofać importu dźwięku")
+            raise
+        finally:
+            for backup in backups.values():
+                if backup is not None:
+                    try:
+                        backup.unlink(missing_ok=True)
+                    except OSError:
+                        logging.warning(
+                            "Nie udało się usunąć kopii zapasowej dźwięku",
+                            exc_info=True,
+                        )
+            for staged in staged_sources.values():
+                try:
+                    staged.unlink(missing_ok=True)
+                except OSError:
+                    logging.warning(
+                        "Nie udało się usunąć tymczasowej kopii dźwięku",
+                        exc_info=True,
+                    )
+
+
 def configured_sound_path(config: dict[str, Any], kind: str) -> Optional[Path]:
     feedback = config.get("feedback", {})
     custom = feedback.get("custom_sounds", {})
     if not isinstance(custom, dict):
         return None
-    path = resolve_sound_path(custom.get(kind, ""))
+    path = runtime_sound_path(custom.get(kind, ""))
     if path is None:
         return None
-    if path.is_file():
-        return path
-    logging.warning("Brakuje własnego dźwięku %s: %s", kind, path)
-    return None
+    return path
+
+
+def settings_sound_sources_from_config(config: dict[str, Any]) -> dict[str, str]:
+    """Return managed sound paths suitable for the next Settings save."""
+
+    custom = config.get("feedback", {}).get("custom_sounds", {})
+    if not isinstance(custom, dict):
+        custom = {}
+    result: dict[str, str] = {}
+    for kind in ("start", "stop", "done", "error"):
+        managed_path = resolve_sound_path(custom.get(kind, ""))
+        result[kind] = str(managed_path) if managed_path is not None else ""
+    return result
 
 
 def windows_set_clipboard_text(
@@ -1777,16 +2972,23 @@ def windows_set_clipboard_text(
                 "Pasting is supported only on Windows.",
             )
         )
-    try:
-        pyperclip.copy(text)
-    except pyperclip.PyperclipException as exc:
-        raise AppError(
-            translator.t(
-                "Nie udało się zapisać tekstu do schowka: {error}",
-                "Could not copy text to the clipboard: {error}",
-                error=exc,
-            )
-        ) from exc
+    last_error: Optional[pyperclip.PyperclipException] = None
+    for retry_delay in (*CLIPBOARD_WRITE_RETRY_DELAYS, None):
+        try:
+            pyperclip.copy(text)
+            return
+        except pyperclip.PyperclipException as exc:
+            last_error = exc
+            if retry_delay is not None:
+                time.sleep(retry_delay)
+    assert last_error is not None
+    raise AppError(
+        translator.t(
+            "Nie udało się zapisać tekstu do schowka: {error}",
+            "Could not copy text to the clipboard: {error}",
+            error=last_error,
+        )
+    ) from last_error
 
 
 def windows_get_clipboard_text(
@@ -1814,28 +3016,108 @@ def windows_get_clipboard_text(
     return value if isinstance(value, str) else str(value)
 
 
-def foreground_identity_matches(expected: tuple[int, int]) -> bool:
-    """Fail closed unless the same positive HWND/PID is still foreground."""
+def capture_paste_target_identity(
+    foreground: Optional[windows_actions.ForegroundContext] = None,
+) -> tuple[int, int, int, int, int]:
+    """Capture the top-level window and its focused GUI control atomically enough.
+
+    The focused/control handles catch tab, pane, and edit-control changes that
+    leave the same process and top-level HWND active.  Zeroes are deliberately
+    returned on any ambiguity so delayed input fails closed.
+    """
+
+    invalid = (0, 0, 0, 0, 0)
+    try:
+        foreground = foreground or windows_actions.capture_foreground_identity()
+        if not foreground.is_valid or os.name != "nt":
+            return invalid
+
+        from ctypes import wintypes
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetGUIThreadInfo.argtypes = [
+            wintypes.DWORD,
+            ctypes.POINTER(GUITHREADINFO),
+        ]
+        user32.GetGUIThreadInfo.restype = wintypes.BOOL
+
+        process_id = wintypes.DWORD()
+        thread_id = int(
+            user32.GetWindowThreadProcessId(
+                wintypes.HWND(foreground.hwnd),
+                ctypes.byref(process_id),
+            )
+        )
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if (
+            thread_id <= 0
+            or int(process_id.value) != foreground.pid
+            or not user32.GetGUIThreadInfo(thread_id, ctypes.byref(info))
+        ):
+            return invalid
+        active_hwnd = int(info.hwndActive or 0)
+        focus_hwnd = int(info.hwndFocus or 0)
+        caret_hwnd = int(info.hwndCaret or 0)
+        if active_hwnd != foreground.hwnd or focus_hwnd <= 0:
+            return invalid
+        return (
+            foreground.hwnd,
+            foreground.pid,
+            thread_id,
+            focus_hwnd,
+            caret_hwnd,
+        )
+    except Exception:
+        return invalid
+
+
+def foreground_identity_matches(expected: tuple[int, ...]) -> bool:
+    """Fail closed unless the exact captured window/control is still focused."""
 
     if (
         not isinstance(expected, tuple)
-        or len(expected) != 2
-        or type(expected[0]) is not int
-        or type(expected[1]) is not int
-        or expected[0] <= 0
-        or expected[1] <= 0
+        or len(expected) not in {2, 5}
+        or any(type(value) is not int for value in expected)
+        or any(value <= 0 for value in expected[:2])
     ):
         return False
     current = windows_actions.capture_foreground_identity()
-    return (
+    top_level_matches = (
         current.is_valid
         and current.hwnd == expected[0]
         and current.pid == expected[1]
     )
+    if not top_level_matches:
+        return False
+    if len(expected) == 2:
+        # Compatibility for API callers predating focused-control pinning.
+        return True
+    if any(value <= 0 for value in expected[2:4]) or expected[4] < 0:
+        return False
+    return capture_paste_target_identity(current) == expected
 
 
 def require_foreground_identity(
-    expected: tuple[int, int],
+    expected: tuple[int, ...],
     translator: Optional[Translator] = None,
 ) -> None:
     if foreground_identity_matches(expected):
@@ -1853,6 +3135,7 @@ def windows_type_unicode_text(
     text: str,
     translator: Optional[Translator] = None,
     cancel_event: Optional[threading.Event] = None,
+    expected_foreground: Optional[tuple[int, ...]] = None,
 ) -> None:
     """Wpisz tekst przez Win32 SendInput bez używania schowka."""
     translator = translator or Translator("auto")
@@ -1925,6 +3208,8 @@ def windows_type_unicode_text(
     for offset in range(0, len(code_units), 256):
         if cancel_event is not None and cancel_event.is_set():
             raise OperationCancelled()
+        if expected_foreground is not None:
+            require_foreground_identity(expected_foreground, translator)
         inputs: list[INPUT] = []
         for code_unit in code_units[offset : offset + 256]:
             press = INPUT()
@@ -1958,6 +3243,8 @@ def windows_type_unicode_text(
                     total=len(inputs),
                 )
             )
+    if expected_foreground is not None:
+        require_foreground_identity(expected_foreground, translator)
 
 
 def paste_text(
@@ -1965,7 +3252,7 @@ def paste_text(
     config: dict[str, Any],
     *,
     append_space_override: Optional[bool] = None,
-    expected_foreground: Optional[tuple[int, int]] = None,
+    expected_foreground: Optional[tuple[int, ...]] = None,
     verify_clipboard_before_paste: bool = False,
     cancel_event: Optional[threading.Event] = None,
 ) -> None:
@@ -1990,23 +3277,15 @@ def paste_text(
             )
         )
 
-    if expected_foreground is not None and paste_enabled and not copy_to_clipboard:
-        raise AppError(
-            translator.t(
-                "Własne komendy wymagają schowka, aby bezpiecznie wkleić tekst.",
-                "Custom commands require the clipboard for safe text insertion.",
-            )
-        )
-
-    if expected_foreground is not None:
-        require_foreground_identity(expected_foreground, translator)
-
     if not paste_enabled:
         if cancel_event is not None and cancel_event.is_set():
             raise OperationCancelled()
         if copy_to_clipboard:
             windows_set_clipboard_text(text, translator)
         return
+
+    if expected_foreground is not None:
+        require_foreground_identity(expected_foreground, translator)
 
     delay = max(0, int(settings.get("delay_ms", 25))) / 1000
     if delay:
@@ -2026,18 +3305,31 @@ def paste_text(
             raise OperationCancelled()
         if expected_foreground is not None:
             require_foreground_identity(expected_foreground, translator)
-        if verify_clipboard_before_paste:
-            if windows_get_clipboard_text(translator) != text:
-                raise AppError(
-                    translator.t(
-                        "Schowek zmienił się — tekst nie został wklejony.",
-                        "The clipboard changed, so the text was not pasted.",
-                    )
+        # Every Ctrl+V-capable path verifies the exact clipboard payload.  The
+        # argument remains for source compatibility but can no longer disable
+        # this last-moment integrity check.
+        if windows_get_clipboard_text(translator) != text:
+            raise AppError(
+                translator.t(
+                    "Schowek zmienił się — tekst nie został wklejony.",
+                    "The clipboard changed, so the text was not pasted.",
                 )
+            )
         if expected_foreground is not None:
             require_foreground_identity(expected_foreground, translator)
         if cancel_event is not None and cancel_event.is_set():
             raise OperationCancelled()
+        if expected_foreground is not None and "\r" not in text and "\n" not in text:
+            payload = text
+            if append_space and text and not text[-1].isspace():
+                payload += " "
+            windows_type_unicode_text(
+                payload,
+                translator,
+                cancel_event,
+                expected_foreground,
+            )
+            return
         controller = keyboard.Controller()
         with controller.pressed(keyboard.Key.ctrl):
             controller.press("v")
@@ -2054,7 +3346,12 @@ def paste_text(
         payload = text
         if append_space and text and not text[-1].isspace():
             payload += " "
-        windows_type_unicode_text(payload, translator, cancel_event)
+        windows_type_unicode_text(
+            payload,
+            translator,
+            cancel_event,
+            expected_foreground,
+        )
 
 
 def key_name(key: keyboard.Key | keyboard.KeyCode) -> str:
@@ -2071,6 +3368,26 @@ def mouse_name(button: mouse.Button) -> str:
     value = str(button).replace("Button.", "")
     aliases = {"x1": "x1", "x2": "x2", "left": "left", "right": "right", "middle": "middle"}
     return aliases.get(value, value)
+
+
+def start_shortcut_capture_listeners(on_key, on_mouse) -> dict[str, Any]:
+    """Start suppressing shortcut detectors with rollback on partial failure."""
+
+    listeners: dict[str, Any] = {
+        "keyboard": keyboard.Listener(on_press=on_key, suppress=True),
+        "mouse": mouse.Listener(on_click=on_mouse, suppress=True),
+    }
+    try:
+        listeners["keyboard"].start()
+        listeners["mouse"].start()
+    except Exception:
+        for listener in listeners.values():
+            try:
+                listener.stop()
+            except Exception:
+                logging.debug("Nie udało się wycofać hooka skrótu", exc_info=True)
+        raise
+    return listeners
 
 
 def split_trigger(
@@ -2262,136 +3579,408 @@ STATUS_INDICATOR_STATES = frozenset(
         "command_success",
     }
 )
-STATUS_INDICATOR_SIZE = 56
+STATUS_INDICATOR_WIDTH = 344
+STATUS_INDICATOR_HEIGHT = 76
+# Zachowany alias dla prostych integracji i starszych testów renderera.
+STATUS_INDICATOR_SIZE = STATUS_INDICATOR_HEIGHT
 STATUS_INDICATOR_BOTTOM_MARGIN = 34
 STATUS_INDICATOR_MIN_PROCESSING_SECONDS = 0.25
-STATUS_INDICATOR_SUCCESS_SECONDS = 0.9
-STATUS_INDICATOR_ERROR_SECONDS = 1.1
+STATUS_INDICATOR_SUCCESS_SECONDS = 1.8
+STATUS_INDICATOR_ERROR_SECONDS = 1.35
 
 
 def status_indicator_window_position(
     work_area: tuple[int, int, int, int],
-    size: int = STATUS_INDICATOR_SIZE,
+    size: int | tuple[int, int] = (
+        STATUS_INDICATOR_WIDTH,
+        STATUS_INDICATOR_HEIGHT,
+    ),
     bottom_margin: int = STATUS_INDICATOR_BOTTOM_MARGIN,
 ) -> tuple[int, int]:
     """Wycentruj wskaźnik nad dolną krawędzią obszaru roboczego monitora."""
     left, top, right, bottom = (int(value) for value in work_area)
     if right <= left or bottom <= top:
         raise ValueError("The monitor work area must have a positive size")
-    size = max(1, int(size))
+    if isinstance(size, tuple):
+        width, height = size
+    else:
+        width = height = size
+    width = max(1, int(width))
+    height = max(1, int(height))
     bottom_margin = max(0, int(bottom_margin))
-    max_x = max(left, right - size)
-    max_y = max(top, bottom - size)
-    x = left + (right - left - size) // 2
-    y = bottom - bottom_margin - size
+    max_x = max(left, right - width)
+    max_y = max(top, bottom - height)
+    x = left + (right - left - width) // 2
+    y = bottom - bottom_margin - height
     return min(max(x, left), max_x), min(max(y, top), max_y)
+
+
+@lru_cache(maxsize=24)
+def _status_indicator_font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
+    """Załaduj systemowy krój kapsuły z bezpiecznym fallbackiem Pillow."""
+
+    candidates = (
+        "segoeuib.ttf" if bold else "segoeui.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+    )
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, max(8, int(size)))
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _status_indicator_graphemes(text: str) -> list[str]:
+    """Split enough Unicode grapheme structure to avoid broken preview tails."""
+
+    clusters: list[str] = []
+    regional_run = 0
+    for character in text:
+        codepoint = ord(character)
+        combining = bool(unicodedata.combining(character)) or unicodedata.category(
+            character
+        ).startswith("M")
+        variation = 0xFE00 <= codepoint <= 0xFE0F
+        emoji_modifier = 0x1F3FB <= codepoint <= 0x1F3FF
+        regional = 0x1F1E6 <= codepoint <= 0x1F1FF
+        joins_previous = bool(
+            clusters
+            and (
+                combining
+                or variation
+                or emoji_modifier
+                or character == "\u200d"
+                or clusters[-1].endswith("\u200d")
+                or (regional and regional_run % 2 == 1)
+            )
+        )
+        if joins_previous:
+            clusters[-1] += character
+        else:
+            clusters.append(character)
+        regional_run = regional_run + 1 if regional else 0
+    return clusters
+
+
+def status_indicator_preview_text(text: Any, max_characters: int = 72) -> str:
+    """Zwiń poufny podgląd do jednego krótkiego wiersza bez łamania grafemów."""
+
+    normalized = " ".join(str(text or "").split())
+    maximum = max(8, int(max_characters))
+    if len(normalized) <= maximum:
+        return normalized
+    result: list[str] = []
+    length = 0
+    for cluster in _status_indicator_graphemes(normalized):
+        if length + len(cluster) + 1 > maximum:
+            break
+        result.append(cluster)
+        length += len(cluster)
+    return "".join(result).rstrip() + "…"
+
+
+def _status_indicator_fit_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    maximum_width: int,
+) -> str:
+    """Ellipsize one normalized line to its real rendered pixel width."""
+
+    value = status_indicator_preview_text(text, 256)
+    maximum_width = max(1, int(maximum_width))
+    if draw.textbbox((0, 0), value, font=font)[2] <= maximum_width:
+        return value
+    ellipsis = "…"
+    if draw.textbbox((0, 0), ellipsis, font=font)[2] > maximum_width:
+        return ""
+    clusters = _status_indicator_graphemes(value.removesuffix(ellipsis))
+    low = 0
+    high = len(clusters)
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = "".join(clusters[:middle]).rstrip() + ellipsis
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= maximum_width:
+            low = middle
+        else:
+            high = middle - 1
+    return "".join(clusters[:low]).rstrip() + ellipsis
 
 
 def render_status_indicator_frame(
     state: str,
     frame: int = 0,
-    size: int = STATUS_INDICATOR_SIZE,
+    width: int = STATUS_INDICATOR_WIDTH,
+    height: int = STATUS_INDICATOR_HEIGHT,
+    *,
+    level: float = 0.0,
+    label: str = "",
+    detail: str = "",
 ) -> Image.Image:
-    """Renderuj antyaliasowaną klatkę pływającego wskaźnika dyktowania."""
+    """Renderuj antyaliasowaną klatkę nowoczesnej kapsuły dyktowania."""
     if state not in STATUS_INDICATOR_STATES:
         raise ValueError(f"Unknown status indicator state: {state}")
-    size = max(16, int(size))
-    scale = 4
-    canvas_size = size * scale
-    image = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+    output_width = max(160, int(width))
+    output_height = max(48, int(height))
+    # The whole canonical layout is scaled as one image. Previously only the
+    # outer canvas grew on HiDPI displays while icons, text and offsets stayed
+    # at 100%, leaving tiny content in the upper-left of an oversized capsule.
+    width = STATUS_INDICATOR_WIDTH
+    height = STATUS_INDICATOR_HEIGHT
+    level = min(1.0, max(0.0, float(level)))
+    scale = 3
+    canvas_width = width * scale
+    canvas_height = height * scale
+    image = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
     if state == "hidden":
-        return image.resize((size, size), Image.Resampling.LANCZOS)
+        return Image.new(
+            "RGBA",
+            (output_width, output_height),
+            (0, 0, 0, 0),
+        )
     command_mode = state.startswith("command_")
     base_state = state.removeprefix("command_")
-
     draw = ImageDraw.Draw(image)
-    center = canvas_size // 2
+    radius = int(canvas_height * 0.42)
+    inset = 4 * scale
+    shadow_box = (
+        inset,
+        inset + 2 * scale,
+        canvas_width - inset,
+        canvas_height - inset,
+    )
+    draw.rounded_rectangle(
+        shadow_box,
+        radius=radius,
+        fill=(2, 6, 23, 118),
+    )
+    capsule_box = (
+        inset,
+        inset,
+        canvas_width - inset,
+        canvas_height - inset - 2 * scale,
+    )
+    draw.rounded_rectangle(
+        capsule_box,
+        radius=radius,
+        fill=(9, 15, 29, 248),
+        outline=(71, 85, 105, 175),
+        width=scale,
+    )
+    draw.rounded_rectangle(
+        (
+            inset + scale,
+            inset + scale,
+            canvas_width - inset - scale,
+            int(canvas_height * 0.48),
+        ),
+        radius=max(scale, radius - scale),
+        fill=(20, 30, 48, 255),
+    )
 
-    def circle(radius: float) -> tuple[int, int, int, int]:
-        scaled_radius = int(round(radius * scale))
-        return (
-            center - scaled_radius,
-            center - scaled_radius,
-            center + scaled_radius,
-            center + scaled_radius,
-        )
+    accent = (168, 85, 247, 255) if command_mode else (34, 211, 238, 255)
+    soft_accent = (
+        (196, 181, 253, 225) if command_mode else (103, 232, 249, 225)
+    )
+    if base_state == "success" and not command_mode:
+        accent = (34, 197, 94, 255)
+        soft_accent = (134, 239, 172, 225)
+    elif base_state == "error":
+        accent = (239, 68, 68, 255)
+        soft_accent = (252, 165, 165, 225)
 
-    backing_radius = size * 0.39
-    draw.ellipse(circle(backing_radius), fill=(15, 23, 42, 246))
+    icon_x = int(39 * scale)
+    icon_y = canvas_height // 2 - scale
+    icon_radius = int(21 * scale)
+    draw.ellipse(
+        (
+            icon_x - icon_radius,
+            icon_y - icon_radius,
+            icon_x + icon_radius,
+            icon_y + icon_radius,
+        ),
+        fill=(15, 23, 42, 255),
+        outline=(51, 65, 85, 230),
+        width=scale,
+    )
 
     if base_state == "recording":
-        pulse_step = abs((int(frame) % 20) - 10) / 10
-        ring_radius = size * (0.235 + 0.035 * pulse_step)
+        pulse = (math.sin(int(frame) * 0.32) + 1.0) / 2.0
+        pulse_radius = int((14.5 + 2.0 * pulse + 2.5 * level) * scale)
         draw.ellipse(
-            circle(ring_radius),
-            outline=(196, 181, 253, 255)
-            if command_mode
-            else (134, 239, 172, 255),
-            width=max(scale * 2, 1),
+            (
+                icon_x - pulse_radius,
+                icon_y - pulse_radius,
+                icon_x + pulse_radius,
+                icon_y + pulse_radius,
+            ),
+            outline=soft_accent,
+            width=2 * scale,
         )
+        dot_radius = int((5.0 + 2.5 * level) * scale)
         draw.ellipse(
-            circle(size * 0.125),
-            fill=(124, 58, 237, 255)
-            if command_mode
-            else (34, 197, 94, 255),
+            (
+                icon_x - dot_radius,
+                icon_y - dot_radius,
+                icon_x + dot_radius,
+                icon_y + dot_radius,
+            ),
+            fill=accent,
         )
     elif base_state == "processing":
-        spinner_box = circle(size * 0.245)
-        draw.ellipse(
-            spinner_box,
-            outline=(51, 65, 85, 255),
-            width=max(scale * 3, 1),
+        spinner_radius = int(14 * scale)
+        spinner_box = (
+            icon_x - spinner_radius,
+            icon_y - spinner_radius,
+            icon_x + spinner_radius,
+            icon_y + spinner_radius,
         )
-        start = (int(frame) * 18 - 90) % 360
+        draw.ellipse(spinner_box, outline=(51, 65, 85, 255), width=3 * scale)
+        start = (int(frame) * 16 - 90) % 360
         draw.arc(
             spinner_box,
             start=start,
-            end=start + 245,
-            fill=(167, 139, 250, 255)
-            if command_mode
-            else (96, 165, 250, 255),
-            width=max(scale * 3, 1),
+            end=start + 235,
+            fill=accent,
+            width=3 * scale,
         )
     elif base_state == "success":
+        success_radius = int(15 * scale)
         draw.ellipse(
-            circle(size * 0.285),
-            fill=(109, 40, 217, 255)
-            if command_mode
-            else (22, 163, 74, 255),
+            (
+                icon_x - success_radius,
+                icon_y - success_radius,
+                icon_x + success_radius,
+                icon_y + success_radius,
+            ),
+            fill=accent,
         )
         points = (
-            (center - int(size * 0.14 * scale), center),
-            (
-                center - int(size * 0.035 * scale),
-                center + int(size * 0.11 * scale),
-            ),
-            (
-                center + int(size * 0.16 * scale),
-                center - int(size * 0.13 * scale),
-            ),
+            (icon_x - 7 * scale, icon_y),
+            (icon_x - 2 * scale, icon_y + 6 * scale),
+            (icon_x + 9 * scale, icon_y - 7 * scale),
         )
         draw.line(
             points,
             fill=(255, 255, 255, 255),
-            width=max(scale * 3, 1),
+            width=3 * scale,
             joint="curve",
         )
     else:
-        draw.ellipse(circle(size * 0.285), fill=(220, 38, 38, 255))
-        offset = int(size * 0.12 * scale)
-        width = max(scale * 3, 1)
+        error_radius = int(15 * scale)
+        draw.ellipse(
+            (
+                icon_x - error_radius,
+                icon_y - error_radius,
+                icon_x + error_radius,
+                icon_y + error_radius,
+            ),
+            fill=accent,
+        )
+        offset = 6 * scale
+        stroke = 3 * scale
         draw.line(
-            (center - offset, center - offset, center + offset, center + offset),
+            (icon_x - offset, icon_y - offset, icon_x + offset, icon_y + offset),
             fill=(255, 255, 255, 255),
-            width=width,
+            width=stroke,
         )
         draw.line(
-            (center + offset, center - offset, center - offset, center + offset),
+            (icon_x + offset, icon_y - offset, icon_x - offset, icon_y + offset),
             fill=(255, 255, 255, 255),
-            width=width,
+            width=stroke,
         )
 
-    return image.resize((size, size), Image.Resampling.LANCZOS)
+    label = status_indicator_preview_text(label, 128)
+    detail = status_indicator_preview_text(detail, 256)
+    text_x = 72 * scale
+    label_font = _status_indicator_font(10 * scale, bold=True)
+    detail_font = _status_indicator_font(15 * scale, bold=not bool(detail))
+    text_right = canvas_width - (
+        52 * scale if base_state == "processing" else 22 * scale
+    )
+    available_text_width = max(scale, text_right - text_x)
+    label = _status_indicator_fit_text(
+        draw,
+        label,
+        label_font,
+        available_text_width,
+    )
+    detail = _status_indicator_fit_text(
+        draw,
+        detail,
+        detail_font,
+        available_text_width,
+    )
+    label_y = 15 * scale
+    detail_y = 33 * scale
+    draw.text(
+        (text_x, label_y),
+        label.upper(),
+        font=label_font,
+        fill=soft_accent,
+    )
+
+    if base_state == "recording" and not detail:
+        wave_left = text_x
+        wave_right = canvas_width - 22 * scale
+        baseline = 47 * scale
+        bar_count = 18
+        spacing = max(3 * scale, (wave_right - wave_left) // bar_count)
+        bar_width = max(2 * scale, spacing // 3)
+        visual_level = max(0.12, level)
+        for index in range(bar_count):
+            phase = int(frame) * 0.34 + index * 0.72
+            wave = 0.35 + 0.65 * abs(math.sin(phase))
+            center_weight = 0.55 + 0.45 * math.sin(
+                math.pi * (index + 1) / (bar_count + 1)
+            )
+            bar_height = int(
+                (3.0 + 18.0 * visual_level * wave * center_weight) * scale
+            )
+            x = wave_left + index * spacing
+            draw.rounded_rectangle(
+                (
+                    x,
+                    baseline - bar_height // 2,
+                    x + bar_width,
+                    baseline + bar_height // 2,
+                ),
+                radius=bar_width // 2,
+                fill=accent,
+            )
+    else:
+        draw.text(
+            (text_x, detail_y),
+            detail or label,
+            font=detail_font,
+            fill=(241, 245, 249, 255),
+        )
+
+    if base_state == "processing":
+        dot_y = 48 * scale
+        dot_start = canvas_width - 42 * scale
+        active_dot = (int(frame) // 3) % 3
+        for index in range(3):
+            dot_radius = (2 if index == active_dot else 1) * scale
+            x = dot_start + index * 9 * scale
+            draw.ellipse(
+                (
+                    x - dot_radius,
+                    dot_y - dot_radius,
+                    x + dot_radius,
+                    dot_y + dot_radius,
+                ),
+                fill=accent if index == active_dot else (71, 85, 105, 255),
+            )
+
+    rendered = image.resize((width, height), Image.Resampling.LANCZOS)
+    if (output_width, output_height) != (width, height):
+        rendered = rendered.resize(
+            (output_width, output_height),
+            Image.Resampling.LANCZOS,
+        )
+    return rendered
 
 
 class _IndicatorRect(ctypes.Structure):
@@ -2448,13 +4037,26 @@ def active_monitor_work_area() -> Optional[tuple[int, int, int, int]]:
 class FloatingStatusIndicator:
     """Nieaktywujące okno statusu sterowane bezpiecznie z dowolnego wątku."""
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        translator: Optional[Translator] = None,
+    ) -> None:
         self.enabled = bool(enabled and os.name == "nt")
         self._commands: queue.Queue[
-            Optional[tuple[str, Optional[tuple[int, int, int, int]]]]
+            Optional[
+                tuple[
+                    str,
+                    Optional[tuple[int, int, int, int]],
+                    str,
+                    str,
+                ]
+            ]
         ] = queue.Queue()
+        self.translator = translator or Translator("auto")
         self._root = None
         self._command_lock = threading.Lock()
+        self._level_source = None
         self._closed = threading.Event()
         self._failed = threading.Event()
 
@@ -2468,31 +4070,85 @@ class FloatingStatusIndicator:
             raise RuntimeError("The status indicator must start on the main thread")
         return self._prepare_window()
 
-    def show(self, state: str) -> None:
+    def set_level_source(self, source) -> None:
+        """Podłącz lekki, tylko-odczytowy miernik mikrofonu."""
+
+        with self._command_lock:
+            self._level_source = source if callable(source) else None
+
+    def _read_level(self) -> float:
+        with self._command_lock:
+            source = self._level_source
+        if source is None:
+            return 0.0
+        try:
+            return min(1.0, max(0.0, float(source())))
+        except Exception:
+            return 0.0
+
+    def show(self, state: str, label: str = "", detail: str = "") -> None:
         if state not in STATUS_INDICATOR_STATES - {"hidden"}:
             raise ValueError(f"Unknown status indicator state: {state}")
         with self._command_lock:
             if not self.enabled or self._closed.is_set() or self._failed.is_set():
                 return
-            self._commands.put((state, active_monitor_work_area()))
+            self._commands.put(
+                (
+                    state,
+                    active_monitor_work_area(),
+                    status_indicator_preview_text(label, 128),
+                    status_indicator_preview_text(detail, 256),
+                )
+            )
 
     def recording(self, command: bool = False) -> None:
-        self.show("command_recording" if command else "recording")
+        self.show(
+            "command_recording" if command else "recording",
+            self.translator.t(
+                "Komenda głosowa" if command else "Słucham",
+                "Voice command" if command else "Listening",
+            ),
+        )
 
     def processing(self, command: bool = False) -> None:
-        self.show("command_processing" if command else "processing")
+        self.show(
+            "command_processing" if command else "processing",
+            self.translator.t(
+                "Rozpoznaję komendę" if command else "Rozpoznaję mowę",
+                "Recognizing command" if command else "Transcribing speech",
+            ),
+            self.translator.t(
+                "Chwila…" if command else "Porządkuję tekst…",
+                "One moment…" if command else "Preparing your text…",
+            ),
+        )
 
-    def success(self, command: bool = False) -> None:
-        self.show("command_success" if command else "success")
+    def success(self, text: str = "", command: bool = False) -> None:
+        self.show(
+            "command_success" if command else "success",
+            self.translator.t(
+                "Komenda wykonana" if command else "Gotowe",
+                "Command completed" if command else "Ready",
+            ),
+            status_indicator_preview_text(text, 256)
+            or self.translator.t(
+                "Wykonano" if command else "Tekst został wklejony",
+                "Completed" if command else "Text inserted",
+            ),
+        )
 
     def error(self) -> None:
-        self.show("error")
+        self.show(
+            "error",
+            self.translator.t("Nie udało się", "Something went wrong"),
+            self.translator.t("Spróbuj ponownie", "Please try again"),
+        )
 
     def hide(self) -> None:
         with self._command_lock:
             if not self.enabled or self._closed.is_set() or self._failed.is_set():
                 return
-            self._commands.put(("hidden", None))
+            self._commands.put(("hidden", None, "", ""))
 
     def close(self) -> None:
         with self._command_lock:
@@ -2561,7 +4217,8 @@ class FloatingStatusIndicator:
         hwnd: int,
         x: int,
         y: int,
-        size: int,
+        width: int,
+        height: int,
     ) -> None:
         root.deiconify()
         root.update_idletasks()
@@ -2584,8 +4241,8 @@ class FloatingStatusIndicator:
             ctypes.c_void_p(-1),  # HWND_TOPMOST
             x,
             y,
-            size,
-            size,
+            width,
+            height,
             0x0010 | 0x0040,  # SWP_NOACTIVATE | SWP_SHOWWINDOW
         )
         if not positioned:
@@ -2607,16 +4264,23 @@ class FloatingStatusIndicator:
             root.wm_attributes("-transparentcolor", transparent)
 
             ui_scale = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
-            window_size = max(40, int(round(STATUS_INDICATOR_SIZE * ui_scale)))
+            window_width = max(
+                220,
+                int(round(STATUS_INDICATOR_WIDTH * ui_scale)),
+            )
+            window_height = max(
+                52,
+                int(round(STATUS_INDICATOR_HEIGHT * ui_scale)),
+            )
             bottom_margin = max(
                 0,
                 int(round(STATUS_INDICATOR_BOTTOM_MARGIN * ui_scale)),
             )
-            root.geometry(f"{window_size}x{window_size}+0+0")
+            root.geometry(f"{window_width}x{window_height}+0+0")
             canvas = tk.Canvas(
                 root,
-                width=window_size,
-                height=window_size,
+                width=window_width,
+                height=window_height,
                 background=transparent,
                 borderwidth=0,
                 highlightthickness=0,
@@ -2627,6 +4291,9 @@ class FloatingStatusIndicator:
 
             current_state = "hidden"
             current_frame = 0
+            current_label = ""
+            current_detail = ""
+            meter_level = 0.0
             generation = 0
             processing_started = 0.0
             current_photo = None
@@ -2653,19 +4320,30 @@ class FloatingStatusIndicator:
                 return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
 
             def render_current() -> None:
-                nonlocal current_photo
+                nonlocal current_photo, meter_level
                 if current_state == "hidden":
                     return
+                target_level = (
+                    self._read_level()
+                    if current_state in {"recording", "command_recording"}
+                    else 0.0
+                )
+                response = 0.62 if target_level >= meter_level else 0.20
+                meter_level += (target_level - meter_level) * response
                 frame_image = render_status_indicator_frame(
                     current_state,
                     current_frame,
-                    window_size,
+                    window_width,
+                    window_height,
+                    level=meter_level,
+                    label=current_label,
+                    detail=current_detail,
                 )
                 current_photo = ImageTk.PhotoImage(frame_image, master=root)
                 canvas.delete("all")
                 canvas.create_image(
-                    window_size // 2,
-                    window_size // 2,
+                    window_width // 2,
+                    window_height // 2,
                     image=current_photo,
                 )
 
@@ -2679,22 +4357,37 @@ class FloatingStatusIndicator:
             def show_terminal(
                 state: str,
                 work_area: Optional[tuple[int, int, int, int]],
+                label: str,
+                detail: str,
                 token: int,
             ) -> None:
                 nonlocal current_state, current_frame
+                nonlocal current_label, current_detail, meter_level
                 if token != generation or self._failed.is_set():
                     return
                 current_state = state
                 current_frame = 0
+                current_label = label
+                current_detail = detail
+                meter_level = 0.0
                 area = work_area or fallback_work_area()
                 x, y = status_indicator_window_position(
                     area,
-                    window_size,
+                    (window_width, window_height),
                     bottom_margin,
                 )
-                root.geometry(f"{window_size}x{window_size}{x:+d}{y:+d}")
+                root.geometry(
+                    f"{window_width}x{window_height}{x:+d}{y:+d}"
+                )
                 render_current()
-                self._show_no_activate(root, hwnd, x, y, window_size)
+                self._show_no_activate(
+                    root,
+                    hwnd,
+                    x,
+                    y,
+                    window_width,
+                    window_height,
+                )
                 visible_seconds = (
                     STATUS_INDICATOR_SUCCESS_SECONDS
                     if state.endswith("success")
@@ -2726,8 +4419,11 @@ class FloatingStatusIndicator:
             def apply_command(
                 state: str,
                 work_area: Optional[tuple[int, int, int, int]],
+                label: str,
+                detail: str,
             ) -> None:
                 nonlocal current_state, current_frame
+                nonlocal current_label, current_detail, meter_level
                 nonlocal generation, processing_started
                 generation += 1
                 token = generation
@@ -2743,26 +4439,44 @@ class FloatingStatusIndicator:
                     if remaining > 0:
                         root.after(
                             max(1, int(remaining * 1000)),
-                            lambda: show_terminal(state, work_area, token),
+                            lambda: show_terminal(
+                                state,
+                                work_area,
+                                label,
+                                detail,
+                                token,
+                            ),
                         )
                         root.after(50, lambda: animate_if_current(token))
                         return
                 if state in terminal_states:
-                    show_terminal(state, work_area, token)
+                    show_terminal(state, work_area, label, detail, token)
                     return
                 current_state = state
                 current_frame = 0
+                current_label = label
+                current_detail = detail
+                meter_level = 0.0
                 if state in processing_states:
                     processing_started = time.monotonic()
                 area = work_area or fallback_work_area()
                 x, y = status_indicator_window_position(
                     area,
-                    window_size,
+                    (window_width, window_height),
                     bottom_margin,
                 )
-                root.geometry(f"{window_size}x{window_size}{x:+d}{y:+d}")
+                root.geometry(
+                    f"{window_width}x{window_height}{x:+d}{y:+d}"
+                )
                 render_current()
-                self._show_no_activate(root, hwnd, x, y, window_size)
+                self._show_no_activate(
+                    root,
+                    hwnd,
+                    x,
+                    y,
+                    window_width,
+                    window_height,
+                )
                 root.after(50, lambda: animate_if_current(token))
 
             def schedule_poll(delay: int) -> None:
@@ -2815,6 +4529,23 @@ def settings_process_args() -> list[str]:
     return [*application_process_args(), "--settings"]
 
 
+def application_restart_process_args(
+    requested_at_ns: Optional[int] = None,
+) -> list[str]:
+    args = [*application_process_args(), "--restart-delay", "0.2"]
+    if requested_at_ns is None:
+        return args
+    if isinstance(requested_at_ns, bool) or not isinstance(requested_at_ns, int):
+        raise ValueError("restart timestamp must be an integer")
+    if requested_at_ns <= 0:
+        raise ValueError("restart timestamp must be positive")
+    return [
+        *args,
+        "--restart-started-token",
+        str(requested_at_ns),
+    ]
+
+
 def is_app_instance_running() -> bool:
     """Sprawdź mutex głównej aplikacji bez tworzenia nowej instancji."""
 
@@ -2839,20 +4570,65 @@ def is_app_instance_running() -> bool:
     raise ctypes.WinError(error)
 
 
-def restart_or_launch_app_after_settings() -> str:
-    """Zastosuj zapis do działającej instancji albo uruchom nową bez stale IPC."""
+def restart_or_launch_app_after_settings(
+    translator: Optional[Translator] = None,
+) -> str:
+    """Apply settings only after a matching replacement process confirms start."""
 
+    translator = translator or Translator("auto")
+    requested_at_ns = request_app_restart()
     if is_app_instance_running():
-        request_app_restart()
-        return "restart_requested"
+        if wait_for_restart_ack(requested_at_ns):
+            if wait_for_restart_started(requested_at_ns):
+                return "restart_requested"
+            raise AppError(
+                translator.t(
+                    "Mówik odebrał prośbę o restart, ale nowa instancja nie "
+                    "potwierdziła uruchomienia. Panel ustawień pozostaje otwarty.",
+                    "Mówik received the restart request, but the replacement "
+                    "instance did not confirm startup. Settings will remain open.",
+                )
+            )
+        # The process may have exited after the mutex probe but before it
+        # could claim the request.  Launch a fresh process in that case.
+        if is_app_instance_running():
+            raise AppError(
+                translator.t(
+                    "Działający Mówik nie potwierdził odbioru prośby o restart. "
+                    "Panel ustawień pozostaje otwarty.",
+                    "The running Mówik instance did not acknowledge the restart "
+                    "request. Settings will remain open.",
+                )
+            )
     discard_pending_restart_request()
-    subprocess.Popen(application_process_args(), cwd=str(APP_ROOT))
+    try:
+        subprocess.Popen(
+            application_restart_process_args(requested_at_ns),
+            cwd=str(APP_ROOT),
+        )
+    except OSError as exc:
+        raise AppError(
+            translator.t(
+                "Nie udało się uruchomić Mówika: {error}",
+                "Could not start Mówik: {error}",
+                error=exc,
+            )
+        ) from exc
+    if not wait_for_restart_started(requested_at_ns):
+        raise AppError(
+            translator.t(
+                "Uruchomiony proces Mówika nie potwierdził startu. "
+                "Panel ustawień pozostaje otwarty.",
+                "The launched Mówik process did not confirm startup. "
+                "Settings will remain open.",
+            )
+        )
     return "app_started"
 
 
 def run_settings_window() -> int:
     """Uruchom osobny panel ustawień oparty na wbudowanym Tkinterze."""
-    config = load_config()
+    config, config_revision = load_config_with_revision()
     translator = Translator.from_config(config)
     t = translator.t
     enable_windows_dpi_awareness()
@@ -2910,32 +4686,106 @@ def run_settings_window() -> int:
         logging.debug("Nie udało się ustawić ikony okna", exc_info=True)
 
     colors = {
-        "canvas": "#F3F6FA",
-        "surface": "#FFFFFF",
-        "surface_alt": "#F8FAFC",
-        "surface_hover": "#EEF2F7",
-        "sidebar": "#0F172A",
-        "sidebar_active": "#1E3A5F",
-        "sidebar_hover": "#182B46",
-        "sidebar_success": "#12372D",
-        "sidebar_success_text": "#86E7BD",
-        "text": "#0F172A",
-        "muted": "#5B667A",
-        "border": "#D8E0EA",
-        "control_border": "#7F8DA3",
-        "primary": "#2563EB",
+        "canvas": "#090E18",
+        "surface": "#111827",
+        "surface_alt": "#182235",
+        "surface_hover": "#233047",
+        "control": "#0B1220",
+        "control_disabled": "#202B3D",
+        "sidebar": "#080D17",
+        "sidebar_active": "#18385F",
+        "sidebar_hover": "#111F33",
+        "sidebar_success": "#0E342B",
+        "sidebar_success_text": "#86EFAC",
+        "sidebar_text": "#CBD5E1",
+        "sidebar_muted": "#94A3B8",
+        "text": "#F1F5F9",
+        "muted": "#AAB5C6",
+        "disabled_text": "#7F8DA3",
+        "border": "#2D3A4F",
+        "control_border": "#65738A",
+        "button_pressed": "#2C3A50",
+        "button_hover_border": "#52637B",
+        "primary": "#60A5FA",
+        "primary_button": "#2563EB",
         "primary_hover": "#1D4ED8",
-        "primary_soft": "#EFF6FF",
-        "primary_border": "#BFDBFE",
-        "success": "#0F6B45",
-        "success_soft": "#ECFDF5",
-        "success_border": "#B7E4CF",
-        "warning": "#9A5A00",
-        "warning_soft": "#FFF8E8",
-        "warning_border": "#F3D59A",
-        "danger": "#B4232F",
-        "white": "#FFFFFF",
+        "primary_pressed": "#1E40AF",
+        "primary_disabled": "#274365",
+        "primary_soft": "#14243D",
+        "primary_soft_hover": "#193454",
+        "primary_border": "#2E5F92",
+        "success": "#6EE7B7",
+        "success_soft": "#0F2D25",
+        "success_border": "#28614E",
+        "warning": "#FBBF24",
+        "warning_soft": "#33260E",
+        "warning_border": "#765514",
+        "danger": "#FB7185",
+        "selection": "#1D4ED8",
+        "scrollbar_thumb": "#475569",
+        "scrollbar_thumb_hover": "#64748B",
+        "white": "#F8FAFC",
     }
+
+    try:
+        root.tk_setPalette(
+            background=colors["surface"],
+            foreground=colors["text"],
+            activeBackground=colors["surface_hover"],
+            activeForeground=colors["text"],
+            selectBackground=colors["selection"],
+            selectForeground=colors["white"],
+            highlightColor=colors["primary"],
+            disabledForeground=colors["disabled_text"],
+        )
+    except tk.TclError:
+        logging.debug("Nie udało się ustawić ciemnej palety widgetów Tk")
+    root.configure(background=colors["canvas"])
+
+    def apply_dark_window_chrome(window) -> None:
+        """Ustaw ciemne tło i natywną ciemną belkę okna, gdy Windows ją wspiera."""
+
+        try:
+            window.configure(background=colors["surface"])
+        except tk.TclError:
+            return
+        if os.name != "nt":
+            return
+        try:
+            window.update_idletasks()
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.GetParent.argtypes = [ctypes.c_void_p]
+            user32.GetParent.restype = ctypes.c_void_p
+            hwnd = int(window.winfo_id())
+            parent_hwnd = user32.GetParent(ctypes.c_void_p(hwnd))
+            if parent_hwnd:
+                hwnd = int(parent_hwnd)
+
+            dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+            dwmapi.DwmSetWindowAttribute.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+            enabled = ctypes.c_int(1)
+            for attribute in (20, 19):
+                result = dwmapi.DwmSetWindowAttribute(
+                    ctypes.c_void_p(hwnd),
+                    attribute,
+                    ctypes.byref(enabled),
+                    ctypes.sizeof(enabled),
+                )
+                if result == 0:
+                    break
+        except (AttributeError, OSError, TypeError, ValueError, tk.TclError):
+            logging.debug(
+                "Natywna ciemna belka okna jest niedostępna",
+                exc_info=True,
+            )
+
+    apply_dark_window_chrome(root)
     root.configure(background=colors["canvas"])
 
     font_families = {
@@ -2967,6 +4817,42 @@ def run_settings_window() -> int:
         except tk.TclError:
             logging.debug("Nie udało się ustawić czcionki %s", font_name)
 
+    classic_widget_options = {
+        "*Menu.background": colors["surface_alt"],
+        "*Menu.foreground": colors["text"],
+        "*Menu.activeBackground": colors["surface_hover"],
+        "*Menu.activeForeground": colors["text"],
+        "*Menu.disabledForeground": colors["disabled_text"],
+        "*Menu.selectColor": colors["primary"],
+        "*Menu.borderWidth": 1,
+        "*Menu.activeBorderWidth": 0,
+        "*Listbox.background": colors["control"],
+        "*Listbox.foreground": colors["text"],
+        "*Listbox.selectBackground": colors["selection"],
+        "*Listbox.selectForeground": colors["white"],
+        "*Listbox.disabledForeground": colors["disabled_text"],
+        "*Listbox.highlightBackground": colors["control_border"],
+        "*Listbox.highlightColor": colors["primary"],
+        "*TCombobox*Listbox.background": colors["control"],
+        "*TCombobox*Listbox.foreground": colors["text"],
+        "*TCombobox*Listbox.selectBackground": colors["selection"],
+        "*TCombobox*Listbox.selectForeground": colors["white"],
+        "*TCombobox*Listbox.disabledForeground": colors["disabled_text"],
+        "*TCombobox*Listbox.highlightBackground": colors["control_border"],
+        "*TCombobox*Listbox.highlightColor": colors["primary"],
+        "*TCombobox*Listbox.highlightThickness": 1,
+        "*Text.background": colors["control"],
+        "*Text.foreground": colors["text"],
+        "*Text.insertBackground": colors["text"],
+        "*Text.selectBackground": colors["selection"],
+        "*Text.selectForeground": colors["white"],
+        "*Text.disabledForeground": colors["disabled_text"],
+        "*Text.highlightBackground": colors["control_border"],
+        "*Text.highlightColor": colors["primary"],
+    }
+    for option_pattern, option_value in classic_widget_options.items():
+        root.option_add(option_pattern, option_value, "interactive")
+
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
@@ -2974,13 +4860,27 @@ def run_settings_window() -> int:
         pass
 
     base_font = (ui_font_family, 10)
-    style.configure(".", font=base_font)
+    style.configure(
+        ".",
+        background=colors["surface"],
+        foreground=colors["text"],
+        fieldbackground=colors["control"],
+        troughcolor=colors["canvas"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        selectbackground=colors["selection"],
+        selectforeground=colors["white"],
+        insertcolor=colors["text"],
+        font=base_font,
+    )
     style.configure("TFrame", background=colors["surface"])
     style.configure("App.TFrame", background=colors["canvas"])
     style.configure("Surface.TFrame", background=colors["surface"])
     style.configure("Alt.TFrame", background=colors["surface_alt"])
     style.configure("Sidebar.TFrame", background=colors["sidebar"])
     style.configure("TLabel", background=colors["surface"], foreground=colors["text"])
+    style.map("TLabel", foreground=[("disabled", colors["disabled_text"])])
     style.configure(
         "Title.TLabel",
         font=(display_font_family, 21, "bold"),
@@ -3015,13 +4915,13 @@ def run_settings_window() -> int:
     style.configure(
         "SidebarMeta.TLabel",
         background=colors["sidebar"],
-        foreground="#CBD5E1",
+        foreground=colors["sidebar_text"],
         font=(ui_font_family, 9),
     )
     style.configure(
         "SidebarSection.TLabel",
         background=colors["sidebar"],
-        foreground="#94A3B8",
+        foreground=colors["sidebar_muted"],
         font=(ui_font_family, 9, "bold"),
     )
     style.configure(
@@ -3037,35 +4937,74 @@ def run_settings_window() -> int:
     style.map(
         "TButton",
         background=[
-            ("pressed", "#E3E9F1"),
+            ("disabled", colors["control_disabled"]),
+            ("pressed", colors["button_pressed"]),
             ("active", colors["surface_hover"]),
         ],
-        bordercolor=[("focus", colors["primary"]), ("active", "#C9D2DF")],
+        foreground=[("disabled", colors["disabled_text"])],
+        bordercolor=[
+            ("disabled", colors["border"]),
+            ("focus", colors["primary"]),
+            ("active", colors["button_hover_border"]),
+        ],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "Primary.TButton",
-        background=colors["primary"],
+        background=colors["primary_button"],
         foreground=colors["white"],
-        bordercolor=colors["primary"],
-        lightcolor=colors["primary"],
-        darkcolor=colors["primary"],
+        bordercolor=colors["primary_button"],
+        lightcolor=colors["primary_button"],
+        darkcolor=colors["primary_button"],
         font=(ui_font_family, 10, "bold"),
         padding=(px(17), px(10)),
     )
     style.map(
         "Primary.TButton",
         background=[
-            ("disabled", "#AFC4F2"),
-            ("pressed", "#1E40AF"),
+            ("disabled", colors["primary_disabled"]),
+            ("pressed", colors["primary_pressed"]),
             ("active", colors["primary_hover"]),
         ],
-        foreground=[("disabled", "#F5F8FF")],
-        bordercolor=[("disabled", "#AFC4F2")],
+        foreground=[("disabled", colors["disabled_text"])],
+        bordercolor=[
+            ("disabled", colors["primary_disabled"]),
+            ("focus", colors["primary"]),
+        ],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
+    )
+    style.configure(
+        "Accent.TButton",
+        background=colors["primary_soft"],
+        foreground=colors["primary"],
+        bordercolor=colors["primary_border"],
+        lightcolor=colors["primary_border"],
+        darkcolor=colors["primary_border"],
+        font=(ui_font_family, 10, "bold"),
+        padding=(px(14), px(9)),
+    )
+    style.map(
+        "Accent.TButton",
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("pressed", colors["button_pressed"]),
+            ("active", colors["primary_soft_hover"]),
+        ],
+        foreground=[("disabled", colors["disabled_text"])],
+        bordercolor=[
+            ("disabled", colors["border"]),
+            ("focus", colors["primary"]),
+            ("active", colors["primary"]),
+        ],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "Nav.TButton",
         background=colors["sidebar"],
-        foreground="#C7D5E6",
+        foreground=colors["sidebar_text"],
         bordercolor=colors["sidebar"],
         lightcolor=colors["sidebar"],
         darkcolor=colors["sidebar"],
@@ -3075,9 +5014,17 @@ def run_settings_window() -> int:
     )
     style.map(
         "Nav.TButton",
-        background=[("active", colors["sidebar_hover"])],
-        foreground=[("active", colors["white"])],
-        bordercolor=[("focus", "#60A5FA")],
+        background=[
+            ("disabled", colors["sidebar"]),
+            ("active", colors["sidebar_hover"]),
+        ],
+        foreground=[
+            ("disabled", colors["disabled_text"]),
+            ("active", colors["white"]),
+        ],
+        bordercolor=[("focus", colors["primary"])],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "NavActive.TButton",
@@ -3092,9 +5039,17 @@ def run_settings_window() -> int:
     )
     style.map(
         "NavActive.TButton",
-        background=[("active", colors["sidebar_active"])],
-        foreground=[("active", colors["white"])],
-        bordercolor=[("focus", "#60A5FA")],
+        background=[
+            ("disabled", colors["sidebar_active"]),
+            ("active", colors["sidebar_active"]),
+        ],
+        foreground=[
+            ("disabled", colors["disabled_text"]),
+            ("active", colors["white"]),
+        ],
+        bordercolor=[("focus", colors["primary"])],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "Profile.TButton",
@@ -3105,7 +5060,7 @@ def run_settings_window() -> int:
     style.configure(
         "SelectedProfile.TButton",
         background=colors["primary_soft"],
-        foreground=colors["primary_hover"],
+        foreground=colors["primary"],
         bordercolor=colors["primary_border"],
         lightcolor=colors["primary_border"],
         darkcolor=colors["primary_border"],
@@ -3115,8 +5070,14 @@ def run_settings_window() -> int:
     )
     style.map(
         "SelectedProfile.TButton",
-        background=[("active", "#DDE9FF")],
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("active", colors["primary_soft_hover"]),
+        ],
+        foreground=[("disabled", colors["disabled_text"])],
         bordercolor=[("focus", colors["primary"])],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "Disclosure.TButton",
@@ -3131,13 +5092,19 @@ def run_settings_window() -> int:
     )
     style.map(
         "Disclosure.TButton",
-        background=[("active", colors["surface_hover"])],
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("active", colors["surface_hover"]),
+        ],
+        foreground=[("disabled", colors["disabled_text"])],
         bordercolor=[("focus", colors["primary"])],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "DisclosureOpen.TButton",
         background=colors["primary_soft"],
-        foreground=colors["primary_hover"],
+        foreground=colors["primary"],
         bordercolor=colors["primary_soft"],
         lightcolor=colors["primary_soft"],
         darkcolor=colors["primary_soft"],
@@ -3147,28 +5114,41 @@ def run_settings_window() -> int:
     )
     style.map(
         "DisclosureOpen.TButton",
-        background=[("active", "#DDE9FF")],
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("active", colors["primary_soft_hover"]),
+        ],
+        foreground=[("disabled", colors["disabled_text"])],
         bordercolor=[("focus", colors["primary"])],
+        lightcolor=[("focus", colors["primary"])],
+        darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "TEntry",
-        fieldbackground=colors["surface"],
+        fieldbackground=colors["control"],
         foreground=colors["text"],
         bordercolor=colors["control_border"],
         lightcolor=colors["control_border"],
         darkcolor=colors["control_border"],
         insertcolor=colors["text"],
+        selectbackground=colors["selection"],
+        selectforeground=colors["white"],
         padding=px(9),
     )
     style.map(
         "TEntry",
+        fieldbackground=[
+            ("disabled", colors["control_disabled"]),
+            ("readonly", colors["control"]),
+        ],
+        foreground=[("disabled", colors["disabled_text"])],
         bordercolor=[("focus", colors["primary"])],
         lightcolor=[("focus", colors["primary"])],
         darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "TCombobox",
-        fieldbackground=colors["surface"],
+        fieldbackground=colors["control"],
         foreground=colors["text"],
         background=colors["surface_alt"],
         bordercolor=colors["control_border"],
@@ -3179,16 +5159,34 @@ def run_settings_window() -> int:
     )
     style.map(
         "TCombobox",
-        fieldbackground=[("readonly", colors["surface"])],
-        selectbackground=[("readonly", colors["surface"])],
-        selectforeground=[("readonly", colors["text"])],
+        fieldbackground=[
+            ("disabled", colors["control_disabled"]),
+            ("readonly", colors["control"]),
+        ],
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("active", colors["surface_hover"]),
+        ],
+        foreground=[("disabled", colors["disabled_text"])],
+        arrowcolor=[
+            ("disabled", colors["disabled_text"]),
+            ("active", colors["text"]),
+        ],
+        selectbackground=[
+            ("disabled", colors["control_disabled"]),
+            ("readonly", colors["control"]),
+        ],
+        selectforeground=[
+            ("disabled", colors["disabled_text"]),
+            ("readonly", colors["text"]),
+        ],
         bordercolor=[("focus", colors["primary"])],
         lightcolor=[("focus", colors["primary"])],
         darkcolor=[("focus", colors["primary"])],
     )
     style.configure(
         "TSpinbox",
-        fieldbackground=colors["surface"],
+        fieldbackground=colors["control"],
         foreground=colors["text"],
         background=colors["surface_alt"],
         bordercolor=colors["control_border"],
@@ -3199,6 +5197,19 @@ def run_settings_window() -> int:
     )
     style.map(
         "TSpinbox",
+        fieldbackground=[
+            ("disabled", colors["control_disabled"]),
+            ("readonly", colors["control"]),
+        ],
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("active", colors["surface_hover"]),
+        ],
+        foreground=[("disabled", colors["disabled_text"])],
+        arrowcolor=[
+            ("disabled", colors["disabled_text"]),
+            ("active", colors["text"]),
+        ],
         bordercolor=[("focus", colors["primary"])],
         lightcolor=[("focus", colors["primary"])],
         darkcolor=[("focus", colors["primary"])],
@@ -3207,12 +5218,55 @@ def run_settings_window() -> int:
         "TCheckbutton",
         background=colors["surface"],
         foreground=colors["text"],
+        focuscolor=colors["primary"],
+        indicatorbackground=colors["control"],
+        indicatorforeground=colors["white"],
+        bordercolor=colors["control_border"],
+        lightcolor=colors["control_border"],
+        darkcolor=colors["control_border"],
         padding=(0, px(4)),
     )
     style.map(
         "TCheckbutton",
-        background=[("active", colors["surface"])],
-        foreground=[("disabled", "#98A3B3")],
+        background=[("active", colors["surface_hover"])],
+        foreground=[("disabled", colors["disabled_text"])],
+        indicatorbackground=[
+            ("disabled", colors["control_disabled"]),
+            ("selected", colors["primary_button"]),
+            ("active", colors["surface_hover"]),
+        ],
+        indicatorforeground=[
+            ("disabled", colors["disabled_text"]),
+            ("selected", colors["white"]),
+        ],
+        bordercolor=[("focus", colors["primary"])],
+    )
+    style.configure(
+        "TRadiobutton",
+        background=colors["surface"],
+        foreground=colors["text"],
+        focuscolor=colors["primary"],
+        indicatorbackground=colors["control"],
+        indicatorforeground=colors["white"],
+        bordercolor=colors["control_border"],
+        lightcolor=colors["control_border"],
+        darkcolor=colors["control_border"],
+        padding=(0, px(4)),
+    )
+    style.map(
+        "TRadiobutton",
+        background=[("active", colors["surface_hover"])],
+        foreground=[("disabled", colors["disabled_text"])],
+        indicatorbackground=[
+            ("disabled", colors["control_disabled"]),
+            ("selected", colors["primary_button"]),
+            ("active", colors["surface_hover"]),
+        ],
+        indicatorforeground=[
+            ("disabled", colors["disabled_text"]),
+            ("selected", colors["white"]),
+        ],
+        bordercolor=[("focus", colors["primary"])],
     )
     style.configure(
         "TLabelframe",
@@ -3232,12 +5286,45 @@ def run_settings_window() -> int:
     )
     style.configure(
         "Vertical.TScrollbar",
-        background="#C8D1DF",
+        background=colors["scrollbar_thumb"],
         troughcolor=colors["surface"],
         bordercolor=colors["surface"],
         arrowcolor=colors["muted"],
         gripcount=0,
         width=px(10),
+    )
+    style.map(
+        "Vertical.TScrollbar",
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("pressed", colors["primary_button"]),
+            ("active", colors["scrollbar_thumb_hover"]),
+        ],
+        arrowcolor=[
+            ("disabled", colors["disabled_text"]),
+            ("active", colors["text"]),
+        ],
+    )
+    style.configure(
+        "Horizontal.TScrollbar",
+        background=colors["scrollbar_thumb"],
+        troughcolor=colors["surface"],
+        bordercolor=colors["surface"],
+        arrowcolor=colors["muted"],
+        gripcount=0,
+        width=px(10),
+    )
+    style.map(
+        "Horizontal.TScrollbar",
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("pressed", colors["primary_button"]),
+            ("active", colors["scrollbar_thumb_hover"]),
+        ],
+        arrowcolor=[
+            ("disabled", colors["disabled_text"]),
+            ("active", colors["text"]),
+        ],
     )
     try:
         style.layout(
@@ -3260,6 +5347,99 @@ def run_settings_window() -> int:
     except tk.TclError:
         logging.debug("Uproszczony scrollbar jest niedostępny")
     style.configure("TSeparator", background=colors["border"])
+    style.configure(
+        "Treeview",
+        background=colors["surface_alt"],
+        fieldbackground=colors["surface_alt"],
+        foreground=colors["text"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        rowheight=px(28),
+    )
+    style.map(
+        "Treeview",
+        background=[("selected", colors["selection"])],
+        foreground=[
+            ("disabled", colors["disabled_text"]),
+            ("selected", colors["white"]),
+        ],
+    )
+    style.configure(
+        "Treeview.Heading",
+        background=colors["surface_hover"],
+        foreground=colors["text"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        relief="flat",
+        font=(ui_font_family, 9, "bold"),
+        padding=(px(8), px(7)),
+    )
+    style.map(
+        "Treeview.Heading",
+        background=[
+            ("pressed", colors["button_pressed"]),
+            ("active", colors["surface_hover"]),
+        ],
+        foreground=[("disabled", colors["disabled_text"])],
+        bordercolor=[("focus", colors["primary"])],
+    )
+    style.configure(
+        "TNotebook",
+        background=colors["surface"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        tabmargins=0,
+    )
+    style.configure(
+        "TNotebook.Tab",
+        background=colors["surface_alt"],
+        foreground=colors["muted"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        padding=(px(12), px(8)),
+    )
+    style.map(
+        "TNotebook.Tab",
+        background=[
+            ("selected", colors["surface"]),
+            ("active", colors["surface_hover"]),
+        ],
+        foreground=[
+            ("disabled", colors["disabled_text"]),
+            ("selected", colors["text"]),
+            ("active", colors["text"]),
+        ],
+        bordercolor=[("focus", colors["primary"])],
+    )
+    style.configure(
+        "Horizontal.TProgressbar",
+        background=colors["primary_button"],
+        troughcolor=colors["control_disabled"],
+        bordercolor=colors["border"],
+        lightcolor=colors["primary_button"],
+        darkcolor=colors["primary_button"],
+    )
+    style.configure(
+        "TScale",
+        background=colors["surface"],
+        troughcolor=colors["control_disabled"],
+        slidercolor=colors["scrollbar_thumb"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+    )
+    style.map(
+        "TScale",
+        background=[("active", colors["surface_hover"])],
+        slidercolor=[
+            ("disabled", colors["control_disabled"]),
+            ("active", colors["primary"]),
+        ],
+    )
 
     try:
         from PIL import ImageTk
@@ -3293,9 +5473,7 @@ def run_settings_window() -> int:
     model_values: dict[str, Any] = {
         t("Automatycznie", "Automatic"): "auto",
         t("tiny — najmniejszy", "tiny — smallest"): "tiny",
-        t("base — bardzo lekki", "base — very lightweight"): "base",
         t("small — lekki (~0,5 GB)", "small — lightweight (~0.5 GB)"): "small",
-        t("medium — dokładniejszy", "medium — more accurate"): "medium",
         t(
             "large-v3-turbo — zalecany (~1,6 GB)",
             "large-v3-turbo — recommended (~1.6 GB)",
@@ -3485,6 +5663,14 @@ def run_settings_window() -> int:
     post_roll_var = tk.StringVar(value=str(config.get("post_roll_ms", 120)))
     minimum_recording_var = tk.StringVar(
         value=str(config.get("minimum_recording_ms", 250))
+    )
+    maximum_recording_var = tk.StringVar(
+        value=str(
+            config.get(
+                "maximum_recording_seconds",
+                DEFAULT_MAXIMUM_RECORDING_SECONDS,
+            )
+        )
     )
     minimum_rms_var = tk.StringVar(value=str(config.get("minimum_rms", 0.0015)))
 
@@ -4167,7 +6353,7 @@ def run_settings_window() -> int:
             foreground=colors["muted"],
             font=(ui_font_family, 9, "bold"),
         ).pack(anchor="w")
-        tk.Label(
+        value_label = tk.Label(
             card,
             textvariable=value_var,
             background=colors["surface_alt"],
@@ -4175,9 +6361,10 @@ def run_settings_window() -> int:
             font=(ui_font_family, 10, "bold"),
             justify="left",
             anchor="w",
-            wraplength=px(190),
-        ).pack(anchor="w", fill="x", pady=(px(5), px(3)))
-        tk.Label(
+            wraplength=px(150),
+        )
+        value_label.pack(anchor="w", fill="x", pady=(px(5), px(3)))
+        description_label = tk.Label(
             card,
             text=description,
             background=colors["surface_alt"],
@@ -4185,8 +6372,16 @@ def run_settings_window() -> int:
             font=(ui_font_family, 9),
             justify="left",
             anchor="w",
-            wraplength=px(190),
-        ).pack(anchor="w", fill="x")
+            wraplength=px(150),
+        )
+        description_label.pack(anchor="w", fill="x")
+
+        def fit_card_text(event) -> None:
+            wrap_length = max(px(96), event.width - px(34))
+            value_label.configure(wraplength=wrap_length)
+            description_label.configure(wraplength=wrap_length)
+
+        card.bind("<Configure>", fit_card_text, add="+")
 
     add_overview_card(
         overview,
@@ -4557,6 +6752,7 @@ def run_settings_window() -> int:
         dialog.resizable(False, False)
         dialog.transient(root)
         dialog.grab_set()
+        apply_dark_window_chrome(dialog)
         try:
             dialog.attributes("-topmost", True)
         except tk.TclError:
@@ -4696,16 +6892,35 @@ def run_settings_window() -> int:
                 state="disabled",
                 text=t("Anuluj: Esc", "Cancel: Esc"),
             )
-            listeners["keyboard"] = keyboard.Listener(
-                on_press=on_capture_key,
-                suppress=True,
-            )
-            listeners["mouse"] = mouse.Listener(
-                on_click=on_capture_mouse,
-                suppress=True,
-            )
-            listeners["keyboard"].start()
-            listeners["mouse"].start()
+            try:
+                listeners.update(
+                    start_shortcut_capture_listeners(
+                        on_capture_key,
+                        on_capture_mouse,
+                    )
+                )
+            except Exception:
+                finished.set()
+                stop_capture_listeners()
+                logging.exception("Nie udało się uruchomić wykrywania przycisku")
+                try:
+                    dialog.grab_release()
+                except tk.TclError:
+                    pass
+                messagebox.showerror(
+                    t(
+                        "{app} — wykrywanie przycisku",
+                        "{app} — Shortcut detection",
+                        app=APP_DISPLAY_NAME,
+                    ),
+                    t(
+                        "Nie udało się uruchomić wykrywania. Żaden przycisk nie jest przechwytywany.",
+                        "Shortcut detection could not start. No input is being captured.",
+                    ),
+                    parent=dialog,
+                )
+                dialog.destroy()
+                return
             poll_capture_queue()
 
         cancel_button = ttk.Button(
@@ -4913,6 +7128,8 @@ def run_settings_window() -> int:
             str(post_roll_var.get()) != str(DEFAULT_CONFIG["post_roll_ms"]),
             str(minimum_recording_var.get())
             != str(DEFAULT_CONFIG["minimum_recording_ms"]),
+            str(maximum_recording_var.get())
+            != str(DEFAULT_CONFIG["maximum_recording_seconds"]),
             str(minimum_rms_var.get()) != str(DEFAULT_CONFIG["minimum_rms"]),
             str(vad_threshold_var.get()) != str(default_vad["threshold"]),
             str(vad_min_speech_var.get())
@@ -4986,13 +7203,36 @@ def run_settings_window() -> int:
         t("Minimalne nagranie (ms)", "Minimum recording (ms)"),
         minimum_recording_spin,
     )
+    maximum_recording_spin = ttk.Spinbox(
+        capture_frame,
+        from_=1,
+        to=MAXIMUM_RECORDING_SECONDS,
+        textvariable=maximum_recording_var,
+    )
+    add_field(
+        capture_frame,
+        3,
+        t(
+            "Maksymalne nagranie (s)",
+            "Maximum recording (s)",
+        ),
+        maximum_recording_spin,
+        t(
+            "Nagranie zostanie zakończone po tym czasie. Przy wysokiej częstotliwości "
+            "mikrofonu bezpieczny limit pamięci może go skrócić; efektywny limit "
+            "pojawi się wtedy w statusie.",
+            "Recording stops after this time. At high microphone sample rates, the "
+            "safe memory cap may shorten it; the effective limit then appears in "
+            "the status.",
+        ),
+    )
     minimum_rms_entry = ttk.Entry(
         capture_frame,
         textvariable=minimum_rms_var,
     )
     add_field(
         capture_frame,
-        3,
+        4,
         t("Minimalny poziom dźwięku", "Minimum audio level"),
         minimum_rms_entry,
         t(
@@ -5470,6 +7710,7 @@ def run_settings_window() -> int:
         dialog.minsize(px(600), px(540))
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
+        apply_dark_window_chrome(dialog)
 
         editor = ttk.Frame(dialog, padding=px(22))
         editor.grid(row=0, column=0, sticky="nsew")
@@ -5709,9 +7950,12 @@ def run_settings_window() -> int:
             wrap="word",
             undo=True,
             font=(ui_font_family, 10),
-            background=colors["surface"],
+            background=colors["control"],
             foreground=colors["text"],
             insertbackground=colors["text"],
+            selectbackground=colors["selection"],
+            selectforeground=colors["white"],
+            inactiveselectbackground=colors["primary_border"],
             relief="flat",
             borderwidth=0,
             highlightthickness=1,
@@ -6319,13 +8563,13 @@ def run_settings_window() -> int:
             "Mówik nie wykonuje zapisanych poleceń systemowych. Może otworzyć widoczny "
             "terminal i skopiować jednowierszowy szkic do schowka, ale to Ty wklejasz go "
             "i naciskasz Enter. Otwieranie zawsze wymaga potwierdzenia; skrypty, skróty "
-            "i ścieżki sieciowe są blokowane. Akcje otwierające są też blokowane, gdy "
-            "Mówik działa jako administrator. Nie zapisuj tu haseł ani sekretów.",
+            "i ścieżki sieciowe są blokowane. Wszystkie własne komendy są blokowane, "
+            "gdy Mówik działa jako administrator. Nie zapisuj tu haseł ani sekretów.",
             "Mówik does not execute saved system commands. It can open a visible terminal "
             "and copy a one-line draft to the clipboard, but you paste it and press Enter. "
             "Opening always requires confirmation; scripts, shortcuts, and network paths "
-            "are blocked. Open actions are also blocked while Mówik runs as administrator. "
-            "Do not store passwords or secrets here.",
+            "are blocked. All custom commands are blocked while Mówik runs as "
+            "administrator. Do not store passwords or secrets here.",
         ),
         background=colors["warning_soft"],
         foreground=colors["muted"],
@@ -6384,8 +8628,8 @@ def run_settings_window() -> int:
     ttk.Checkbutton(
         feedback_frame,
         text=t(
-            "Wskaźnik dyktowania na ekranie",
-            "On-screen dictation indicator",
+            "Kapsuła dyktowania na żywo",
+            "Live dictation capsule",
         ),
         variable=floating_indicator_var,
     ).grid(
@@ -6398,10 +8642,10 @@ def run_settings_window() -> int:
     ttk.Label(
         feedback_frame,
         text=t(
-            "Pokazuje zieloną kropkę podczas nagrywania, animację podczas "
-            "przetwarzania i ✓ po zakończeniu.",
-            "Shows a green dot while recording, an animation while processing, "
-            "and ✓ when done.",
+            "Pokazuje reagującą falę głosu, stan rozpoznawania i krótki podgląd "
+            "gotowego tekstu bez przejmowania fokusu.",
+            "Shows a voice-reactive waveform, recognition state, and a short "
+            "preview of the finished text without taking focus.",
         ),
         style="Muted.TLabel",
         wraplength=px(700),
@@ -6752,7 +8996,10 @@ def run_settings_window() -> int:
         ollama_url_entry,
     )
     ollama_timeout_spin = ttk.Spinbox(
-        ollama_advanced, from_=1, to=600, textvariable=ollama_timeout_var
+        ollama_advanced,
+        from_=1,
+        to=MAX_OLLAMA_TIMEOUT_SECONDS,
+        textvariable=ollama_timeout_var,
     )
     add_field(
         ollama_advanced,
@@ -7017,7 +9264,10 @@ def run_settings_window() -> int:
                 return retained
         return fallback
 
+    pending_sound_sources: dict[str, Any] = {}
+
     def collect_config() -> dict[str, Any]:
+        nonlocal pending_sound_sources
         updated = load_config()
         trigger = str(trigger_values.get(trigger_var.get(), trigger_var.get()))
         try:
@@ -7189,6 +9439,28 @@ def run_settings_window() -> int:
                 "audio", audio_disclosure, minimum_recording_spin
             ),
         )
+        updated["maximum_recording_seconds"] = parse_int(
+            maximum_recording_var,
+            t("Maksymalne nagranie", "Maximum recording"),
+            1,
+            MAXIMUM_RECORDING_SECONDS,
+            on_error=validation_reveal(
+                "audio", audio_disclosure, maximum_recording_spin
+            ),
+        )
+        if (
+            updated["minimum_recording_ms"]
+            > updated["maximum_recording_seconds"] * 1_000
+        ):
+            reveal_validation_error(
+                "audio", audio_disclosure, minimum_recording_spin
+            )
+            raise AppError(
+                t(
+                    "Minimalne nagranie nie może być dłuższe niż maksymalne nagranie.",
+                    "The minimum recording time cannot exceed the maximum recording time.",
+                )
+            )
         updated["minimum_rms"] = parse_float(
             minimum_rms_var,
             t("Minimalna głośność RMS", "Minimum RMS level"),
@@ -7337,7 +9609,7 @@ def run_settings_window() -> int:
                     ollama_timeout_var,
                     t("Limit czasu Ollamy", "Ollama timeout"),
                     1,
-                    600,
+                    MAX_OLLAMA_TIMEOUT_SECONDS,
                     active=ollama_active,
                     previous=updated["ollama_cleanup"].get("timeout_seconds"),
                     fallback=int(
@@ -7359,15 +9631,29 @@ def run_settings_window() -> int:
                     "Ollama correction is enabled, but the “Model name” field is empty.",
                 )
             )
-        try:
-            updated["feedback"]["custom_sounds"] = {
-                kind: import_custom_sound(
-                    kind,
-                    sound_path_vars[kind].get(),
+        if updated["ollama_cleanup"]["enabled"]:
+            try:
+                updated["ollama_cleanup"]["url"] = normalize_ollama_base_url(
+                    updated["ollama_cleanup"]["url"],
                     translator,
                 )
+            except AppError:
+                focus_validation_error("integrations", ollama_url_entry)
+                raise
+        try:
+            pending_sound_sources = {
+                kind: sound_path_vars[kind].get()
                 for kind in ("start", "stop", "done", "error")
             }
+            custom_sound_values: dict[str, str] = {}
+            for kind, source_value in pending_sound_sources.items():
+                source = resolve_sound_path(source_value)
+                if source is None:
+                    custom_sound_values[kind] = ""
+                    continue
+                validate_wave_file(source.resolve(), translator)
+                custom_sound_values[kind] = str(Path("sounds") / f"{kind}.wav")
+            updated["feedback"]["custom_sounds"] = custom_sound_values
         except Exception:
             show_page("sounds")
             sounds_disclosure["reveal"]()
@@ -7389,6 +9675,7 @@ def run_settings_window() -> int:
         pre_roll_var,
         post_roll_var,
         minimum_recording_var,
+        maximum_recording_var,
         minimum_rms_var,
         vad_enabled_var,
         vad_threshold_var,
@@ -7491,19 +9778,28 @@ def run_settings_window() -> int:
     status_var.trace_add("write", update_status_indicator)
 
     def save_from_window(apply_now: bool) -> None:
-        nonlocal config
+        nonlocal config, config_revision
         settings_saved = False
         try:
             updated = collect_config()
-            save_config(updated)
+            config_revision = save_config_with_custom_sounds(
+                updated,
+                pending_sound_sources,
+                translator,
+                expected_revision=config_revision,
+            )
             settings_saved = True
             config = updated
+            for kind, managed_source in settings_sound_sources_from_config(
+                updated
+            ).items():
+                sound_path_vars[kind].set(managed_source)
             dirty_state["baseline"] = tuple(
                 variable.get() for variable in tracked_variables
             )
             dirty_state["dirty"] = False
             if apply_now:
-                runtime_result = restart_or_launch_app_after_settings()
+                runtime_result = restart_or_launch_app_after_settings(translator)
                 restart_pending["value"] = False
                 apply_button.configure(state="disabled")
                 if runtime_result == "restart_requested":
@@ -7601,6 +9897,9 @@ def run_settings_window() -> int:
         pre_roll_var.set(str(DEFAULT_CONFIG["pre_roll_ms"]))
         post_roll_var.set(str(DEFAULT_CONFIG["post_roll_ms"]))
         minimum_recording_var.set(str(DEFAULT_CONFIG["minimum_recording_ms"]))
+        maximum_recording_var.set(
+            str(DEFAULT_CONFIG["maximum_recording_seconds"])
+        )
         minimum_rms_var.set(str(DEFAULT_CONFIG["minimum_rms"]))
         default_vad = DEFAULT_CONFIG["vad"]
         vad_enabled_var.set(bool(default_vad["enabled"]))
@@ -7731,13 +10030,38 @@ def run_settings_window() -> int:
     return 0
 
 
+def preferred_default_input_device() -> tuple[Optional[int], Any]:
+    """Prefer the Windows WASAPI default endpoint over PortAudio's MME default."""
+
+    devices = tuple(sd.query_devices())
+    host_apis = tuple(sd.query_hostapis())
+    for host_api in host_apis:
+        if "wasapi" not in str(host_api.get("name", "")).casefold():
+            continue
+        index = host_api.get("default_input_device")
+        if type(index) is not int or not 0 <= index < len(devices):
+            continue
+        device_info = devices[index]
+        try:
+            if int(device_info.get("max_input_channels", 0)) > 0:
+                return index, device_info
+        except (TypeError, ValueError):
+            continue
+    return None, sd.query_devices(None, "input")
+
+
 class ContinuousRecorder:
+    _RECOVERY_RETRY_SECONDS = 2.0
+    _RECOVERY_ERROR_AFTER_ATTEMPTS = 3
+    _RECOVERY_ERROR_AFTER_SECONDS = 4.0
+
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         self.sample_rate = SAMPLE_RATE
         self.device_selector = copy.deepcopy(config.get("microphone"))
         self.device: Optional[int] = None
         self.pre_roll_samples = 0
+        self.maximum_recording_samples = 0
         self._set_sample_rate(SAMPLE_RATE)
         self._lock = threading.Lock()
         self._ring: deque[np.ndarray] = deque()
@@ -7746,16 +10070,75 @@ class ContinuousRecorder:
         self._recorded: list[np.ndarray] = []
         self._recording_samples = 0
         self._released_recording_samples: Optional[int] = None
+        self._meter_level = 0.0
         self.last_recording_samples = 0
+        self.recording_limit_reached = threading.Event()
+        self._audio_status_count = 0
+        self._idle_audio_status_count = 0
+        self._stream_lock = threading.RLock()
+        self._stream_finished = threading.Event()
+        self._next_recovery_at = 0.0
+        self._last_working_stream_attempt: Optional[tuple[str, int, str]] = None
+        self._recovery_failure_count = 0
+        self._recovery_first_failure_at: Optional[float] = None
+        self._recovery_error_reported = False
+        self._stream_monitoring_enabled = False
         self._stream: Optional[sd.InputStream] = None
 
     def _set_sample_rate(self, sample_rate: int) -> None:
-        self.sample_rate = max(8_000, int(round(sample_rate)))
+        self.sample_rate = min(
+            MAX_CAPTURE_SAMPLE_RATE,
+            max(8_000, int(round(sample_rate))),
+        )
         self.pre_roll_samples = int(
             self.sample_rate
             * max(0, int(self.config.get("pre_roll_ms", 300)))
             / 1000
         )
+        maximum_seconds = int(
+            self.config.get(
+                "maximum_recording_seconds",
+                DEFAULT_MAXIMUM_RECORDING_SECONDS,
+            )
+        )
+        maximum_seconds = max(1, min(MAXIMUM_RECORDING_SECONDS, maximum_seconds))
+        requested_samples = self.sample_rate * maximum_seconds
+        # Rezerwa obejmuje surowe bloki, wynik concatenate oraz największy
+        # tymczasowy bufor normalizacji/RMS. Sam limit listy bloków nie chronił
+        # wcześniej procesu przed 2-3-krotnym skokiem pamięci po puszczeniu klawisza.
+        memory_safe_total_samples = MAX_RECORDING_BUFFER_BYTES // (
+            np.dtype(np.float32).itemsize * MAX_RECORDING_PIPELINE_BUFFERS
+        )
+        memory_safe_recording_samples = max(
+            1,
+            memory_safe_total_samples - self.pre_roll_samples,
+        )
+        self.maximum_recording_samples = min(
+            requested_samples,
+            memory_safe_recording_samples,
+        )
+        self.maximum_recording_seconds = max(
+            1.0,
+            self.maximum_recording_samples / self.sample_rate,
+        )
+        if self.maximum_recording_samples < requested_samples:
+            logging.warning(
+                "Limit nagrania skrócono do %.1f s, aby szczytowe użycie "
+                "buforów nie przekroczyło %d MiB",
+                self.maximum_recording_seconds,
+                MAX_RECORDING_BUFFER_BYTES // (1024 * 1024),
+            )
+
+    def _reset_stream_audio_state(self) -> None:
+        """Drop samples and meter state that belong to the previous stream."""
+
+        with self._lock:
+            self._ring.clear()
+            self._ring_samples = 0
+            self._meter_level = 0.0
+
+    def _stream_finished_callback(self) -> None:
+        self._stream_finished.set()
 
     def _open_stream(self, sample_rate: int, latency: str) -> sd.InputStream:
         stream = sd.InputStream(
@@ -7763,84 +10146,169 @@ class ContinuousRecorder:
             channels=1,
             dtype="float32",
             device=self.device,
-            blocksize=1024,
+            blocksize=0,
             latency=latency,
             callback=self._callback,
+            finished_callback=self._stream_finished_callback,
         )
         try:
             stream.start()
         except Exception:
-            stream.close()
+            try:
+                stream.close(ignore_errors=False)
+            except Exception:
+                logging.exception(
+                    "Błąd zamykania mikrofonu po nieudanym uruchomieniu"
+                )
             raise
         return stream
 
     def start(self) -> None:
+        with self._stream_lock:
+            self._start_unlocked()
+            self._stream_monitoring_enabled = True
+
+    def _start_unlocked(self) -> None:
         translator = Translator.from_config(self.config)
+        attempts: list[tuple[str, str, Optional[int]]] = []
         if self.device_selector is None:
-            self.device = None
             try:
-                device_info = sd.query_devices(None, "input")
+                self.device, device_info = preferred_default_input_device()
                 default_rate = int(
                     round(float(device_info["default_samplerate"]))
                 )
             except Exception:
+                self.device = None
                 default_rate = SAMPLE_RATE
-        else:
-            self.device, device_info = resolve_runtime_microphone(
-                self.device_selector,
-                translator,
+            attempts.extend(
+                [
+                    ("default", "high", default_rate),
+                    ("default", "low", default_rate),
+                ]
             )
-            default_rate: Optional[int]
-            try:
-                default_rate = int(
-                    round(float(device_info["default_samplerate"]))
-                )
-            except Exception:
-                default_rate = None
-            if default_rate is None:
-                raise microphone_selection_app_error(
-                    audio_devices.ERROR_SNAPSHOT_MALFORMED,
+            if default_rate != SAMPLE_RATE:
+                attempts.append(("default", "high", SAMPLE_RATE))
+        else:
+            _, _, original_identity = (
+                _resolve_runtime_microphone_with_identity(
+                    self.device_selector,
                     translator,
+                    prefer_wasapi=False,
+                )
+            )
+            # A legacy index is meaningful only for the snapshot in which it
+            # was resolved. Pin it to that device's identity before any retry
+            # so hot-plug cannot redirect recording to a different microphone.
+            if type(self.device_selector) is int:
+                self.device_selector = original_identity
+            self.device, _, preferred_identity = (
+                _resolve_runtime_microphone_with_identity(
+                    self.device_selector,
+                    translator,
+                    prefer_wasapi=True,
+                )
+            )
+            attempts.extend(
+                [
+                    ("preferred", "high", None),
+                    ("preferred", "low", None),
+                ]
+            )
+            original_selector = audio_devices.parse_microphone_selector(
+                original_identity
+            )
+            preferred_selector = audio_devices.parse_microphone_selector(
+                preferred_identity
+            )
+            if audio_devices.microphone_identity_key(
+                original_selector
+            ) != audio_devices.microphone_identity_key(preferred_selector):
+                attempts.extend(
+                    [
+                        ("original", "high", None),
+                        ("original", "low", None),
+                    ]
                 )
 
-        attempts: list[tuple[int, str]] = [(SAMPLE_RATE, "low")]
-        if default_rate != SAMPLE_RATE:
-            attempts.extend([(default_rate, "low"), (default_rate, "high")])
-        else:
-            attempts.append((SAMPLE_RATE, "high"))
+        cached_attempt = self._last_working_stream_attempt
+        allowed_cached_endpoints = (
+            {"default"}
+            if self.device_selector is None
+            else {"preferred", "original"}
+        )
+        if (
+            cached_attempt is not None
+            and cached_attempt[0] in allowed_cached_endpoints
+        ):
+            # A native MME fallback that already worked should be the first
+            # recovery attempt instead of repeatedly probing broken WASAPI.
+            cached_endpoint, cached_rate, cached_latency = cached_attempt
+            attempts.insert(
+                0,
+                (cached_endpoint, cached_latency, cached_rate),
+            )
 
         last_error: Optional[Exception] = None
-        seen: set[tuple[int, str]] = set()
-        first_explicit_attempt = True
-        for sample_rate, latency in attempts:
-            if (sample_rate, latency) in seen:
-                continue
-            seen.add((sample_rate, latency))
-            if self.device_selector is not None:
-                if first_explicit_attempt:
-                    first_explicit_attempt = False
-                else:
-                    # PortAudio indices may change after hot-plug. Never carry
-                    # a failed attempt's numeric index into the next attempt.
-                    self.device, _ = resolve_runtime_microphone(
-                        self.device_selector,
-                        translator,
-                    )
+        seen: set[tuple[tuple[Any, ...], int, str]] = set()
+        for endpoint, latency, rate_override in attempts:
             try:
+                sample_rate = rate_override
+                resolved_identity: Optional[dict[str, Any]] = None
+                if self.device_selector is not None:
+                    # Resolve immediately before every attempt.  The fallback
+                    # deliberately returns to the exact saved endpoint rather
+                    # than whichever numeric PortAudio index is now present.
+                    self.device, device_info, resolved_identity = (
+                        _resolve_runtime_microphone_with_identity(
+                            self.device_selector,
+                            translator,
+                            prefer_wasapi=endpoint == "preferred",
+                        )
+                    )
+                    if sample_rate is None:
+                        sample_rate = int(
+                            round(float(device_info["default_samplerate"]))
+                        )
+                if sample_rate is None:
+                    raise ValueError("missing sample rate")
+                if resolved_identity is None:
+                    endpoint_key: tuple[Any, ...] = ("default", self.device)
+                else:
+                    endpoint_key = audio_devices.microphone_identity_key(
+                        audio_devices.parse_microphone_selector(resolved_identity)
+                    )
+                attempt_key = (endpoint_key, sample_rate, latency)
+                if attempt_key in seen:
+                    continue
+                seen.add(attempt_key)
                 self._set_sample_rate(sample_rate)
+                sample_rate = self.sample_rate
+                self._stream_finished.clear()
                 self._stream = self._open_stream(sample_rate, latency)
+                self._last_working_stream_attempt = (
+                    endpoint,
+                    sample_rate,
+                    latency,
+                )
+                self._reset_stream_audio_state()
                 logging.info(
-                    "Mikrofon uruchomiony: %s, %d Hz, latency=%s",
+                    "Mikrofon uruchomiony: %s, %d Hz, latency=%s, endpoint=%s",
                     self.device if self.device is not None else "domyślny",
                     sample_rate,
                     latency,
+                    endpoint,
                 )
                 return
             except Exception as exc:
                 last_error = exc
-                logging.warning(
-                    "Nie udało się otworzyć mikrofonu przy %d Hz (%s): %s",
-                    sample_rate,
+                # Individual endpoint failures are diagnostics.  In
+                # particular, a broken optional WASAPI equivalent is expected
+                # to fall back to the exact saved endpoint without producing
+                # warnings on every otherwise-successful startup.
+                logging.info(
+                    "Nie udało się otworzyć mikrofonu (%s, %s Hz, %s): %s",
+                    endpoint,
+                    sample_rate if sample_rate is not None else "?",
                     latency,
                     exc,
                 )
@@ -7853,27 +10321,125 @@ class ContinuousRecorder:
             )
         )
 
+    def ensure_stream_alive(self) -> bool:
+        """Recover an idle stream after a driver reset or device hot-plug."""
+
+        if not self._stream_monitoring_enabled:
+            return True
+        with self._lock:
+            if self._recording:
+                return True
+        with self._stream_lock:
+            # ``close`` may have disabled monitoring while this thread waited
+            # for the stream lock.  Never resurrect audio during shutdown.
+            if not self._stream_monitoring_enabled:
+                return True
+            stream = self._stream
+            try:
+                active = bool(stream is not None and stream.active)
+            except Exception:
+                active = False
+            if active and not self._stream_finished.is_set():
+                return True
+            now = time.monotonic()
+            if now < self._next_recovery_at:
+                return False
+            self._next_recovery_at = now + self._RECOVERY_RETRY_SECONDS
+            self._close_stream_unlocked(stream)
+            self._stream = None
+            try:
+                self._start_unlocked()
+            except Exception as exc:
+                if self._recovery_first_failure_at is None:
+                    self._recovery_first_failure_at = now
+                self._recovery_failure_count += 1
+                elapsed = max(0.0, now - self._recovery_first_failure_at)
+                exhausted_budget = (
+                    self._recovery_failure_count
+                    >= self._RECOVERY_ERROR_AFTER_ATTEMPTS
+                    and elapsed >= self._RECOVERY_ERROR_AFTER_SECONDS
+                )
+                if exhausted_budget and not self._recovery_error_reported:
+                    self._recovery_error_reported = True
+                    logging.exception(
+                        "Nie udało się ponownie otworzyć mikrofonu po %d próbach",
+                        self._recovery_failure_count,
+                    )
+                else:
+                    logging.warning(
+                        "Przejściowo nie udało się ponownie otworzyć mikrofonu "
+                        "(próba %d): %s",
+                        self._recovery_failure_count,
+                        exc,
+                    )
+                return False
+            self._next_recovery_at = 0.0
+            self._recovery_failure_count = 0
+            self._recovery_first_failure_at = None
+            self._recovery_error_reported = False
+            logging.info("Połączenie z mikrofonem zostało przywrócone")
+            return True
+
+    @staticmethod
+    def _close_stream_unlocked(stream: Any) -> None:
+        if stream is None:
+            return
+        try:
+            stream.stop(ignore_errors=False)
+        except Exception:
+            logging.exception("Błąd zatrzymywania mikrofonu")
+        try:
+            stream.close(ignore_errors=False)
+        except Exception:
+            logging.exception("Błąd zamykania mikrofonu")
+
     def close(self) -> None:
-        stream = self._stream
-        self._stream = None
-        if stream is not None:
-            try:
-                stream.stop()
-            except Exception:
-                logging.exception("Błąd zatrzymywania mikrofonu")
-            try:
-                stream.close()
-            except Exception:
-                logging.exception("Błąd zamykania mikrofonu")
+        with self._stream_lock:
+            self._stream_monitoring_enabled = False
+            stream = self._stream
+            self._stream = None
+            self._close_stream_unlocked(stream)
+
+    def abort(self) -> None:
+        """Discard a capture without concatenating a potentially large buffer."""
+
+        with self._lock:
+            self._recording = False
+            self._recorded = []
+            self._recording_samples = 0
+            self._released_recording_samples = None
+            self.last_recording_samples = 0
+            self._audio_status_count = 0
+            self.recording_limit_reached.clear()
 
     def _callback(self, indata, frames, time_info, status) -> None:
-        if status:
-            logging.warning("Status wejścia audio: %s", status)
         chunk = np.asarray(indata[:, 0], dtype=np.float32).copy()
         with self._lock:
             if self._recording:
-                self._recorded.append(chunk)
-                self._recording_samples += len(chunk)
+                if chunk.size:
+                    peak = max(
+                        abs(float(np.min(chunk))),
+                        abs(float(np.max(chunk))),
+                    )
+                    visual_level = min(1.0, math.sqrt(max(0.0, peak)))
+                    self._meter_level = max(
+                        visual_level,
+                        self._meter_level * 0.72,
+                    )
+                if status:
+                    self._audio_status_count += 1
+                remaining = max(
+                    0,
+                    self.maximum_recording_samples - self._recording_samples,
+                )
+                if remaining:
+                    captured = chunk[:remaining]
+                    self._recorded.append(captured)
+                    self._recording_samples += len(captured)
+                if self._recording_samples >= self.maximum_recording_samples:
+                    self.recording_limit_reached.set()
+            elif status:
+                self._idle_audio_status_count += 1
             # Ring zawsze opisuje najnowszy dźwięk. Gdyby zatrzymać go na czas
             # nagrania, szybkie kolejne naciśnięcie dostałoby pre-roll sprzed
             # poprzedniej wypowiedzi zamiast jej rzeczywistego końca.
@@ -7891,14 +10457,37 @@ class ContinuousRecorder:
                     self._ring[0] = oldest[excess:].copy()
                     self._ring_samples -= excess
 
+    def log_pending_audio_statuses(self) -> None:
+        """Move idle PortAudio diagnostics out of its real-time callback."""
+
+        with self._lock:
+            count = self._idle_audio_status_count
+            self._idle_audio_status_count = 0
+        if count:
+            logging.warning(
+                "PortAudio zgłosiło problemy wejścia poza nagraniem: %d",
+                count,
+            )
+
     def begin(self) -> None:
+        if not self.ensure_stream_alive():
+            raise AppError("Microphone stream is unavailable")
         with self._lock:
             if self._recording:
                 return
             self._recorded = [part.copy() for part in self._ring]
             self._recording_samples = 0
             self._released_recording_samples = None
+            self._meter_level = 0.0
+            self._audio_status_count = 0
+            self.recording_limit_reached.clear()
             self._recording = True
+
+    def current_level(self) -> float:
+        """Zwróć wygładzony poziom nagrania dla lekkiej animacji kapsuły."""
+
+        with self._lock:
+            return min(1.0, max(0.0, float(self._meter_level)))
 
     def mark_release(self) -> None:
         """Snapshot samples captured while the shortcut was physically held."""
@@ -7908,6 +10497,7 @@ class ContinuousRecorder:
                 self._released_recording_samples = self._recording_samples
 
     def finish(self) -> np.ndarray:
+        audio_status_count = 0
         with self._lock:
             if not self._recording:
                 self.last_recording_samples = 0
@@ -7923,6 +10513,14 @@ class ContinuousRecorder:
             )
             self._recording_samples = 0
             self._released_recording_samples = None
+            self._meter_level = 0.0
+            audio_status_count = self._audio_status_count
+            self._audio_status_count = 0
+        if audio_status_count:
+            logging.warning(
+                "PortAudio zgłosiło problemy wejścia podczas nagrania: %d",
+                audio_status_count,
+            )
         if not parts:
             return np.empty(0, dtype=np.float32)
         return np.concatenate(parts).astype(np.float32, copy=False)
@@ -7978,9 +10576,14 @@ class MowikApp:
             command_engine.ExecutionContext
         ] = None
         self._pending_command_context_ready: Optional[threading.Event] = None
+        self._explorer_context_slots = threading.BoundedSemaphore(
+            MAX_PENDING_EXPLORER_CONTEXTS
+        )
         self.key_down = False
         self.capture_active = False
         self.capture_mode: Optional[str] = None
+        self._capture_generation = 0
+        self._capture_timer: Optional[RecordingDeadlineTimer] = None
         self._release_started_at: Optional[float] = None
         self.model: Optional[WhisperModel] = None
         self.model_name = ""
@@ -7995,10 +10598,17 @@ class MowikApp:
         self._status_lock = threading.Lock()
         feedback = config.get("feedback", {})
         self.dictation_indicator = FloatingStatusIndicator(
-            bool(feedback.get("floating_indicator", True))
+            bool(feedback.get("floating_indicator", True)),
+            self.translator,
         )
         self._restart_lock = threading.Lock()
         self._restart_started = False
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
+        self._shutdown_owner_ident: Optional[int] = None
+        self._shutdown_complete = threading.Event()
+        self._microphone_state_lock = threading.Lock()
+        self._microphone_unavailable = False
         # Request zapisany przez poprzedni proces nie może zrestartować
         # świeżo uruchomionej aplikacji. Próg pochodzi z początku procesu,
         # więc obejmuje także request wysłany tuż po utworzeniu mutexu.
@@ -8018,7 +10628,8 @@ class MowikApp:
         )
 
     def _model_status(self, status: str) -> None:
-        self.set_status(status, state="processing")
+        if not self.stop_event.is_set():
+            self.set_status(status, state="processing")
 
     def _command_mode_enabled(self) -> bool:
         return bool(
@@ -8033,24 +10644,44 @@ class MowikApp:
             self.translator,
         )
         if not self._command_mode_enabled():
-            return self.translator.t(
+            status = self.translator.t(
                 "Gotowy — {trigger_label}",
                 "Ready — {trigger_label}",
                 trigger_label=dictation_label,
             )
-        command_trigger = self.config.get("custom_commands", {}).get(
-            "trigger", "keyboard:f7"
+        else:
+            command_trigger = self.config.get("custom_commands", {}).get(
+                "trigger", "keyboard:f7"
+            )
+            command_label = trigger_display_name(
+                str(command_trigger),
+                self.translator,
+            )
+            status = self.translator.t(
+                "Gotowy — dyktowanie: {dictation} · komendy: {commands}",
+                "Ready — dictation: {dictation} · commands: {commands}",
+                dictation=dictation_label,
+                commands=command_label,
+            )
+        requested_limit = float(
+            self.config.get(
+                "maximum_recording_seconds",
+                DEFAULT_MAXIMUM_RECORDING_SECONDS,
+            )
         )
-        command_label = trigger_display_name(
-            str(command_trigger),
-            self.translator,
+        effective_limit = getattr(
+            self.recorder, "maximum_recording_seconds", requested_limit
         )
-        return self.translator.t(
-            "Gotowy — dyktowanie: {dictation} · komendy: {commands}",
-            "Ready — dictation: {dictation} · commands: {commands}",
-            dictation=dictation_label,
-            commands=command_label,
-        )
+        if (
+            isinstance(effective_limit, (int, float))
+            and float(effective_limit) + 0.001 < requested_limit
+        ):
+            status += self.translator.t(
+                " · limit nagrania: {seconds} s",
+                " · recording limit: {seconds} s",
+                seconds=max(1, int(float(effective_limit))),
+            )
+        return status
 
     def start(self) -> None:
         self.worker.start()
@@ -8067,6 +10698,31 @@ class MowikApp:
                     self._restart_requests_not_before_ns
                 )
                 if request_text is None:
+                    recorder = self.recorder
+                    if recorder is not None:
+                        recorder.log_pending_audio_statuses()
+                        if not recorder.ensure_stream_alive():
+                            with self._microphone_state_lock:
+                                if self._microphone_unavailable:
+                                    continue
+                                self._microphone_unavailable = True
+                                self.set_status(
+                                    self.translator.t(
+                                        "Mikrofon został odłączony — próbuję połączyć ponownie…",
+                                        "Microphone disconnected — reconnecting…",
+                                    ),
+                                    state="processing",
+                                )
+                        else:
+                            with self._microphone_state_lock:
+                                if not self._microphone_unavailable:
+                                    continue
+                                self._microphone_unavailable = False
+                                if self.model_ready.is_set():
+                                    self.set_status(
+                                        self._ready_status(),
+                                        state="ready",
+                                    )
                     continue
                 logging.info("Odebrano prośbę o restart ustawień: %s", request_text)
                 self.set_status(
@@ -8076,7 +10732,7 @@ class MowikApp:
                     ),
                     state="processing",
                 )
-                self.restart()
+                self.restart(restart_request=request_text)
                 return
             except Exception:
                 logging.exception("Nie udało się obsłużyć prośby o restart")
@@ -8092,6 +10748,7 @@ class MowikApp:
 
     def _load_runtime(self) -> None:
         recorder: Optional[ContinuousRecorder] = None
+        recorder_published = False
         try:
             self.set_status(
                 self.translator.t(
@@ -8102,23 +10759,42 @@ class MowikApp:
             )
             recorder = ContinuousRecorder(self.config)
             recorder.start()
-            if self.stop_event.is_set():
+            with self._shutdown_lock:
+                cancelled = self._shutdown_started or self.stop_event.is_set()
+                if not cancelled:
+                    self.recorder = recorder
+                    recorder_published = True
+                    self.dictation_indicator.set_level_source(
+                        recorder.current_level
+                    )
+            if cancelled:
                 recorder.close()
                 return
-            self.recorder = recorder
             model, model_name, device = create_model(
                 self.config,
                 self._model_status,
             )
-            if self.stop_event.is_set():
-                if self.recorder is recorder:
-                    self.recorder = None
-                recorder.close()
+            with self._shutdown_lock:
+                cancelled = self._shutdown_started or self.stop_event.is_set()
+                if cancelled:
+                    if self.recorder is recorder:
+                        self.recorder = None
+                else:
+                    self.model = model
+                    self.model_name = model_name
+                    self.model_device = device
+                    self.model_ready.set()
+            if cancelled:
+                should_close = False
+                with self._shutdown_lock:
+                    if self.recorder is recorder:
+                        self.recorder = None
+                        should_close = True
+                    elif not recorder_published:
+                        should_close = True
+                if should_close:
+                    recorder.close()
                 return
-            self.model = model
-            self.model_name = model_name
-            self.model_device = device
-            self.model_ready.set()
             dictation_label = trigger_display_name(
                 str(self.config["trigger"]),
                 self.translator,
@@ -8143,27 +10819,44 @@ class MowikApp:
                     dictation=dictation_label,
                     commands=command_label,
                 )
-            self.set_status(
-                self._ready_status(),
-                notify=self.translator.t(
-                    "Model {model_name} działa na {device}. {instruction}",
-                    "Model {model_name} is running on {device}. {instruction}",
-                    model_name=model_name,
-                    device=device,
-                    instruction=instruction,
-                ),
-                state="ready",
-            )
+            if not self.stop_event.is_set():
+                with self._microphone_state_lock:
+                    if self._microphone_unavailable:
+                        self.set_status(
+                            self.translator.t(
+                                "Mikrofon został odłączony — próbuję połączyć ponownie…",
+                                "Microphone disconnected — reconnecting…",
+                            ),
+                            state="processing",
+                        )
+                    else:
+                        self.set_status(
+                            self._ready_status(),
+                            notify=self.translator.t(
+                                "Model {model_name} działa na {device}. {instruction}",
+                                "Model {model_name} is running on {device}. {instruction}",
+                                model_name=model_name,
+                                device=device,
+                                instruction=instruction,
+                            ),
+                            state="ready",
+                        )
         except Exception:
             logging.exception("Błąd inicjalizacji")
             self.model_ready.clear()
             if recorder is not None:
-                if self.recorder is recorder:
-                    self.recorder = None
-                try:
-                    recorder.close()
-                except Exception:
-                    logging.exception("Nie udało się zamknąć mikrofonu po błędzie")
+                should_close = False
+                with self._shutdown_lock:
+                    if self.recorder is recorder:
+                        self.recorder = None
+                        should_close = True
+                    elif not recorder_published:
+                        should_close = True
+                if should_close:
+                    try:
+                        recorder.close()
+                    except Exception:
+                        logging.exception("Nie udało się zamknąć mikrofonu po błędzie")
             if self.stop_event.is_set():
                 return
             self.set_status(
@@ -8209,6 +10902,13 @@ class MowikApp:
             )
             self._pending_command_context_ready = ready
 
+        if not self._explorer_context_slots.acquire(blocking=False):
+            logging.warning(
+                "Pominięto rozwiązywanie kontekstu Explorera: limit zadań"
+            )
+            ready.set()
+            return
+
         def resolve() -> None:
             try:
                 resolved = windows_actions.resolve_explorer_context(identity)
@@ -8224,12 +10924,19 @@ class MowikApp:
                 )
             finally:
                 ready.set()
+                self._explorer_context_slots.release()
 
-        threading.Thread(
+        worker = threading.Thread(
             target=resolve,
             name="ExplorerContext",
             daemon=True,
-        ).start()
+        )
+        try:
+            worker.start()
+        except Exception:
+            self._explorer_context_slots.release()
+            ready.set()
+            raise
 
     def _take_command_context(self) -> command_engine.ExecutionContext:
         with self._command_context_lock:
@@ -8302,7 +11009,11 @@ class MowikApp:
     def begin_dictation(self, mode: str = "dictation") -> None:
         if mode not in {"dictation", "custom_command"}:
             raise ValueError(f"Unknown capture mode: {mode}")
-        if not self.model_ready.is_set() or self.recorder is None:
+        with self._shutdown_lock:
+            if self._shutdown_started or self.stop_event.is_set():
+                return
+            recorder = self.recorder
+        if not self.model_ready.is_set() or recorder is None:
             self.dictation_indicator.error()
             self.beep("error")
             self.set_status(
@@ -8325,18 +11036,175 @@ class MowikApp:
                 )
                 return
             self.busy = True
+        timer: Optional[RecordingDeadlineTimer] = None
+        capture_generation: Optional[int] = None
+
+        def rollback_started_capture() -> None:
+            nonlocal timer
+            if timer is not None:
+                timer.cancel()
+            with self._input_lock:
+                if self._capture_timer is timer:
+                    self._capture_timer = None
+                if (
+                    capture_generation is not None
+                    and self._capture_generation == capture_generation
+                ):
+                    self.capture_active = False
+                    self.capture_mode = None
+                    self._capture_generation += 1
+            abort = getattr(recorder, "abort", None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception:
+                    logging.exception("Nie udało się odrzucić przerwanego nagrania")
+            self._release_busy()
+
         try:
-            self.recorder.begin()
-            self.capture_active = True
-            self.capture_mode = mode
-            if mode == "custom_command":
-                self.dictation_indicator.recording(command=True)
-            else:
-                self.dictation_indicator.recording()
+            recorder.begin()
+            maximum_seconds = int(
+                self.config.get(
+                    "maximum_recording_seconds",
+                    DEFAULT_MAXIMUM_RECORDING_SECONDS,
+                )
+            )
+            recorder_limit = getattr(recorder, "maximum_recording_seconds", None)
+            if not isinstance(recorder_limit, (int, float)):
+                recorder_limit = maximum_seconds
+            timer_delay = max(
+                1.0,
+                min(
+                    float(MAXIMUM_RECORDING_SECONDS),
+                    float(maximum_seconds),
+                    float(recorder_limit),
+                ),
+            )
+            # Commit the recording only while shutdown is excluded. This lock
+            # also keeps status/indicator updates ordered before any cleanup.
+            with self._shutdown_lock:
+                if self._shutdown_started or self.stop_event.is_set():
+                    raise OperationCancelled()
+                with self._input_lock:
+                    if self.stop_event.is_set():
+                        raise OperationCancelled()
+                    self.capture_active = True
+                    self.capture_mode = mode
+                    self._capture_generation += 1
+                    capture_generation = self._capture_generation
+                    timer = RecordingDeadlineTimer(
+                        timer_delay,
+                        self._capture_limit_elapsed,
+                        (capture_generation,),
+                    )
+                    self._capture_timer = timer
+                    timer.start()
+                if mode == "custom_command":
+                    self.dictation_indicator.recording(command=True)
+                else:
+                    self.dictation_indicator.recording()
+                self.beep("start")
+                self.set_status(
+                    self.translator.t(
+                        "Słucham komendy…"
+                        if mode == "custom_command"
+                        else "Nagrywanie…",
+                        "Listening for a command…"
+                        if mode == "custom_command"
+                        else "Recording…",
+                    ),
+                    state="recording",
+                )
+        except OperationCancelled:
+            rollback_started_capture()
+            return
         except Exception:
+            rollback_started_capture()
+            with self._shutdown_lock:
+                if self._shutdown_started or self.stop_event.is_set():
+                    return
+                self.dictation_indicator.error()
+                logging.exception("Nie udało się rozpocząć nagrywania")
+                self.set_status(
+                    self.translator.t("Błąd nagrywania", "Recording error"),
+                    notify=self._error_notification(),
+                    error=True,
+                    state="error",
+                )
+                self.beep("error")
+            return
+
+    def _cancel_capture_timer(self) -> None:
+        timer = self._capture_timer
+        self._capture_timer = None
+        if timer is not None and timer is not threading.current_thread():
+            timer.cancel()
+
+    def _capture_limit_elapsed(self, generation: int) -> None:
+        with self._input_lock:
+            if (
+                self.stop_event.is_set()
+                or generation != self._capture_generation
+                or not self.capture_active
+            ):
+                return
+            self._active_input = None
+            self.key_down = False
+        logging.warning("Nagranie osiągnęło bezpieczny limit czasu")
+        self.end_dictation()
+
+    def end_dictation(self) -> None:
+        with self._input_lock:
+            if not self.capture_active:
+                return
+            self.capture_active = False
+            mode = self.capture_mode or "dictation"
+            self.capture_mode = None
+            self._capture_generation += 1
+        self._cancel_capture_timer()
+        released_at = time.perf_counter()
+        self._release_started_at = released_at
+        recorder = self.recorder
+        mark_release = getattr(recorder, "mark_release", None)
+        if callable(mark_release):
+            # Freeze the sample boundary immediately after the physical release.
+            # Foreground/control inspection may cross a process boundary and must
+            # never extend the recorded utterance or its minimum-duration check.
+            mark_release()
+        delivery_foreground: Optional[tuple[int, ...]] = None
+        try:
+            delivery_foreground = capture_paste_target_identity()
+        except Exception:
+            # A missing identity must fail closed in paste_text instead of
+            # allowing a delayed transcript into whichever window is next.
+            logging.warning("Nie udało się przypiąć pola docelowego dyktowania")
+            delivery_foreground = (0, 0, 0, 0, 0)
+        if mode == "custom_command":
+            self.dictation_indicator.processing(command=True)
+        else:
+            self.dictation_indicator.processing()
+        # Kończymy także dłuższy, niezapętlony WAV przypisany do nagrywania.
+        self.stop_feedback_sound()
+        post_roll_thread = threading.Thread(
+            target=self._finish_dictation_safely,
+            args=(mode, released_at, delivery_foreground),
+            name="PostRoll",
+            daemon=True,
+        )
+        try:
+            post_roll_thread.start()
+        except Exception:
+            logging.exception("Nie udało się uruchomić kończenia nagrania")
+            abort = getattr(recorder, "abort", None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception:
+                    logging.exception("Nie udało się odrzucić nagrania")
+            if mode == "custom_command":
+                self._discard_command_context()
             self._release_busy()
             self.dictation_indicator.error()
-            logging.exception("Nie udało się rozpocząć nagrywania")
             self.set_status(
                 self.translator.t("Błąd nagrywania", "Recording error"),
                 notify=self._error_notification(),
@@ -8344,50 +11212,19 @@ class MowikApp:
                 state="error",
             )
             self.beep("error")
-            return
-        self.beep("start")
-        self.set_status(
-            self.translator.t(
-                "Słucham komendy…" if mode == "custom_command" else "Nagrywanie…",
-                "Listening for a command…"
-                if mode == "custom_command"
-                else "Recording…",
-            ),
-            state="recording",
-        )
-
-    def end_dictation(self) -> None:
-        if not self.capture_active:
-            return
-        self.capture_active = False
-        mode = self.capture_mode or "dictation"
-        self.capture_mode = None
-        released_at = time.perf_counter()
-        self._release_started_at = released_at
-        recorder = self.recorder
-        mark_release = getattr(recorder, "mark_release", None)
-        if callable(mark_release):
-            mark_release()
-        if mode == "custom_command":
-            self.dictation_indicator.processing(command=True)
-        else:
-            self.dictation_indicator.processing()
-        # Kończymy także dłuższy, niezapętlony WAV przypisany do nagrywania.
-        self.stop_feedback_sound()
-        threading.Thread(
-            target=self._finish_dictation_safely,
-            args=(mode, released_at),
-            name="PostRoll",
-            daemon=True,
-        ).start()
 
     def _finish_dictation_safely(
         self,
         mode: str = "dictation",
         released_at: Optional[float] = None,
+        delivery_foreground: Optional[tuple[int, ...]] = None,
     ) -> None:
         try:
-            self._finish_dictation_after_tail(mode, released_at)
+            self._finish_dictation_after_tail(
+                mode,
+                released_at,
+                delivery_foreground,
+            )
         except Exception:
             logging.exception("Nie udało się zakończyć nagrywania")
             self._release_busy()
@@ -8404,6 +11241,7 @@ class MowikApp:
         self,
         mode: str = "dictation",
         released_at: Optional[float] = None,
+        delivery_foreground: Optional[tuple[int, ...]] = None,
     ) -> None:
         post_roll = max(0, int(self.config.get("post_roll_ms", 120))) / 1000
         if post_roll:
@@ -8421,6 +11259,7 @@ class MowikApp:
             self._release_busy()
             self.dictation_indicator.hide()
             return
+        capture_sample_rate = int(recorder.sample_rate)
         audio = recorder.finish()
         self.beep("stop")
         recorded_samples = getattr(recorder, "last_recording_samples", None)
@@ -8429,7 +11268,7 @@ class MowikApp:
             # wersji, które zwracają wyłącznie tablicę audio.
             recorded_samples = len(audio)
         minimum_samples = int(
-            recorder.sample_rate
+            capture_sample_rate
             * max(0, int(self.config.get("minimum_recording_ms", 250)))
             / 1000
         )
@@ -8463,7 +11302,14 @@ class MowikApp:
             else None
         )
         self.jobs.put(
-            SpeechJob(audio, mode, released_at, execution_context)
+            SpeechJob(
+                audio,
+                mode,
+                released_at,
+                execution_context,
+                delivery_foreground,
+                capture_sample_rate,
+            )
         )
 
     def _job_worker(self) -> None:
@@ -8482,10 +11328,18 @@ class MowikApp:
             else:
                 # Zgodność z kolejką z wersji 2.6 i prostymi integracjami.
                 job = SpeechJob(np.asarray(queued_job), "dictation", None)
+            manual_multiline_delivery = False
             try:
                 if self.stop_event.is_set():
                     continue
-                text = self.transcribe(job.audio, mode=job.mode)
+                if job.sample_rate is None:
+                    text = self.transcribe(job.audio, mode=job.mode)
+                else:
+                    text = self.transcribe(
+                        job.audio,
+                        mode=job.mode,
+                        sample_rate=job.sample_rate,
+                    )
                 if self.stop_event.is_set():
                     continue
                 if not text:
@@ -8508,18 +11362,38 @@ class MowikApp:
                     if not self._deliver_custom_command(
                         text,
                         job.execution_context,
+                        job.delivery_foreground,
                     ):
                         continue
                 else:
                     self._set_text_delivery_status()
                     if self.stop_event.is_set():
                         continue
-                    paste_text(
-                        text,
-                        self.config,
-                        cancel_event=self.stop_event,
-                    )
                     paste_settings = self.config.get("paste", {})
+                    paste_enabled = bool(paste_settings.get("enabled", True))
+                    copy_enabled = bool(
+                        paste_settings.get("copy_to_clipboard", True)
+                    )
+                    multiline = "\r" in text or "\n" in text
+                    paste_kwargs: dict[str, Any] = {
+                        "cancel_event": self.stop_event,
+                    }
+                    if job.delivery_foreground is not None:
+                        paste_kwargs["expected_foreground"] = (
+                            job.delivery_foreground
+                        )
+                    if multiline and paste_enabled:
+                        if not copy_enabled:
+                            raise AppError(
+                                self.translator.t(
+                                    "Tekst wielowierszowy wymaga włączonego schowka.",
+                                    "Multi-line text requires clipboard copying.",
+                                )
+                            )
+                        windows_set_clipboard_text(text, self.translator)
+                        manual_multiline_delivery = True
+                    else:
+                        paste_text(text, self.config, **paste_kwargs)
                     logging.info(
                         "Dostarczono tekst (%d znaków; wklejanie=%s; schowek=%s)",
                         len(text),
@@ -8532,14 +11406,27 @@ class MowikApp:
                         job.mode,
                         time.perf_counter() - job.released_at,
                     )
-                self.set_status(
-                    self._ready_status(),
-                    state="ready",
-                )
+                if manual_multiline_delivery:
+                    self.set_status(
+                        self.translator.t(
+                            "Tekst wielowierszowy skopiowano — wklej go ręcznie przez Ctrl+V",
+                            "Multi-line text copied — paste it manually with Ctrl+V",
+                        ),
+                        notify=self.translator.t(
+                            "Mówik nie wkleił go automatycznie ze względów bezpieczeństwa.",
+                            "Mówik did not paste it automatically for safety.",
+                        ),
+                        state="ready",
+                    )
+                else:
+                    self.set_status(
+                        self._ready_status(),
+                        state="ready",
+                    )
                 if job.mode == "custom_command":
                     self.dictation_indicator.success(command=True)
                 else:
-                    self.dictation_indicator.success()
+                    self.dictation_indicator.success(text)
                 self.beep("done")
             except OperationCancelled:
                 logging.info("Anulowano dostarczanie tekstu podczas zamykania")
@@ -8605,6 +11492,7 @@ class MowikApp:
         self,
         transcript: str,
         execution_context: Optional[command_engine.ExecutionContext] = None,
+        delivery_foreground: Optional[tuple[int, ...]] = None,
     ) -> bool:
         if self.stop_event.is_set():
             return False
@@ -8642,6 +11530,15 @@ class MowikApp:
                 ),
             )
         requested_action = match.definition.action
+        if context.process_elevated:
+            return self._deny_custom_command(
+                requested_action,
+                "elevated_process_denied",
+                self.translator.t(
+                    "Zamknij Mówika uruchomionego jako administrator i otwórz go normalnie",
+                    "Close the elevated Mówik process and start it normally",
+                ),
+            )
         context_denial = custom_command_context_denial(
             context,
             require_foreground=(requested_action == "paste_text"),
@@ -8668,12 +11565,24 @@ class MowikApp:
                 message,
             )
 
-        target_identity: Optional[tuple[int, int]] = None
+        target_identity: Optional[tuple[int, ...]] = None
         if requested_action == "paste_text":
-            target_identity = (
+            target_identity = delivery_foreground or (
                 int(context.foreground_hwnd),
                 int(context.foreground_pid),
             )
+            if target_identity[:2] != (
+                int(context.foreground_hwnd),
+                int(context.foreground_pid),
+            ):
+                return self._deny_custom_command(
+                    requested_action,
+                    "delivery_target_mismatch",
+                    self.translator.t(
+                        "Pole docelowe zmieniło się — tekst nie został wklejony",
+                        "The target field changed, so the text was not pasted",
+                    ),
+                )
             if not foreground_identity_matches(target_identity):
                 return self._deny_custom_command(
                     requested_action,
@@ -8779,6 +11688,26 @@ class MowikApp:
             )
         if action == "paste_text" and plan.requires_confirmation and not multiline_paste:
             self._set_text_delivery_status()
+        launched_terminal: Optional[windows_actions.TerminalHandle] = None
+
+        def cleanup_launched_terminal() -> None:
+            nonlocal launched_terminal
+            handle = launched_terminal
+            launched_terminal = None
+            if handle is None:
+                return
+            result = windows_actions.terminate_terminal(handle)
+            cleanup_complete = result.status == "terminated" or (
+                result.status == "already_exited" and handle.host == "console"
+            )
+            if not cleanup_complete:
+                logging.warning(
+                    "Nie udało się potwierdzić zamknięcia terminala "
+                    "po nieudanej akcji (status=%s, powód=%s)",
+                    result.status,
+                    result.reason,
+                )
+
         try:
             if action == "paste_text":
                 if multiline_paste:
@@ -8820,7 +11749,7 @@ class MowikApp:
                         cancel_event=self.stop_event,
                     )
             elif action == "open":
-                open_custom_command_target(value)
+                open_custom_command_target(value, self.translator)
             elif action == "open_terminal":
                 options = plan.terminal_options or command_engine.TerminalOptions()
                 windows_context = windows_actions.ForegroundContext(
@@ -8847,13 +11776,18 @@ class MowikApp:
                 )
                 if not launched.ok or launched.handle is None:
                     raise AppError("terminal_launch_failed")
+                launched_terminal = launched.handle
+                if self.stop_event.is_set():
+                    cleanup_launched_terminal()
+                    return False
                 if value:
-                    if self.stop_event.is_set():
-                        return False
                     delivery = windows_actions.deliver_terminal_draft(
                         launched.handle,
                         value,
                     )
+                    if self.stop_event.is_set():
+                        cleanup_launched_terminal()
+                        return False
                     if delivery.status == "copied_only":
                         self.set_status(
                             self.translator.t(
@@ -8866,8 +11800,12 @@ class MowikApp:
                             ),
                             state="ready",
                         )
+                        launched_terminal = None
                     else:
+                        cleanup_launched_terminal()
                         raise AppError("terminal_draft_delivery_failed")
+                else:
+                    launched_terminal = None
             else:
                 raise AppError(
                     self.translator.t(
@@ -8876,8 +11814,10 @@ class MowikApp:
                     )
                 )
         except OperationCancelled:
+            cleanup_launched_terminal()
             raise
         except Exception as exc:
+            cleanup_launched_terminal()
             # Nie przekazujemy do logu treści ścieżki, szablonu ani polecenia.
             logging.error(
                 "Akcja własnej komendy nie powiodła się (typ=%s, błąd=%s)",
@@ -8897,7 +11837,12 @@ class MowikApp:
         )
         return True
 
-    def transcribe(self, audio: np.ndarray, mode: str = "dictation") -> str:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        mode: str = "dictation",
+        sample_rate: Optional[int] = None,
+    ) -> str:
         if mode not in {"dictation", "custom_command"}:
             raise ValueError(f"Unknown transcription mode: {mode}")
         pipeline_started = time.perf_counter()
@@ -8909,14 +11854,30 @@ class MowikApp:
                     "The model is not loaded.",
                 )
             )
-        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        audio_array = np.asarray(audio).reshape(-1)
+        if (
+            audio_array.dtype != np.float32
+            or not audio_array.flags.c_contiguous
+            or not audio_array.flags.writeable
+        ):
+            audio_array = np.array(audio_array, dtype=np.float32, order="C", copy=True)
+        audio = audio_array
         if audio.size == 0:
             return ""
-        audio = np.clip(audio - float(np.mean(audio)), -1.0, 1.0)
-        rms = float(np.sqrt(np.mean(np.square(audio), dtype=np.float64)))
-        sample_rate = (
-            self.recorder.sample_rate if self.recorder is not None else SAMPLE_RATE
-        )
+        np.subtract(audio, float(np.mean(audio, dtype=np.float64)), out=audio)
+        np.clip(audio, -1.0, 1.0, out=audio)
+        square_sum = 0.0
+        for offset in range(0, audio.size, 1_048_576):
+            chunk = audio[offset : offset + 1_048_576]
+            square_sum += float(np.dot(chunk, chunk))
+        rms = math.sqrt(square_sum / audio.size)
+        if sample_rate is None:
+            sample_rate = (
+                self.recorder.sample_rate
+                if self.recorder is not None
+                else SAMPLE_RATE
+            )
+        sample_rate = max(1, int(sample_rate))
         audio_duration = len(audio) / sample_rate
         logging.info("Audio: %.2f s, %d Hz, RMS=%.6f", audio_duration, sample_rate, rms)
         if rms < float(self.config.get("minimum_rms", 0.0015)):
@@ -8926,13 +11887,14 @@ class MowikApp:
         if sample_rate != SAMPLE_RATE:
             # faster-whisper/PyAV resampluje plik WAV do 16 kHz w pamięci.
             # Nie zapisujemy nagrania na dysku.
-            pcm = np.asarray(np.clip(audio, -1.0, 1.0) * 32767, dtype=np.int16)
+            pcm = np.empty(audio.shape, dtype=np.int16)
+            np.multiply(audio, 32767, out=pcm, casting="unsafe")
             buffer = io.BytesIO()
             with wave.open(buffer, "wb") as wav_file:
                 wav_file.setnchannels(1)
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(sample_rate)
-                wav_file.writeframes(pcm.tobytes())
+                wav_file.writeframes(memoryview(pcm).cast("B"))
             buffer.seek(0)
             audio_input = buffer
 
@@ -9118,24 +12080,46 @@ class MowikApp:
                 state="error",
             )
 
+    def _open_tray_path(
+        self,
+        path: Path,
+        polish_label: str,
+        english_label: str,
+    ) -> None:
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except OSError:
+            logging.exception("Nie udało się otworzyć ścieżki z menu: %s", path)
+            self.set_status(
+                self.translator.t(
+                    "Nie udało się otworzyć: {label}",
+                    "Could not open: {label}",
+                    label=self.translator.t(polish_label, english_label),
+                ),
+                notify=self._error_notification(),
+                error=True,
+                state="error",
+            )
+
     def open_config(self, icon=None, item=None) -> None:
-        os.startfile(CONFIG_PATH)  # type: ignore[attr-defined]
+        self._open_tray_path(CONFIG_PATH, "konfiguracja", "configuration")
 
     def open_dictionary(self, icon=None, item=None) -> None:
-        os.startfile(DICTIONARY_PATH)  # type: ignore[attr-defined]
+        self._open_tray_path(DICTIONARY_PATH, "słownik", "dictionary")
 
     def open_log(self, icon=None, item=None) -> None:
-        os.startfile(LOG_PATH)  # type: ignore[attr-defined]
+        self._open_tray_path(LOG_PATH, "dziennik", "log")
 
     def open_app_folder(self, icon=None, item=None) -> None:
-        os.startfile(APPDATA_DIR)  # type: ignore[attr-defined]
+        self._open_tray_path(APPDATA_DIR, "folder aplikacji", "application folder")
 
     def apply_profile(self, profile_name: str) -> None:
         try:
             profile = QUICK_PROFILES[profile_name]
             profile_display = profile["display"][self.translator.language]
-            updated = apply_quick_profile(load_config(), profile_name)
-            save_config(updated)
+            current_config, revision = load_config_with_revision()
+            updated = apply_quick_profile(current_config, profile_name)
+            save_config(updated, expected_revision=revision)
             self.set_status(
                 self.translator.t(
                     "Włączam profil {label}…",
@@ -9174,22 +12158,31 @@ class MowikApp:
     def apply_accurate_profile(self, icon=None, item=None) -> None:
         self.apply_profile("accurate")
 
-    def restart(self, icon=None, item=None) -> None:
+    def restart(
+        self,
+        icon=None,
+        item=None,
+        *,
+        restart_request: Optional[str] = None,
+    ) -> None:
         with self._restart_lock:
             if self._restart_started:
                 return
             self._restart_started = True
         try:
-            if getattr(sys, "frozen", False):
-                args = [sys.executable, "--restart-delay", "1.0"]
-            else:
-                args = [
-                    sys.executable,
-                    str(Path(__file__).resolve()),
-                    "--restart-delay",
-                    "1.0",
-                ]
+            requested_at_ns: Optional[int] = None
+            if restart_request is not None:
+                requested_at_ns = parse_restart_request_timestamp_ns(
+                    restart_request
+                )
+                if requested_at_ns is None:
+                    raise ValueError("invalid restart request token")
+            args = application_restart_process_args(requested_at_ns)
             subprocess.Popen(args, cwd=str(APP_ROOT))
+            if restart_request is not None:
+                # Receipt means that creating the replacement process
+                # succeeded, not merely that the request file was consumed.
+                acknowledge_restart_request(restart_request)
         except Exception:
             with self._restart_lock:
                 self._restart_started = False
@@ -9198,31 +12191,71 @@ class MowikApp:
             self.shutdown(icon, item)
 
     def shutdown(self, icon=None, item=None) -> None:
-        if self.stop_event.is_set():
+        current_ident = threading.get_ident()
+        wait_for_shutdown = False
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                # Cleanup callbacks can re-enter shutdown synchronously. The
+                # owner must return instead of waiting for its own completion.
+                if self._shutdown_owner_ident == current_ident:
+                    return
+                wait_for_shutdown = True
+            else:
+                self._shutdown_started = True
+                self._shutdown_owner_ident = current_ident
+        if wait_for_shutdown:
+            self._shutdown_complete.wait()
             return
-        self.stop_event.set()
-        with self._input_lock:
-            self._pressed_inputs.clear()
-            self._active_input = None
-            self.key_down = False
-            self.capture_active = False
-            self.capture_mode = None
-        self.dictation_indicator.close()
-        self.stop_feedback_sound()
-        self.model_ready.clear()
-        self.jobs.put(None)
-        if self.keyboard_listener is not None:
-            self.keyboard_listener.stop()
-        if self.mouse_listener is not None:
-            self.mouse_listener.stop()
-        if self.recorder is not None:
-            self.recorder.close()
-        if icon is not None:
-            icon.stop()
-        elif self.tray is not None:
-            self.tray.stop()
 
-    def run_tray(self) -> None:
+        def cleanup(label: str, action) -> None:
+            try:
+                action()
+            except Exception:
+                logging.exception("Błąd zamykania zasobu: %s", label)
+
+        try:
+            self.stop_event.set()
+            self._cancel_capture_timer()
+            with self._input_lock:
+                self._pressed_inputs.clear()
+                self._active_input = None
+                self.key_down = False
+                self.capture_active = False
+                self.capture_mode = None
+                self._capture_generation += 1
+            cleanup("indicator", self.dictation_indicator.close)
+            cleanup("feedback", self.stop_feedback_sound)
+            self.model_ready.clear()
+            self.jobs.put(None)
+
+            keyboard_listener = self.keyboard_listener
+            self.keyboard_listener = None
+            if keyboard_listener is not None:
+                cleanup("keyboard listener", keyboard_listener.stop)
+            mouse_listener = self.mouse_listener
+            self.mouse_listener = None
+            if mouse_listener is not None:
+                cleanup("mouse listener", mouse_listener.stop)
+            with self._shutdown_lock:
+                recorder = self.recorder
+                self.recorder = None
+            if recorder is not None:
+                abort = getattr(recorder, "abort", None)
+                if callable(abort):
+                    cleanup("recording buffer", abort)
+                cleanup("microphone", recorder.close)
+            tray = icon if icon is not None else self.tray
+            if tray is not None:
+                cleanup("tray", tray.stop)
+        finally:
+            with self._shutdown_lock:
+                self._shutdown_owner_ident = None
+            self._shutdown_complete.set()
+
+    def run_tray(
+        self,
+        started_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
         light_display = QUICK_PROFILES["light"]["display"][
             self.translator.language
         ]
@@ -9308,11 +12341,27 @@ class MowikApp:
         indicator_ready = self.dictation_indicator.start()
         try:
             self.start()
+            tray_setup = None
+            if started_callback is not None:
+                def tray_setup(icon) -> None:
+                    icon.visible = True
+                    try:
+                        started_callback()
+                    except Exception:
+                        logging.exception(
+                            "Nie udało się potwierdzić startu po restarcie"
+                        )
             if indicator_ready:
-                self.tray.run_detached()
+                if tray_setup is None:
+                    self.tray.run_detached()
+                else:
+                    self.tray.run_detached(setup=tray_setup)
                 self.dictation_indicator.run()
             else:
-                self.tray.run()
+                if tray_setup is None:
+                    self.tray.run()
+                else:
+                    self.tray.run(setup=tray_setup)
         finally:
             self.shutdown()
             if indicator_ready:
@@ -9380,6 +12429,8 @@ def acquire_settings_instance(
 
 def acquire_single_instance(
     translator: Optional[Translator] = None,
+    *,
+    notify_existing: bool = True,
 ) -> Optional[int]:
     if os.name != "nt":
         return None
@@ -9397,17 +12448,18 @@ def acquire_single_instance(
         raise ctypes.WinError(ctypes.get_last_error())
     ERROR_ALREADY_EXISTS = 183
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            translator.t(
-                "Mówik jest już uruchomiony. "
-                "Poszukaj ikony mikrofonu przy zegarze.",
-                "Mówik is already running. "
-                "Look for the microphone icon in the system tray.",
-            ),
-            APP_DISPLAY_NAME,
-            0x40,
-        )
+        if notify_existing:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                translator.t(
+                    "Mówik jest już uruchomiony. "
+                    "Poszukaj ikony mikrofonu przy zegarze.",
+                    "Mówik is already running. "
+                    "Look for the microphone icon in the system tray.",
+                ),
+                APP_DISPLAY_NAME,
+                0x40,
+            )
         kernel32.CloseHandle(handle)
         return None
     return int(handle)
@@ -9424,15 +12476,21 @@ def release_single_instance(handle: Optional[int]) -> None:
 def show_fatal_error(
     message: str,
     translator: Optional[Translator] = None,
+    *,
+    include_log_details: bool = True,
+    write_log: bool = True,
 ) -> None:
     translator = translator or Translator("auto")
-    display_message = translator.t(
-        "{message}\n\nSzczegóły: {path}",
-        "{message}\n\nDetails: {path}",
-        message=message,
-        path=LOG_PATH,
-    )
-    logging.error("Błąd krytyczny: %s", message)
+    display_message = message
+    if include_log_details:
+        display_message = translator.t(
+            "{message}\n\nSzczegóły: {path}",
+            "{message}\n\nDetails: {path}",
+            message=message,
+            path=LOG_PATH,
+        )
+    if write_log:
+        logging.error("Błąd krytyczny: %s", message)
     if os.name == "nt":
         ctypes.windll.user32.MessageBoxW(
             None,
@@ -9461,13 +12519,21 @@ def list_devices(translator: Optional[Translator] = None) -> int:
     return 0
 
 
-def download_model_command(config: dict[str, Any]) -> int:
+def download_model_command(
+    config: dict[str, Any],
+    *,
+    force_download: bool = True,
+) -> int:
     translator = Translator.from_config(config)
 
     def status(text: str) -> None:
         print(text, flush=True)
 
-    model, model_name, device = create_model(config, status)
+    model, model_name, device = create_model(
+        config,
+        status,
+        force_download=force_download,
+    )
     del model
     print(
         translator.t(
@@ -9516,6 +12582,29 @@ def test_ollama_command(config: dict[str, Any]) -> int:
     return 0
 
 
+def runtime_gui_smoke_test_command() -> int:
+    """Fail fast when a source or frozen build cannot create a Tk GUI."""
+
+    root: Any = None
+    try:
+        import tkinter
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.update_idletasks()
+    except Exception as exc:
+        print(f"Tk GUI smoke test failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception as exc:
+                print(f"Tk GUI cleanup failed: {exc}", file=sys.stderr)
+                return 1
+    return 0
+
+
 def parse_args(translator: Optional[Translator] = None) -> argparse.Namespace:
     translator = translator or Translator()
     parser = argparse.ArgumentParser(
@@ -9530,12 +12619,21 @@ def parse_args(translator: Optional[Translator] = None) -> argparse.Namespace:
         action="store_true",
         help=translator.t("Pokaż mikrofony", "List microphones"),
     )
-    parser.add_argument(
+    model_action_group = parser.add_mutually_exclusive_group()
+    model_action_group.add_argument(
         "--download-model",
         action="store_true",
         help=translator.t(
-            "Pobierz/załaduj model i zakończ",
-            "Download/load the model and exit",
+            "Pobierz model ponownie i zakończ",
+            "Download the model again and exit",
+        ),
+    )
+    model_action_group.add_argument(
+        "--ensure-model",
+        action="store_true",
+        help=translator.t(
+            "Zapewnij lokalną kopię modelu i zakończ",
+            "Ensure a local model copy and exit",
         ),
     )
     parser.add_argument(
@@ -9576,13 +12674,34 @@ def parse_args(translator: Optional[Translator] = None) -> argparse.Namespace:
         default=0.0,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--restart-started-token",
+        type=parse_restart_started_cli_token,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--runtime-gui-smoke-test",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     cli_translator = Translator()
     args = parse_args(cli_translator)
-    setup_logging(console=args.console_log or args.download_model or args.list_devices)
+    if getattr(args, "runtime_gui_smoke_test", False):
+        return runtime_gui_smoke_test_command()
+    require_non_elevated_runtime(cli_translator)
+    setup_logging(
+        console=(
+            args.console_log
+            or args.download_model
+            or getattr(args, "ensure_model", False)
+            or args.list_devices
+        )
+    )
     create_default_files()
 
     if args.create_config:
@@ -9623,7 +12742,9 @@ def main() -> int:
     if args.restart_delay > 0:
         time.sleep(min(args.restart_delay, 5.0))
     if args.download_model:
-        return download_model_command(config)
+        return download_model_command(config, force_download=True)
+    if getattr(args, "ensure_model", False):
+        return download_model_command(config, force_download=False)
     if args.test_ollama:
         return test_ollama_command(config)
 
@@ -9643,22 +12764,53 @@ def main() -> int:
     except Exception:
         pass
 
-    mutex_handle = acquire_single_instance(translator)
-    if mutex_handle is None:
-        return 0
+    restart_deadline = (
+        time.monotonic() + RESTART_MUTEX_WAIT_SECONDS
+        if args.restart_delay > 0
+        else None
+    )
+    while True:
+        mutex_handle = acquire_single_instance(
+            translator,
+            notify_existing=restart_deadline is None,
+        )
+        if mutex_handle is not None:
+            break
+        if restart_deadline is None:
+            return 0
+        if time.monotonic() >= restart_deadline:
+            logging.error("Nowa instancja nie przejęła mutexu po restarcie")
+            return 0
+        time.sleep(0.2)
     try:
         app = MowikApp(config)
-        app.run_tray()
+        restart_started_token = getattr(args, "restart_started_token", None)
+        started_callback = (
+            None
+            if restart_started_token is None
+            else lambda: announce_restart_started(restart_started_token)
+        )
+        app.run_tray(started_callback=started_callback)
     finally:
         release_single_instance(mutex_handle)
     return 0
 
 
-if __name__ == "__main__":
+def run_entrypoint() -> int:
+    """Run the CLI while keeping elevation rejection free of user-data I/O."""
+
     try:
-        raise SystemExit(main())
+        return main()
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        return 130
+    except ElevatedRuntimeError as exc:
+        show_fatal_error(
+            str(exc),
+            Translator(),
+            include_log_details=False,
+            write_log=False,
+        )
+        return 1
     except Exception as exc:
         setup_logging(console=True)
         logging.error("Błąd krytyczny:\n%s", traceback.format_exc())
@@ -9667,4 +12819,8 @@ if __name__ == "__main__":
         except Exception:
             fatal_translator = Translator()
         show_fatal_error(str(exc), fatal_translator)
-        raise SystemExit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_entrypoint())

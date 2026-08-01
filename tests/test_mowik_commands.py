@@ -201,6 +201,21 @@ class CommandMatchingTests(unittest.TestCase):
         self.assertIsNone(registry.match("terminalista git status"))
         self.assertIsNone(registry.match("superterminal git status"))
 
+    def test_prefix_rejects_ambiguous_nfkc_expansion_boundary(self) -> None:
+        registry = CommandRegistry.from_items(
+            [
+                {
+                    "id": "ambiguous-prefix",
+                    "phrase": "a",
+                    "action": "open_terminal",
+                    "value": "",
+                    "match": "prefix_tail",
+                }
+            ]
+        )
+
+        self.assertIsNone(registry.match("\u2100 status"))
+
     def test_duplicate_match_keys_and_ids_are_all_disabled_fail_closed(self) -> None:
         registry = CommandRegistry.from_items(
             [

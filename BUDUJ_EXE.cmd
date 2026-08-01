@@ -5,19 +5,12 @@ title Mowik - budowanie EXE
 set "PYTHONUTF8=1"
 if not exist "%~dp0.venv\Scripts\python.exe" goto :not_installed
 
-"%~dp0.venv\Scripts\python.exe" -m pip install "PyInstaller==6.21.0"
-if errorlevel 1 goto :fail
-"%~dp0.venv\Scripts\python.exe" -m pip install --prefer-binary -r "%~dp0requirements-gpu.txt"
-if errorlevel 1 goto :fail
-
-"%~dp0.venv\Scripts\python.exe" "%~dp0scripts\generate-icon.py"
-if errorlevel 1 goto :fail
-
-"%~dp0.venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean "%~dp0packaging\Mowik.spec"
+powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\build-release.ps1" -Version "2.7.4" -BuildMode UnsignedLocal -PrepareApplicationOnly -PreparedAppManifestPath "%~dp0dist\Mowik-LOCAL-MANIFEST.txt"
 if errorlevel 1 goto :fail
 
 echo.
 echo Gotowe: %~dp0dist\Mowik\Mowik.exe
+echo Manifest plikow: %~dp0dist\Mowik-LOCAL-MANIFEST.txt
 echo Model nie jest dolaczany do EXE.
 pause
 exit /b 0

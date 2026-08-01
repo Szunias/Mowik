@@ -63,7 +63,7 @@ Centrum Mówika pokazuje na co dzień tylko najważniejsze ustawienia, a opcje t
 - **Czytelny panel ustawień** w zasobniku systemowym: na co dzień pokazuje tylko najważniejsze wybory, a model, GPU/CPU, VAD i szczegóły połączeń są dostępne na żądanie w **ustawieniach zaawansowanych**.
 - **Polski i angielski interfejs** z automatycznym dopasowaniem do języka Windows oraz trwałym przełącznikiem języka.
 - **Łagodne sygnały wbudowane i własne dźwięki WAV** dla startu nagrywania, puszczenia przycisku, gotowego tekstu i błędu, z odsłuchem i opcjonalnym zapętleniem.
-- **Opcjonalny ekranowy wskaźnik dyktowania** z zieloną kropką nagrywania, animacją przetwarzania, znacznikiem sukcesu i symbolem X przy błędzie.
+- **Opcjonalna Kapsuła na żywo** z falą reagującą na głos, osobnymi kolorami dyktowania i komend, animacją przetwarzania oraz krótkim podglądem gotowego tekstu.
 - **Własne komendy w stylu Jarvisa** pod osobnym przyciskiem: wklejanie zapisanych treści, otwieranie programu/pliku/strony albo bezpieczne otwarcie terminala w folderze aktywnego Eksploratora ze szkicem w schowku.
 - **Elastyczne wyjście**: automatyczne wklejanie do aktywnego okna, kopiowanie do schowka albo jedno i drugie.
 - **Prywatny słownik**: nazwiska, marki i fachowe terminy jako podpowiedź dla modelu.
@@ -93,11 +93,15 @@ Instalator wymaga 64-bitowego Windows 10 w wersji 1809 lub nowszej albo Windows 
 Instalator proponuje język zgodny z interfejsem Windows i pozwala go potwierdzić lub zmienić. Aplikacja domyślnie dopasowuje język automatycznie; w Centrum Mówika możesz niezależnie wybrać **Automatycznie**, **Polski** albo **English**, a następnie **Zapisz i uruchom ponownie**.
 
 > [!WARNING]
-> Publiczny instalator Mówika 2.7.3 **nie jest podpisany cyfrowo**. Windows może przez to wyświetlić komunikat **Nieznany wydawca** albo ostrzeżenie Microsoft Defender SmartScreen. Pobieraj instalator wyłącznie z [oficjalnego wydania Mówika na GitHubie](https://github.com/Szunias/Mowik/releases/latest) i przed uruchomieniem porównaj jego SHA-256 z plikiem `SHA256SUMS.txt` z tego samego wydania. W PowerShell użyj `Get-FileHash .\Mowik-2.7.3-Setup-UNSIGNED.exe -Algorithm SHA256` i porównaj całą wartość. Nie wyłączaj zabezpieczeń Windows, żeby zainstalować Mówika.
+> Oficjalny instalator Mówika **nie jest podpisany cyfrowo**. Windows może przez to wyświetlić komunikat **Nieznany wydawca** albo ostrzeżenie Microsoft Defender SmartScreen. Pobieraj instalator wyłącznie z [oficjalnego wydania Mówika na GitHubie](https://github.com/Szunias/Mowik/releases/latest) i przed uruchomieniem porównaj jego SHA-256 z plikiem `SHA256SUMS.txt` z tego samego wydania. W PowerShell użyj `Get-FileHash .\Mowik-2.7.4-Setup-UNSIGNED.exe -Algorithm SHA256` i porównaj całą wartość. Nie wyłączaj zabezpieczeń Windows, żeby zainstalować Mówika.
+
+Oficjalny build wydania otrzymuje także podpisane poświadczenie pochodzenia GitHub/Sigstore. Jeśli masz GitHub CLI, zweryfikuj pobrany instalator poleceniem `gh attestation verify .\Mowik-2.7.4-Setup-UNSIGNED.exe --repo Szunias/Mowik`. Potwierdza ono tożsamość buildu GitHub Actions, mimo że sam plik wykonywalny Windows pozostaje niepodpisany.
 
 ### Aktualizacja istniejącej instalacji
 
 Pobierz nowszy `Mowik-x.y.z-Setup-UNSIGNED.exe` i uruchom go. Instalator rozpozna poprzednią wersję, zamknie ją na czas aktualizacji i podmieni tylko pliki programu. Konfiguracja, słownik, własne dźwięki i pobrane modele zostają na miejscu.
+
+Jeśli starsza konfiguracja wskazywała wycofany model `base` albo `medium`, Mówik bezpiecznie zmieni ten wybór na `auto` (`large-v3-turbo`) i zapisze informację o migracji w logu technicznym.
 
 Jeśli przechodzisz ze starej wersji ZIP 2.2.0 lub wcześniejszej, również użyj nowego instalatora. Istniejące dane z AppData zostaną wykorzystane automatycznie, a instalator usunie stary skrót autostartu. Po sprawdzeniu nowej wersji możesz ręcznie usunąć dawny folder z `.venv`.
 
@@ -148,7 +152,7 @@ Nie można wyłączyć obu opcji naraz. Gdy kopiowanie jest włączone, schowek 
 
 ## Informacje zwrotne i własne dźwięki
 
-Opcjonalny **Wskaźnik dyktowania na ekranie** w sekcji **Dźwięki → Informacje zwrotne** daje natychmiastowe potwierdzenie wizualne bez odbierania fokusu aplikacji, w której piszesz. Zwykłe dyktowanie ma zieloną kropkę, a własne komendy — wyraźnie odmienny fioletowy wskaźnik. Oba tryby mają własną animację przetwarzania i znacznik sukcesu; przy błędzie pojawia się symbol X. Wskaźnik można wyłączyć w ustawieniach Mówika; sygnały dźwiękowe i powiadomienia Windows konfiguruje się niezależnie.
+Opcjonalna **Kapsuła dyktowania na żywo** w sekcji **Dźwięki → Informacje zwrotne** daje natychmiastowe potwierdzenie wizualne bez odbierania fokusu aplikacji, w której piszesz. Podczas nagrywania pokazuje falę sterowaną aktualnym poziomem mikrofonu, następnie animację rozpoznawania, a po prawidłowym dostarczeniu — krótki podgląd gotowego tekstu. Własne komendy mają odmienny fioletowy akcent, a błędy pozostają wyraźnie oznaczone. Podgląd istnieje wyłącznie na ekranie i nie trafia do logu technicznego. Kapsułę można wyłączyć w ustawieniach Mówika; sygnały dźwiękowe i powiadomienia Windows konfiguruje się niezależnie.
 
 W sekcji **Dźwięki** rozwiń **ustawienia zaawansowane**, aby przypisać osobny plik do każdego zdarzenia: naciśnięcie, puszczenie, gotowy tekst, błąd. Obsługiwane są nieskompresowane pliki `.wav` (PCM) do 50 MB. Po zapisaniu plik jest kopiowany do `%APPDATA%\Mowik\sounds`, więc działa nawet po usunięciu oryginału. Pole pokazuje **Wbudowany**, gdy działa krótki ton programu; przycisk **Przywróć** wraca do tego dźwięku.
 
@@ -163,7 +167,7 @@ PostgreSQL
 Mówik
 ```
 
-Słownik jest przekazywany modelowi jako podpowiedź. Pomaga przy nazwiskach, markach i skrótach, ale nie gwarantuje konkretnego zapisu w 100%.
+Słownik jest przekazywany modelowi jako podpowiedź. Pomaga przy nazwiskach, markach i skrótach, ale nie gwarantuje konkretnego zapisu w 100%. **Maksymalna liczba haseł** jest ścisłym limitem odczytu; wartość `0` tymczasowo nie wczytuje żadnych haseł.
 
 ## Komendy głosowe
 
@@ -181,13 +185,15 @@ Polecenia terminala celowo działają jako szkic. Komenda może dopasować wył�
 
 Wklejanie i otwieranie używa dokładnego dopasowania całej frazy. Szkic terminala ma jawny tryb fraza-plus-reszta: fraza musi znaleźć się na początku i kończyć na granicy pełnego słowa, a przy kilku możliwościach wygrywa najdłuższa. Nie ma rozmytego ani częściowego uruchamiania. Jeżeli aktywny Eksplorator pokazuje lokalizację wirtualną, ścieżkę sieciową, nieistniejący folder albo nie można go jednoznacznie rozpoznać, akcja jest blokowana bez zastępczego katalogu.
 
-Mówik zapamiętuje tożsamość okna Eksploratora w chwili naciśnięcia F7, a nie dopiero po transkrypcji. Otwieranie programów i terminala jest też blokowane, gdy Mówik działa jako administrator, aby proces potomny nie odziedziczył po cichu podwyższonych uprawnień. Wielowierszowe akcje wklejania mają ograniczoną długość, dzięki czemu okno potwierdzenia pokazuje całą treść. Frazy oraz treści pozostają lokalnie jako jawny tekst w `%APPDATA%\Mowik\config.json`; nie zapisuj w nich haseł, tokenów ani sekretów.
+Mówik zapamiętuje tożsamość okna Eksploratora w chwili naciśnięcia F7, a nie dopiero po transkrypcji. Wszystkie akcje własnych komend są blokowane, gdy Mówik działa jako administrator, aby automatyczne wprowadzanie tekstu ani proces potomny nie przekraczały granicy podwyższonych uprawnień. Wielowierszowe akcje wklejania mają ograniczoną długość, dzięki czemu okno potwierdzenia pokazuje całą treść. Frazy oraz treści pozostają lokalnie jako jawny tekst w `%APPDATA%\Mowik\config.json`; nie zapisuj w nich haseł, tokenów ani sekretów.
 
-Fioletowy wskaźnik ekranowy odróżnia komendy od zwykłego zielonego dyktowania. Ma własną animację przetwarzania i znacznik sukcesu; można go wyłączyć w **Dźwięki → Informacje zwrotne**.
+Fioletowa Kapsuła na żywo odróżnia komendy od zwykłego turkusowego dyktowania. Ma własną animację przetwarzania i stan sukcesu; można ją wyłączyć w **Dźwięki → Informacje zwrotne**.
+
+Przytrzymaj F7, wypowiedz skonfigurowaną frazę i puść klawisz. Jeśli Mówik nie znajdzie prawidłowego dokładnego dopasowania albo dopasowania prefiksu terminala, nie wykona żadnej akcji i nie wstawi wypowiedzi jako zwykłego dyktowania. Rozpoznawanie komend pomija również zamiany komend głosowych oraz korektę Ollamy, aby fraza wyzwalająca nie została nieoczekiwanie przepisana.
 
 ### Przejrzystość wobec antywirusa i SmartScreen
 
-Mówik nie zaciemnia kodu, nie wyłącza ochrony, nie dodaje wyjątków Defendera, nie ukrywa konsol poleceń i nie pobiera wykonywalnych aktualizacji. Build Windows jest katalogiem aplikacji zamiast samorozpakowującego się pojedynczego EXE, ma manifest `asInvoker`, pozostawia autostart jako świadomy wybór i nie wykonuje szkiców terminala. To ogranicza podejrzane zachowania, ale nie zastępuje podpisu Authenticode ani normalnego budowania reputacji. Publiczny instalator 2.7.3 jest niepodpisany, więc komunikat Nieznany wydawca albo ostrzeżenie SmartScreen może wystąpić nawet wtedy, gdy SHA-256 zgadza się z oficjalnym wydaniem. Jeżeli antywirus zgłosi zweryfikowany oficjalny plik, prześlij dokładnie ten plik jako możliwy fałszywy alarm zamiast osłabiać zabezpieczenia użytkownika.
+Mówik nie zaciemnia kodu, nie wyłącza ochrony, nie dodaje wyjątków Defendera, nie ukrywa konsol poleceń i nie pobiera wykonywalnych aktualizacji. Build Windows jest katalogiem aplikacji zamiast samorozpakowującego się pojedynczego EXE, ma manifest `asInvoker`, pozostawia autostart jako świadomy wybór i nie wykonuje szkiców terminala. To ogranicza podejrzane zachowania, ale nie zastępuje podpisu Authenticode ani normalnego budowania reputacji. Oficjalny instalator jest niepodpisany, więc komunikat Nieznany wydawca albo ostrzeżenie SmartScreen może wystąpić nawet wtedy, gdy SHA-256 zgadza się z oficjalnym wydaniem. Jeżeli antywirus zgłosi zweryfikowany oficjalny plik, prześlij dokładnie ten plik jako możliwy fałszywy alarm zamiast osłabiać zabezpieczenia użytkownika.
 
 Samo rozpoznawanie mowy nadal działa lokalnie, ale akcja otwierająca stronę lub program korzystający z sieci może oczywiście użyć połączenia internetowego tego programu.
 
@@ -212,9 +218,13 @@ Mikrofon pozostaje otwarty podczas działania programu, aby utrzymać krótki bu
 
 ## Dokładność i wydajność
 
-Wartość modelu `auto` wybiera niskoopóźnieniowy `large-v3-turbo` zarówno na GPU, jak i CPU. Pełny `large-v3` pozostaje w profilu **Najdokładniejszy**. Model jest najpierw ładowany wyłącznie z lokalnego cache, więc po jego pobraniu start aplikacji nie zależy od odpowiedzi serwera Hugging Face. Najlepsze wyniki dają: mikrofon blisko ust, ciche otoczenie, język `pl`, własny słownik oraz krótkie, wyraźne wypowiedzi. Żaden system rozpoznawania mowy nie gwarantuje 100% poprawności.
+Wartość modelu `auto` wybiera niskoopóźnieniowy `large-v3-turbo` zarówno na GPU, jak i CPU. Pełny `large-v3` pozostaje w profilu **Najdokładniejszy**. Model jest najpierw ładowany wyłącznie z lokalnego cache, więc po jego pobraniu start aplikacji nie zależy od odpowiedzi serwera Hugging Face. Każdy obsługiwany model jest przypięty do niezmiennej rewizji Hugging Face. Jeśli lokalnego snapshotu nie da się załadować, zwykły start ponawia próbę pobrania dokładnie tej rewizji zamiast akceptować przesuwającą się gałąź upstream.
 
-Instalator zawiera własny runtime CUDA 12.9, cuBLAS i cuDNN, dzięki czemu Mówik nie zależy od bibliotek dołączonych przez inne programy. Zgodna karta NVIDIA jest wybierana automatycznie; przetwarzanie CUDA używa `float16`, a automatyczny fallback CPU — `int8`. Dołączony runtime CUDA obsługuje również karty RTX serii 50. Jeżeli test encodera GPU się nie powiedzie, Mówik zapisuje szczegóły w logu i kontynuuje pracę na CPU. W trybie CPU liczba wątków `0` oznacza automatyczny dobór do liczby rdzeni fizycznych, maksymalnie 16.
+Wersja źródłowa i dawny pakiet ZIP zawierają też `POBIERZ_MODEL_PONOWNIE.cmd`. Przed jego uruchomieniem zamknij Mówika; skrót wywołuje `.venv\Scripts\python.exe mowik.py --download-model --console-log` i wymusza odświeżenie przypiętego snapshotu. Zainstalowana wersja okienkowa nie ma obecnie przycisku **Pobierz model ponownie** w Centrum Mówika.
+
+Najlepsze wyniki dają: mikrofon blisko ust, ciche otoczenie, język `pl`, własny słownik oraz krótkie, wyraźne wypowiedzi. Żaden system rozpoznawania mowy nie gwarantuje 100% poprawności.
+
+Instalator zawiera własny runtime CUDA 12.9 i cuBLAS, dzięki czemu Mówik nie zależy od bibliotek dołączonych przez inne programy. Dołączony CTranslate2 obsługuje konwolucję Whispera bez cuDNN, dlatego ten nieużywany pakiet nie jest dołączany. Zgodna karta NVIDIA jest wybierana automatycznie; przetwarzanie CUDA używa `float16`, a automatyczny fallback CPU — `int8`. Dołączony runtime CUDA obsługuje również karty RTX serii 50. Jeżeli test encodera GPU się nie powiedzie, Mówik zapisuje szczegóły w logu i kontynuuje pracę na CPU. W trybie CPU liczba wątków `0` oznacza automatyczny dobór do liczby rdzeni fizycznych, maksymalnie 16.
 
 ## Diagnostyka i pliki
 
@@ -228,16 +238,17 @@ Instalator zawiera własny runtime CUDA 12.9, cuBLAS i cuDNN, dzięki czemu Mów
 | Dźwięki | `%APPDATA%\Mowik\sounds` |
 | Modele | `%LOCALAPPDATA%\Mowik\models` |
 
-Mówik nie wklei tekstu do aplikacji uruchomionej jako administrator, jeżeli sam nie działa jako administrator. To zabezpieczenie Windows dotyczące symulowania klawiatury między procesami o różnych uprawnieniach.
+Wymuszone uruchamianie Mówika przez **Uruchom jako administrator** jest niewspierane; aplikację należy uruchamiać normalnie, bez podwyższonych uprawnień. Mówik nie wklei tekstu do aplikacji uruchomionej jako administrator, ponieważ Windows blokuje symulowanie klawiatury z procesu o niższych uprawnieniach.
 
 ## Naprawa, autostart i budowanie
 
 - Ponowne uruchomienie tego samego instalatora naprawia pliki programu bez usuwania danych użytkownika.
 - Autostart jest domyślnie odznaczony i wymaga świadomego zaznaczenia w kreatorze; ponowne uruchomienie instalatora pozwala zmienić tę opcję.
 - Język interfejsu może automatycznie podążać za językiem Windows albo zostać ustawiony na polski lub angielski w Centrum Mówika.
-- `BUDUJ_EXE.cmd` buduje katalog aplikacji `dist\Mowik`.
-- `BUDUJ_INSTALATOR.cmd` uruchamia testy, buduje aplikację i tworzy jednoznacznie lokalny `release\Mowik-x.y.z-Setup-UNSIGNED.exe` wraz z sumą SHA-256. Doraźnego lokalnego buildu nie należy wgrywać jako oficjalnego wydania. Oficjalne artefakty powstają przez workflow wydania na GitHubie razem z `SHA256SUMS.txt`; publiczny instalator 2.7.3 również jest niepodpisany i może wywołać ostrzeżenia Windows.
-- Definicje powtarzalnego wydania znajdują się w `packaging`, a workflow GitHub Actions w `.github/workflows/windows-release.yml`.
+- `BUDUJ_EXE.cmd` buduje katalog aplikacji `dist\Mowik`. Korzysta z osobnego, odtwarzanego środowiska build i sprawdza jego dokładny zestaw pakietów oraz sumy plików.
+- `BUDUJ_INSTALATOR.cmd` uruchamia testy, buduje aplikację w takim samym czystym środowisku i tworzy jednoznacznie lokalny `release\Mowik-x.y.z-Setup-LOCAL-UNSIGNED.exe` wraz z sumą SHA-256. Doraźnego lokalnego buildu nie należy wgrywać jako oficjalnego wydania. Oficjalne artefakty powstają przez workflow wydania na GitHubie razem z `BUILD-INFO.txt` i `SHA256SUMS.txt`; oficjalny instalator również jest niepodpisany i może wywołać ostrzeżenia Windows.
+- Definicje powtarzalnego wydania znajdują się w `packaging`; `constraints-release.txt` opisuje pełny zestaw zależności, a blokady `*-hashed.txt` ograniczają instalację do paczek Windows zweryfikowanych sumami SHA-256. Workflow GitHub Actions znajduje się w `.github/workflows/windows-release.yml`.
+- Automatyczne QA instalatora wykonuje świeżą instalację po angielsku i polsku, naprawę tą samą wersją, start spakowanego panelu ustawień oraz deinstalację na bieżącym obrazie GitHub `windows-latest`. Deklarowane minimum Windows 10 1809 i aktualizacja ze starszych publicznych wersji nadal wymagają przed wydaniem ręcznego testu na maszynie wirtualnej; hosted CI nie udostępnia tego starego systemu ani fizycznego mikrofonu i modelu.
 
 ## Licencja
 
