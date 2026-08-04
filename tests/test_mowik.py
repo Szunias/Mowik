@@ -508,7 +508,28 @@ class QuickProfileTests(unittest.TestCase):
         )
 
 
-class FeedbackConfigTests(unittest.TestCase):
+class NonElevatedProcessMixin:
+    """Przypnij token procesu, zamiast dziedziczyć uprawnienia środowiska.
+
+    Mówik świadomie odmawia zapisu ustawień i startu, gdy działa jako
+    administrator. Runnery Windows w GitHub Actions są elewowane, więc bez
+    tego testy ścieżki zwykłego użytkownika przewracały się tam, przechodząc
+    jednocześnie na nieelewowanej maszynie dewelopera. Testy, które celowo
+    sprawdzają odmowę, nadal nadpisują tę wartość własnym ``mock.patch``.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.object(
+            mowik.windows_actions,
+            "is_process_elevated",
+            return_value=False,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class FeedbackConfigTests(NonElevatedProcessMixin, unittest.TestCase):
     def test_deep_merge_does_not_alias_factory_defaults_or_loaded_values(self) -> None:
         defaults = copy.deepcopy(mowik.DEFAULT_CONFIG)
         loaded = {
@@ -3368,7 +3389,7 @@ class CustomCommandFlowTests(unittest.TestCase):
 
 
 
-class SettingsLifecycleTests(unittest.TestCase):
+class SettingsLifecycleTests(NonElevatedProcessMixin, unittest.TestCase):
     def settings_args(self):
         return mowik.argparse.Namespace(
             create_config=False,
