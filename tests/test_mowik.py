@@ -1203,6 +1203,12 @@ class FeedbackConfigTests(unittest.TestCase):
                 self.assertIsNone(
                     mowik.runtime_sound_path(r"\\server\share\start.wav")
                 )
+                for rejected in (
+                    r"\\?\C:\Windows\start.wav",
+                    r"//?/C:/Windows/start.wav",
+                    r"\??\C:\Windows\start.wav",
+                ):
+                    self.assertIsNone(mowik.runtime_sound_path(rejected))
                 with mock.patch.object(
                     mowik,
                     "_path_is_reparse_point",
@@ -3710,6 +3716,37 @@ class SettingsLifecycleTests(unittest.TestCase):
         self.assertIn("already open", english)
         self.assertIn("settings", english_title.lower())
 
+    def test_single_instance_mutex_uses_the_error_resetting_helper(self) -> None:
+        # CreateMutexW nie zeruje kodu błędu przy sukcesie, więc zalegające
+        # ERROR_ALREADY_EXISTS z innego wywołania Win32 nie może zablokować
+        # startu pierwszej instancji.
+        with mock.patch.object(mowik.os, "name", "nt"), mock.patch.object(
+            mowik,
+            "_create_windows_named_mutex",
+            return_value=(4242, False),
+        ) as create_mutex, mock.patch.object(
+            mowik, "release_single_instance"
+        ) as release:
+            handle = mowik.acquire_single_instance(mowik.Translator("en"))
+
+        self.assertEqual(handle, 4242)
+        create_mutex.assert_called_once_with(mowik.MUTEX_NAME)
+        release.assert_not_called()
+
+        with mock.patch.object(mowik.os, "name", "nt"), mock.patch.object(
+            mowik,
+            "_create_windows_named_mutex",
+            return_value=(4242, True),
+        ), mock.patch.object(mowik, "release_single_instance") as release:
+            self.assertIsNone(
+                mowik.acquire_single_instance(
+                    mowik.Translator("en"),
+                    notify_existing=False,
+                )
+            )
+
+        release.assert_called_once_with(4242)
+
     def test_settings_main_sets_dpi_and_always_releases_mutex(self) -> None:
         events: list[str] = []
 
@@ -4765,6 +4802,66 @@ class RecorderTests(unittest.TestCase):
             np.full(4_800, 2.0, dtype=np.float32),
         )
         self.assertEqual(recorder.last_recording_samples, 0)
+
+
+class SettingsMouseWheelTests(unittest.TestCase):
+    """Przewijanie strony nie może po cichu zmieniać zapisywanych ustawień."""
+
+    def _build_settings_window(self):
+        try:
+            import tkinter as tk
+        except ImportError:  # pragma: no cover - Tk brakuje tylko w kiosku
+            self.skipTest("Tkinter is unavailable")
+
+        captured: dict[str, object] = {}
+
+        def capture_mainloop(root) -> None:
+            root.withdraw()
+            captured["root"] = root
+
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        with mock.patch.object(tk.Tk, "mainloop", capture_mainloop), mock.patch.object(
+            mowik,
+            "load_config_with_revision",
+            return_value=(config, "revision"),
+        ), mock.patch.object(mowik, "enable_windows_dpi_awareness"):
+            try:
+                mowik.run_settings_window()
+            except tk.TclError as exc:  # pragma: no cover - brak sesji graficznej
+                self.skipTest(f"Tk cannot create windows here: {exc}")
+
+        root = captured.get("root")
+        if root is None:  # pragma: no cover - mainloop zawsze jest wywoływany
+            self.fail("The settings window never reached its main loop")
+        self.addCleanup(root.destroy)
+        return root
+
+    def test_wheel_over_spinboxes_and_combos_never_changes_their_value(self) -> None:
+        from tkinter import ttk
+
+        root = self._build_settings_window()
+        targets: list[object] = []
+
+        def collect(widget) -> None:
+            for child in widget.winfo_children():
+                if isinstance(child, (ttk.Spinbox, ttk.Combobox)):
+                    targets.append(child)
+                collect(child)
+
+        collect(root)
+        self.assertGreaterEqual(len(targets), 10)
+
+        checked = 0
+        for widget in targets:
+            if str(widget.cget("state")) == "disabled":
+                continue
+            before = widget.get()
+            for delta in (-120, 120):
+                widget.event_generate("<MouseWheel>", delta=delta, x=5, y=5)
+            root.update()
+            self.assertEqual(widget.get(), before)
+            checked += 1
+        self.assertGreaterEqual(checked, 10)
 
 
 if __name__ == "__main__":

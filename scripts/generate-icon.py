@@ -19,9 +19,13 @@ def rounded_gradient(size: int) -> Image.Image:
     for y in range(size):
         for x in range(size):
             ratio = (x + y) / (2 * (size - 1))
-            pixels[x, y] = tuple(
-                round(a + (b - a) * ratio) for a, b in zip(start, end)
-            ) + (255,)
+            pixels[x, y] = (
+                *(
+                    round(a + (b - a) * ratio)
+                    for a, b in zip(start, end, strict=True)
+                ),
+                255,
+            )
     mask = Image.new("L", (size, size), 0)
     ImageDraw.Draw(mask).rounded_rectangle((56, 56, 968, 968), radius=248, fill=255)
     image.paste(gradient, (0, 0), mask)

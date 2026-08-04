@@ -96,9 +96,9 @@ The installer requires 64-bit Windows 10 version 1809 or later, or Windows 11. I
 On first launch, Mówik downloads the selected local speech model to `%LOCALAPPDATA%\Mowik\models`. Transcription works offline after that download is complete.
 
 > [!WARNING]
-> The official Mówik installer is **not digitally signed**. Windows may therefore show **Unknown publisher** or a Microsoft Defender SmartScreen warning. Download the installer only from the [official Mówik GitHub release](https://github.com/Szunias/Mowik/releases/latest) and verify its SHA-256 hash against `SHA256SUMS.txt` from the same release before running it. In PowerShell, use `Get-FileHash .\Mowik-2.7.4-Setup-UNSIGNED.exe -Algorithm SHA256` and compare the complete value. Do not disable Windows security protections to install Mówik.
+> The official Mówik installer is **not digitally signed**. Windows may therefore show **Unknown publisher** or a Microsoft Defender SmartScreen warning. Download the installer only from the [official Mówik GitHub release](https://github.com/Szunias/Mowik/releases/latest) and verify its SHA-256 hash against `SHA256SUMS.txt` from the same release before running it. In PowerShell, use `Get-FileHash .\Mowik-2.7.5-Setup-UNSIGNED.exe -Algorithm SHA256` and compare the complete value. Do not disable Windows security protections to install Mówik.
 
-Official release builds also receive a signed GitHub/Sigstore provenance attestation. With GitHub CLI installed, verify the downloaded installer using `gh attestation verify .\Mowik-2.7.4-Setup-UNSIGNED.exe --repo Szunias/Mowik`. This authenticates the GitHub Actions build identity even though the Windows executable itself remains unsigned.
+Official release builds also receive a signed GitHub/Sigstore provenance attestation. With GitHub CLI installed, verify the downloaded installer using `gh attestation verify .\Mowik-2.7.5-Setup-UNSIGNED.exe --repo Szunias/Mowik`. This authenticates the GitHub Actions build identity even though the Windows executable itself remains unsigned.
 
 ### Updating an existing installation
 

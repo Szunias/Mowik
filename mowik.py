@@ -45,7 +45,7 @@ from typing import Any, Callable, Optional
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.7.4"
+APP_VERSION = "2.7.5"
 
 
 def _run_early_read_only_probe(
@@ -1856,13 +1856,15 @@ def load_model_local_first(
             allow_patterns=MODEL_ALLOW_PATTERNS,
         )
         if not snapshot_complete(model_path):
+            # Chybienie w cache zostało już zalogowane wyżej i nie jest
+            # przyczyną niekompletnego świeżego pobrania.
             raise AppError(
                 translator.t(
                     "Model {model_name} jest niekompletny.",
                     "Model {model_name} is incomplete.",
                     model_name=model_name,
                 )
-            )
+            ) from None
     return WhisperModel(model_path, **local_kwargs)
 
 
@@ -2414,9 +2416,7 @@ def llm_result_is_safe(original: str, corrected: str) -> bool:
         match.group(0).casefold().replace("’", "'")
         for match in re.finditer(negation_pattern, corrected, flags=re.IGNORECASE)
     )
-    if original_negations != corrected_negations:
-        return False
-    return True
+    return original_negations == corrected_negations
 
 
 class _RejectOllamaRedirects(urllib.request.HTTPRedirectHandler):
@@ -2472,7 +2472,7 @@ def normalize_ollama_base_url(
         or parsed.query
         or parsed.fragment
         or parsed.path not in {"", "/"}
-        or port is None and parsed.netloc.endswith(":")
+        or (port is None and parsed.netloc.endswith(":"))
     ):
         raise AppError(
             translator.t(
@@ -2706,7 +2706,9 @@ def runtime_sound_path(value: Any) -> Optional[Path]:
     if not raw:
         return None
     normalized = raw.replace("/", "\\")
-    if normalized.startswith("\\\\") or normalized.startswith("\\?\\"):
+    # ``\\`` obejmuje UNC oraz prefiksy ``\\?\`` i ``\\.\``; ``\??\`` to
+    # nazwa z menedżera obiektów NT i zaczyna się od pojedynczego ukośnika.
+    if normalized.startswith(("\\\\", "\\??\\")):
         return None
     configured = Path(raw).expanduser()
     candidate = configured if configured.is_absolute() else APPDATA_DIR / configured
@@ -3453,9 +3455,7 @@ def trigger_display_name(
     }
     if name in key_labels:
         label = key_labels[name]
-    elif len(name) == 1:
-        label = name.upper()
-    elif re.fullmatch(r"f\d{1,2}", name):
+    elif len(name) == 1 or re.fullmatch(r"f\d{1,2}", name):
         label = name.upper()
     elif name.startswith("vk") and name[2:].isdigit():
         label = translator.t(
@@ -5563,9 +5563,7 @@ def run_settings_window() -> int:
         }
         if name in key_labels:
             label = key_labels[name]
-        elif len(name) == 1:
-            label = name.upper()
-        elif re.fullmatch(r"f\d{1,2}", name):
+        elif len(name) == 1 or re.fullmatch(r"f\d{1,2}", name):
             label = name.upper()
         elif name.startswith("vk") and name[2:].isdigit():
             label = t(
@@ -6145,12 +6143,33 @@ def run_settings_window() -> int:
     root.bind_all("<FocusIn>", handle_focus_in, add="+")
 
     def scroll_active_page(event) -> None:
-        if event.delta:
-            page_canvases[active_page_key["value"]].yview_scroll(
-                int(-event.delta / 120), "units"
-            )
+        if not event.delta:
+            return
+        try:
+            # Modalne okna (edytor komend, wykrywanie skrótu) mają własne
+            # przewijanie; tło nie może się pod nimi przesuwać.
+            if event.widget.winfo_toplevel() is not root:
+                return
+        except (AttributeError, tk.TclError):
+            return
+        page_canvases[active_page_key["value"]].yview_scroll(
+            int(-event.delta / 120), "units"
+        )
+
+    def scroll_page_without_changing_value(event) -> str:
+        # Tk domyślnie zmienia wartość Spinboxa i Combobox kółkiem myszy.
+        # W panelu ustawień zwykłe przewinięcie strony po najechaniu na takie
+        # pole po cichu podmieniłoby model, mikrofon albo skrót dyktowania.
+        scroll_active_page(event)
+        return "break"
 
     root.bind_all("<MouseWheel>", scroll_active_page)
+    for wheel_sensitive_class in ("TSpinbox", "TCombobox"):
+        root.bind_class(
+            wheel_sensitive_class,
+            "<MouseWheel>",
+            scroll_page_without_changing_value,
+        )
 
     def show_page(page_key: str) -> None:
         title, subtitle = page_meta[page_key]
@@ -11135,8 +11154,11 @@ class MowikApp:
             return
 
     def _cancel_capture_timer(self) -> None:
-        timer = self._capture_timer
-        self._capture_timer = None
+        # ``_capture_timer`` jest przypisywany pod ``_input_lock``; odczyt bez
+        # tego zamka mógł zgubić świeżo utworzony timer przy zamykaniu.
+        with self._input_lock:
+            timer = self._capture_timer
+            self._capture_timer = None
         if timer is not None and timer is not threading.current_thread():
             timer.cancel()
 
@@ -12435,34 +12457,26 @@ def acquire_single_instance(
     if os.name != "nt":
         return None
     translator = translator or Translator("pl")
-    # use_last_error zachowuje kod błędu od razu po wywołaniu CreateMutexW;
-    # zwykłe GetLastError może zostać nadpisane przez inne wywołania Win32.
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_bool
-
-    handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    if not handle:
-        raise ctypes.WinError(ctypes.get_last_error())
-    ERROR_ALREADY_EXISTS = 183
-    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-        if notify_existing:
-            ctypes.windll.user32.MessageBoxW(
-                None,
-                translator.t(
-                    "Mówik jest już uruchomiony. "
-                    "Poszukaj ikony mikrofonu przy zegarze.",
-                    "Mówik is already running. "
-                    "Look for the microphone icon in the system tray.",
-                ),
-                APP_DISPLAY_NAME,
-                0x40,
-            )
-        kernel32.CloseHandle(handle)
-        return None
-    return int(handle)
+    # ``_create_windows_named_mutex`` zeruje kod błędu przed CreateMutexW.
+    # Bez tego zalegający ERROR_ALREADY_EXISTS z wcześniejszego wywołania
+    # Win32 w tym wątku mógłby zablokować start pierwszej instancji.
+    handle, already_exists = _create_windows_named_mutex(MUTEX_NAME)
+    if not already_exists:
+        return handle
+    if notify_existing:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            translator.t(
+                "Mówik jest już uruchomiony. "
+                "Poszukaj ikony mikrofonu przy zegarze.",
+                "Mówik is already running. "
+                "Look for the microphone icon in the system tray.",
+            ),
+            APP_DISPLAY_NAME,
+            0x40,
+        )
+    release_single_instance(handle)
+    return None
 
 
 def release_single_instance(handle: Optional[int]) -> None:
@@ -12586,6 +12600,9 @@ def runtime_gui_smoke_test_command() -> int:
     """Fail fast when a source or frozen build cannot create a Tk GUI."""
 
     root: Any = None
+    # ``return`` wewnątrz ``finally`` porzuca trwający wyjątek i od Pythona
+    # 3.14 jest ostrzeżeniem składniowym, więc wynik zbieramy w zmiennej.
+    status = 0
     try:
         import tkinter
 
@@ -12594,15 +12611,15 @@ def runtime_gui_smoke_test_command() -> int:
         root.update_idletasks()
     except Exception as exc:
         print(f"Tk GUI smoke test failed: {exc}", file=sys.stderr)
-        return 1
+        status = 1
     finally:
         if root is not None:
             try:
                 root.destroy()
             except Exception as exc:
                 print(f"Tk GUI cleanup failed: {exc}", file=sys.stderr)
-                return 1
-    return 0
+                status = 1
+    return status
 
 
 def parse_args(translator: Optional[Translator] = None) -> argparse.Namespace:

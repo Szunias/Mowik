@@ -596,9 +596,11 @@ def _resolve_shell(shell: str) -> tuple[Optional[str], Optional[str]]:
     return (normalized, _find_executable(executable)) if executable else (None, None)
 
 
-def _shell_arguments(kind: str, executable: str, *, embedded: bool) -> list[str]:
+def _shell_arguments(kind: str, executable: str) -> list[str]:
+    """Argumenty powłoki osadzonej w Windows Terminalu (bez -NoExit)."""
+
     if kind == "cmd":
-        return [executable, "/d", "/q"] if embedded else [executable, "/d", "/q"]
+        return [executable, "/d", "/q"]
     return [executable, "-NoLogo", "-NoProfile"]
 
 
@@ -716,7 +718,7 @@ def launch_terminal(
             str(launch_directory),
         ]
         if shell_kind != "default" and launch_shell:
-            arguments.extend(_shell_arguments(shell_kind or "", launch_shell, embedded=True))
+            arguments.extend(_shell_arguments(shell_kind or "", launch_shell))
         try:
             process = subprocess.Popen(
                 arguments,
@@ -907,17 +909,17 @@ def deliver_terminal_draft(
 __all__ = [
     "DraftDeliveryResult",
     "ForegroundContext",
-    "TerminalHandle",
     "TerminalCleanupResult",
+    "TerminalHandle",
     "TerminalLaunchResult",
     "WorkingDirectoryResult",
     "capture_foreground_context",
     "capture_foreground_identity",
     "deliver_terminal_draft",
-    "launch_terminal",
-    "terminate_terminal",
-    "is_process_elevated",
     "is_local_filesystem_path",
+    "is_process_elevated",
+    "launch_terminal",
     "resolve_explorer_context",
     "resolve_working_directory",
+    "terminate_terminal",
 ]

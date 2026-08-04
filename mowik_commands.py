@@ -544,7 +544,7 @@ def _parse_terminal_options(raw_options: Any) -> TerminalOptions:
     return TerminalOptions(cwd_source, fixed_cwd, host, shell, draft_delivery)
 
 
-def _parse_definition(raw: Any, index: int) -> CommandDefinition:
+def _parse_definition(raw: Any) -> CommandDefinition:
     if not isinstance(raw, Mapping):
         raise CommandValidationError("definition_not_object")
 
@@ -729,7 +729,7 @@ class CommandRegistry:
             issues.append(ValidationIssue(None, "too_many_commands", "items"))
         for index, raw in enumerate(items[:MAX_COMMANDS]):
             try:
-                definitions.append(_parse_definition(raw, index))
+                definitions.append(_parse_definition(raw))
             except CommandValidationError as exc:
                 code = str(exc) or "definition_invalid"
                 issues.append(ValidationIssue(index, code, _field_for_error(code)))
@@ -901,23 +901,29 @@ def build_action_plan(
         if options.cwd_source == "active_explorer":
             working_directory = _safe_explorer_path(context.explorer_path)
             if working_directory is None:
+                # An earlier denial (for example the elevated-process check)
+                # already explains the refusal.  Keep its reason so the user is
+                # told what actually has to change.
+                if allowed:
+                    denial_reason = "explorer_path_unavailable"
                 allowed = False
-                denial_reason = "explorer_path_unavailable"
         elif options.cwd_source == "fixed":
             working_directory = options.fixed_cwd
         elif options.cwd_source == "home":
             # Home-directory resolution belongs to the OS executor.
             working_directory = None
         else:
+            if allowed:
+                denial_reason = "terminal_cwd_source_unknown"
             allowed = False
-            denial_reason = "terminal_cwd_source_unknown"
         raw_draft = match.spoken_tail if match.spoken_tail else definition.value
         try:
             payload = sanitize_terminal_draft(raw_draft)
         except CommandValidationError:
             payload = ""
+            if allowed:
+                denial_reason = "unsafe_terminal_draft"
             allowed = False
-            denial_reason = "unsafe_terminal_draft"
         operation = OPERATION_DRAFT if payload else OPERATION_OPEN
 
     if not allowed:
@@ -970,17 +976,17 @@ __all__ = [
     "ACTION_REGISTRY",
     "BLOCKED_OPEN_SUFFIXES",
     "CUSTOM_COMMANDS_SCHEMA_VERSION",
+    "DEFAULT_SAFETY_POLICY",
+    "MATCH_EXACT",
+    "MATCH_PREFIX_TAIL",
+    "MAX_OPEN_TARGET_LENGTH",
     "ActionOutcome",
     "ActionPlan",
     "ActionSpec",
     "CommandDefinition",
     "CommandRegistry",
     "CommandValidationError",
-    "DEFAULT_SAFETY_POLICY",
     "ExecutionContext",
-    "MATCH_EXACT",
-    "MATCH_PREFIX_TAIL",
-    "MAX_OPEN_TARGET_LENGTH",
     "MatchResult",
     "SafetyDecision",
     "SafetyPolicy",

@@ -471,6 +471,26 @@ class TerminalPlanTests(unittest.TestCase):
                 self.assertEqual(plan.payload, "")
                 self.assertIsNone(plan.working_directory)
 
+    def test_elevated_denial_reason_survives_a_later_terminal_check(self) -> None:
+        # Bez kontekstu Eksploratora obie kontrole odmawiają. Użytkownik musi
+        # zobaczyć powód, który faktycznie da się naprawić.
+        elevated = ExecutionContext(123, 456, None, 42.5, True)
+        match = CommandRegistry.from_items(
+            [{
+                "phrase": "terminal",
+                "action": "open_terminal",
+                "options": {"cwd_source": "active_explorer"},
+            }]
+        ).match("terminal")
+        assert match is not None
+
+        plan = build_action_plan(match, elevated)
+
+        self.assertFalse(plan.allowed)
+        self.assertEqual(plan.denial_reason, "elevated_process_denied")
+        self.assertEqual(plan.operation, "deny")
+        self.assertIsNone(plan.working_directory)
+
     def test_spoken_terminal_tail_is_only_a_draft_and_is_never_submitted(self) -> None:
         registry = CommandRegistry.from_items(
             [

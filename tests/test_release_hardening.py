@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,6 +12,16 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def current_app_version() -> str:
+    """Read APP_VERSION without importing Mówik's heavy runtime dependencies."""
+
+    source = (ROOT / "mowik.py").read_text(encoding="utf-8")
+    match = re.search(r'^APP_VERSION = "([^"\r\n]+)"$', source, flags=re.MULTILINE)
+    if match is None:
+        raise RuntimeError("mowik.py does not declare a single APP_VERSION")
+    return match.group(1)
 
 
 def load_manifest_validator():
@@ -1170,7 +1181,10 @@ class ReleasePowerShellBehaviorTests(unittest.TestCase):
             "README.md",
             "README.pl.md",
         )
-        command = "& $env:MOWIK_TEST_VERSION_SCRIPT -Version 2.7.4"
+        # Wersję czytamy z mowik.py, żeby ten test nie wymagał ręcznej edycji
+        # przy każdym wydaniu i nie zaczął cicho sprawdzać starego numeru.
+        version = current_app_version()
+        command = f"& $env:MOWIK_TEST_VERSION_SCRIPT -Version {version}"
         for scenario in ("stale-comment", "duplicate", "stale-readme"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
                 project = Path(temp)
@@ -1193,14 +1207,14 @@ class ReleasePowerShellBehaviorTests(unittest.TestCase):
                 content = source_file.read_text(encoding="utf-8")
                 if scenario == "stale-comment":
                     content = content.replace(
-                        'APP_VERSION = "2.7.4"',
-                        'APP_VERSION = "9.9.9"\n# APP_VERSION = "2.7.4"',
+                        f'APP_VERSION = "{version}"',
+                        f'APP_VERSION = "9.9.9"\n# APP_VERSION = "{version}"',
                         1,
                     )
                 elif scenario == "duplicate":
-                    content += '\nAPP_VERSION = "2.7.4"\n'
+                    content += f'\nAPP_VERSION = "{version}"\n'
                 else:
-                    content = content.replace("2.7.4", "9.9.9", 1)
+                    content = content.replace(version, "9.9.9", 1)
                 source_file.write_text(content, encoding="utf-8")
                 self.run_powershell(
                     command, environment=environment, expect_success=False

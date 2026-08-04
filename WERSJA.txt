@@ -1,3 +1,3 @@
-Mowik 2.7.4
-Bezpieczne własne komendy pod osobnym skrótem F7: wklejanie tekstu, otwieranie zaufanych plików lub stron oraz terminal z niewykonywanym automatycznie szkicem polecenia.
-Publiczny instalator 2.7.4 jest niepodpisany; pobieraj go wyłącznie z oficjalnego wydania GitHub i sprawdź SHA-256 z plikiem SHA256SUMS.txt.
+Mowik 2.7.5
+Poprawki stabilności: kółko myszy w panelu ustawień nie zmienia już po cichu modelu, mikrofonu ani skrótu; zablokowana komenda podaje właściwy powód, gdy Mówik działa jako administrator; usunięte ryzyko fałszywego wykrycia drugiej instancji przy starcie.
+Publiczny instalator 2.7.5 jest niepodpisany; pobieraj go wyłącznie z oficjalnego wydania GitHub i sprawdź SHA-256 z plikiem SHA256SUMS.txt.

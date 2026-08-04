@@ -332,18 +332,14 @@ class TerminalLaunchTests(unittest.TestCase):
             ),
             "pwsh": r"C:\Program Files\PowerShell\7\pwsh.exe",
         }
+        builders = {
+            "embedded": windows_actions._shell_arguments,
+            "classic": windows_actions._classic_arguments,
+        }
         for kind, executable in executables.items():
-            for embedded in (False, True):
-                with self.subTest(kind=kind, embedded=embedded):
-                    arguments = (
-                        windows_actions._shell_arguments(
-                            kind,
-                            executable,
-                            embedded=embedded,
-                        )
-                        if embedded
-                        else windows_actions._classic_arguments(kind, executable)
-                    )
+            for variant, build_arguments in builders.items():
+                with self.subTest(kind=kind, variant=variant):
+                    arguments = build_arguments(kind, executable)
                     self.assertEqual(arguments[0], executable)
                     normalized = " ".join(arguments[1:]).casefold()
                     for forbidden in (

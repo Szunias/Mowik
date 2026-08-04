@@ -93,9 +93,9 @@ Instalator wymaga 64-bitowego Windows 10 w wersji 1809 lub nowszej albo Windows 
 Instalator proponuje język zgodny z interfejsem Windows i pozwala go potwierdzić lub zmienić. Aplikacja domyślnie dopasowuje język automatycznie; w Centrum Mówika możesz niezależnie wybrać **Automatycznie**, **Polski** albo **English**, a następnie **Zapisz i uruchom ponownie**.
 
 > [!WARNING]
-> Oficjalny instalator Mówika **nie jest podpisany cyfrowo**. Windows może przez to wyświetlić komunikat **Nieznany wydawca** albo ostrzeżenie Microsoft Defender SmartScreen. Pobieraj instalator wyłącznie z [oficjalnego wydania Mówika na GitHubie](https://github.com/Szunias/Mowik/releases/latest) i przed uruchomieniem porównaj jego SHA-256 z plikiem `SHA256SUMS.txt` z tego samego wydania. W PowerShell użyj `Get-FileHash .\Mowik-2.7.4-Setup-UNSIGNED.exe -Algorithm SHA256` i porównaj całą wartość. Nie wyłączaj zabezpieczeń Windows, żeby zainstalować Mówika.
+> Oficjalny instalator Mówika **nie jest podpisany cyfrowo**. Windows może przez to wyświetlić komunikat **Nieznany wydawca** albo ostrzeżenie Microsoft Defender SmartScreen. Pobieraj instalator wyłącznie z [oficjalnego wydania Mówika na GitHubie](https://github.com/Szunias/Mowik/releases/latest) i przed uruchomieniem porównaj jego SHA-256 z plikiem `SHA256SUMS.txt` z tego samego wydania. W PowerShell użyj `Get-FileHash .\Mowik-2.7.5-Setup-UNSIGNED.exe -Algorithm SHA256` i porównaj całą wartość. Nie wyłączaj zabezpieczeń Windows, żeby zainstalować Mówika.
 
-Oficjalny build wydania otrzymuje także podpisane poświadczenie pochodzenia GitHub/Sigstore. Jeśli masz GitHub CLI, zweryfikuj pobrany instalator poleceniem `gh attestation verify .\Mowik-2.7.4-Setup-UNSIGNED.exe --repo Szunias/Mowik`. Potwierdza ono tożsamość buildu GitHub Actions, mimo że sam plik wykonywalny Windows pozostaje niepodpisany.
+Oficjalny build wydania otrzymuje także podpisane poświadczenie pochodzenia GitHub/Sigstore. Jeśli masz GitHub CLI, zweryfikuj pobrany instalator poleceniem `gh attestation verify .\Mowik-2.7.5-Setup-UNSIGNED.exe --repo Szunias/Mowik`. Potwierdza ono tożsamość buildu GitHub Actions, mimo że sam plik wykonywalny Windows pozostaje niepodpisany.
 
 ### Aktualizacja istniejącej instalacji
 
