@@ -175,6 +175,7 @@ _reject_elevated_runtime_before_native_imports()
 
 import mowik_commands as command_engine
 import mowik_audio_devices as audio_devices
+import mowik_cuda as cuda_runtime
 from mowik_i18n import Translator
 import mowik_windows_actions as windows_actions
 
@@ -237,6 +238,11 @@ def configure_cuda_dll_search_paths() -> tuple[Path, ...]:
             Path(sys.prefix) / "Lib" / "site-packages" / "nvidia",
         )
     )
+    # Instalator nie zawiera bibliotek CUDA; wydania pobierają je na żądanie
+    # do profilu użytkownika.
+    downloaded_root = cuda_runtime.user_runtime_root()
+    if downloaded_root is not None:
+        roots.append(downloaded_root)
 
     # Wybieramy dokładnie jednego dostawcę cuBLAS. AddDllDirectory nie
     # gwarantuje kolejności między wieloma katalogami, a zmieszanie wersji
@@ -1983,15 +1989,32 @@ def windows_cuda_runtime_present() -> bool:
     return True
 
 
-def get_cuda_count() -> int:
+def get_cuda_device_count() -> int:
+    """Policz karty widziane przez sterownik, nie zaglądając do cuBLAS."""
+
     try:
-        count = int(ctranslate2.get_cuda_device_count())
+        return int(ctranslate2.get_cuda_device_count())
     except Exception:
         logging.exception("Nie udało się sprawdzić urządzeń CUDA")
         return 0
+
+
+def get_cuda_count() -> int:
+    count = get_cuda_device_count()
     if count > 0 and not windows_cuda_runtime_present():
         return 0
     return count
+
+
+def cuda_is_usable() -> bool:
+    """Sama karta wystarczy: brakujące biblioteki Mówik dociąga przed startem."""
+
+    if get_cuda_count() > 0:
+        return True
+    return (
+        get_cuda_device_count() > 0
+        and cuda_runtime.user_runtime_root() is not None
+    )
 
 
 def resolve_model_plan(
@@ -2001,7 +2024,7 @@ def resolve_model_plan(
     translator = translator or Translator("pl")
     requested_device = str(config.get("device", "auto")).lower().strip()
     requested_model = str(config.get("model", "auto")).strip()
-    cuda_available = get_cuda_count() > 0
+    cuda_available = cuda_is_usable()
 
     if requested_device == "auto":
         device = "cuda" if cuda_available else "cpu"
@@ -2250,6 +2273,79 @@ def load_model_local_first(
     return WhisperModel(model_path, **local_kwargs)
 
 
+def ensure_cuda_runtime_available(
+    status_callback=None,
+    translator: Optional[Translator] = None,
+) -> bool:
+    """Dociągnij biblioteki CUDA, których instalator świadomie nie zawiera."""
+
+    global CUDA_DLL_SEARCH_PATHS
+
+    if os.name != "nt":
+        return False
+    if CUDA_DLL_SEARCH_PATHS:
+        return True
+
+    translator = translator or Translator("pl")
+    root = cuda_runtime.user_runtime_root()
+    if root is None:
+        logging.warning("Brak profilu użytkownika na biblioteki GPU")
+        return False
+
+    if not cuda_runtime.is_runtime_complete(root):
+        if status_callback:
+            status_callback(
+                translator.t(
+                    "Przygotowuję biblioteki GPU…",
+                    "Preparing GPU libraries…",
+                )
+            )
+        state: dict[str, Any] = {"project": None, "percent": -1, "index": 0}
+
+        def report(package, done: int, total: Optional[int]) -> None:
+            if status_callback is None or not total:
+                return
+            if state["project"] != package.project:
+                state["project"] = package.project
+                state["percent"] = -1
+                state["index"] += 1
+            percent = min(100, max(0, int(done * 100 / total)))
+            if percent == state["percent"]:
+                return
+            state["percent"] = percent
+            status_callback(
+                translator.t(
+                    "Pobieram biblioteki GPU ({index} z {count}): {percent}%"
+                    " ({done} z {total})",
+                    "Downloading GPU libraries ({index} of {count}): {percent}%"
+                    " ({done} of {total})",
+                    index=state["index"],
+                    count=len(cuda_runtime.CUDA_PACKAGES),
+                    percent=percent,
+                    done=format_download_size(done),
+                    total=format_download_size(total),
+                )
+            )
+
+        try:
+            cuda_runtime.ensure_runtime(root, status_callback=report)
+        except cuda_runtime.CudaRuntimeError as exc:
+            logging.error("Nie udało się przygotować bibliotek GPU: %s", exc)
+            raise AppError(
+                translator.t(
+                    "Nie udało się pobrać bibliotek GPU. Sprawdź połączenie "
+                    "z internetem — dyktowanie zadziała na procesorze.",
+                    "Could not download the GPU libraries. Check your internet "
+                    "connection — dictation will run on the processor.",
+                )
+            ) from exc
+
+    CUDA_DLL_SEARCH_PATHS = configure_cuda_dll_search_paths()
+    if not CUDA_DLL_SEARCH_PATHS:
+        logging.warning("Pobrane biblioteki GPU nie dały się załadować")
+    return bool(CUDA_DLL_SEARCH_PATHS)
+
+
 def warm_up_cuda_model(model: WhisperModel, config: dict[str, Any]) -> None:
     """Rozgrzej encoder i sprawdź CUDA bez uruchamiania dekodera na ciszy."""
     del config  # zachowany parametr ułatwia testowanie tej samej ścieżki
@@ -2293,6 +2389,15 @@ def create_model(
     )
     model: Optional[WhisperModel] = None
     try:
+        if device == "cuda" and not ensure_cuda_runtime_available(
+            status_callback, translator
+        ):
+            raise AppError(
+                translator.t(
+                    "Biblioteki GPU są niedostępne.",
+                    "The GPU libraries are unavailable.",
+                )
+            )
         model = load_model_local_first(
             model_name,
             kwargs,

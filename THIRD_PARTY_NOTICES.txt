@@ -25,7 +25,10 @@ Principal components:
   https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/
 
 The Whisper model is downloaded separately on first launch and remains subject
-to the terms published by its author or distributor.
+to the terms published by its author or distributor. The NVIDIA CUDA libraries
+are likewise not part of the installer: Mowik downloads them from the Python
+Package Index when a model is first started on the GPU, and they remain subject
+to the NVIDIA Software License Agreement.
 
 -------------------------------------------------------------------------------
 
@@ -55,4 +58,7 @@ Najważniejsze komponenty:
   https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/
 
 Model Whisper jest pobierany oddzielnie podczas pierwszego uruchomienia i
-podlega warunkom opublikowanym przez jego autora/dystrybutora.
+podlega warunkom opublikowanym przez jego autora/dystrybutora. Biblioteki NVIDIA
+CUDA również nie wchodzą w skład instalatora: Mówik pobiera je z Python Package
+Index przy pierwszym uruchomieniu modelu na karcie graficznej i podlegają one
+warunkom NVIDIA Software License Agreement.

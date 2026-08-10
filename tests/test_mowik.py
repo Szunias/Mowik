@@ -4978,6 +4978,90 @@ class ModelDownloadFeedbackTests(unittest.TestCase):
         self.assertIn("internet", str(raised.exception).lower())
 
 
+class CudaRuntimeSelectionTests(unittest.TestCase):
+    """Instalator nie wiezie bibliotek CUDA, więc karta musi wystarczyć."""
+
+    def test_ready_runtime_is_usable(self) -> None:
+        with mock.patch.object(mowik, "get_cuda_count", return_value=1):
+            self.assertTrue(mowik.cuda_is_usable())
+
+    def test_card_without_libraries_still_counts_as_usable(self) -> None:
+        with mock.patch.object(
+            mowik, "get_cuda_count", return_value=0
+        ), mock.patch.object(
+            mowik, "get_cuda_device_count", return_value=1
+        ), mock.patch.object(
+            mowik.cuda_runtime, "user_runtime_root", return_value=Path("C:/x")
+        ):
+            self.assertTrue(mowik.cuda_is_usable())
+
+    def test_machine_without_a_card_is_not_usable(self) -> None:
+        with mock.patch.object(
+            mowik, "get_cuda_count", return_value=0
+        ), mock.patch.object(mowik, "get_cuda_device_count", return_value=0):
+            self.assertFalse(mowik.cuda_is_usable())
+
+    def test_auto_picks_the_gpu_before_the_libraries_are_downloaded(self) -> None:
+        with mock.patch.object(
+            mowik, "get_cuda_count", return_value=0
+        ), mock.patch.object(
+            mowik, "get_cuda_device_count", return_value=1
+        ), mock.patch.object(
+            mowik.cuda_runtime, "user_runtime_root", return_value=Path("C:/x")
+        ):
+            _, device, compute_type = mowik.resolve_model_plan({"device": "auto"})
+
+        self.assertEqual(device, "cuda")
+        self.assertEqual(compute_type, "float16")
+
+    def test_missing_libraries_are_downloaded_once(self) -> None:
+        statuses: list[str] = []
+
+        with mock.patch.object(mowik, "CUDA_DLL_SEARCH_PATHS", ()), mock.patch.object(
+            mowik.cuda_runtime, "user_runtime_root", return_value=Path("C:/x")
+        ), mock.patch.object(
+            mowik.cuda_runtime, "is_runtime_complete", return_value=False
+        ), mock.patch.object(
+            mowik.cuda_runtime, "ensure_runtime"
+        ) as ensure_runtime, mock.patch.object(
+            mowik,
+            "configure_cuda_dll_search_paths",
+            return_value=(Path("C:/x/cublas/bin"),),
+        ):
+            self.assertTrue(
+                mowik.ensure_cuda_runtime_available(statuses.append, mowik.Translator("pl"))
+            )
+
+        ensure_runtime.assert_called_once()
+        self.assertTrue(any("GPU" in status for status in statuses), statuses)
+
+    def test_failed_download_explains_itself_and_leaves_cpu_available(self) -> None:
+        with mock.patch.object(mowik, "CUDA_DLL_SEARCH_PATHS", ()), mock.patch.object(
+            mowik.cuda_runtime, "user_runtime_root", return_value=Path("C:/x")
+        ), mock.patch.object(
+            mowik.cuda_runtime, "is_runtime_complete", return_value=False
+        ), mock.patch.object(
+            mowik.cuda_runtime,
+            "ensure_runtime",
+            side_effect=mowik.cuda_runtime.CudaRuntimeError("brak sieci"),
+        ):
+            with self.assertRaises(mowik.AppError) as raised:
+                mowik.ensure_cuda_runtime_available(None, mowik.Translator("pl"))
+
+        message = str(raised.exception)
+        self.assertIn("GPU", message)
+        self.assertIn("procesorze", message)
+        self.assertNotIn("brak sieci", message)
+
+    def test_ready_paths_skip_the_download_entirely(self) -> None:
+        with mock.patch.object(
+            mowik, "CUDA_DLL_SEARCH_PATHS", (Path("C:/bundled"),)
+        ), mock.patch.object(mowik.cuda_runtime, "ensure_runtime") as ensure_runtime:
+            self.assertTrue(mowik.ensure_cuda_runtime_available())
+
+        ensure_runtime.assert_not_called()
+
+
 class MicrophonePickerTests(unittest.TestCase):
     """Skrócona lista ma być krótsza, ale nie może gubić żadnego wejścia."""
 
@@ -5115,6 +5199,23 @@ class MicrophonePickerTests(unittest.TestCase):
 class SettingsMicrophoneUiTests(unittest.TestCase):
     """Okno ustawień musi wstać i faktycznie przełączać widok listy."""
 
+    _window = None
+
+    def setUp(self) -> None:
+        # Drugi interpreter Tk w jednym procesie potrafi nie znaleźć tk.tcl,
+        # więc oba testy dzielą jedno okno zamiast budować własne.
+        if type(self)._window is None:
+            type(self)._window = self.build_window()
+        self.root = type(self)._window
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._window is not None:
+            try:
+                cls._window.destroy()
+            finally:
+                cls._window = None
+
     def build_window(self):
         try:
             import tkinter as tk
@@ -5148,7 +5249,6 @@ class SettingsMicrophoneUiTests(unittest.TestCase):
         root = captured.get("root")
         if root is None:  # pragma: no cover - mainloop zawsze jest wywoływany
             self.fail("The settings window never reached its main loop")
-        self.addCleanup(root.destroy)
         return root
 
     @staticmethod
@@ -5178,7 +5278,7 @@ class SettingsMicrophoneUiTests(unittest.TestCase):
         self.fail("The variants switch is missing from the settings window")
 
     def test_checkbox_switches_between_the_short_and_the_full_list(self) -> None:
-        root = self.build_window()
+        root = self.root
         combo = self.microphone_combo(root)
         short = list(combo["values"])
 
@@ -5198,7 +5298,7 @@ class SettingsMicrophoneUiTests(unittest.TestCase):
     def test_level_preview_reports_a_busy_input_instead_of_failing(self) -> None:
         from tkinter import ttk
 
-        root = self.build_window()
+        root = self.root
         buttons = [
             widget
             for widget in self.walk(root)

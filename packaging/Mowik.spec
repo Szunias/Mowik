@@ -123,8 +123,11 @@ hiddenimports += [
     "win32com.client",
 ]
 
-for package in ("nvidia.cublas", "nvidia.cuda_nvrtc"):
-    binaries += collect_dynamic_libs(package)
+# Bibliotek CUDA celowo nie pakujemy: w rozpakowanej postaci zajmują prawie
+# gigabajt, a używają ich wyłącznie posiadacze karty NVIDIA. Mówik pobiera je
+# przy pierwszym uruchomieniu modelu na GPU (mowik_cuda.py). Metadane pakietów
+# zostają powyżej, bo to my doprowadzamy te biblioteki na komputer użytkownika
+# i ich licencje muszą podróżować z aplikacją.
 
 a = Analysis(
     [str(ROOT / "mowik.py")],
