@@ -4461,7 +4461,7 @@ class MicrophoneIntegrationTests(unittest.TestCase):
             translator,
         )
 
-        self.assertIn("Windows WASAPI", state.selected_label)
+        self.assertIn("Secret Studio Microphone", state.selected_label)
         saved = mowik.microphone_config_value_for_choice(
             state,
             state.selected_label,
@@ -4883,6 +4883,489 @@ class SettingsMouseWheelTests(unittest.TestCase):
             self.assertEqual(widget.get(), before)
             checked += 1
         self.assertGreaterEqual(checked, 10)
+
+
+class ModelDownloadFeedbackTests(unittest.TestCase):
+    def make_progress_class(self) -> tuple[type, list[str]]:
+        statuses: list[str] = []
+        progress_class = mowik.make_download_progress_tqdm(
+            "large-v3",
+            statuses.append,
+            mowik.Translator("pl"),
+        )
+        return progress_class, statuses
+
+    def test_progress_bar_reports_percent_without_console_streams(self) -> None:
+        progress_class, statuses = self.make_progress_class()
+
+        with mock.patch.object(mowik.sys, "stdout", None), mock.patch.object(
+            mowik.sys, "stderr", None
+        ):
+            bar = progress_class(total=400, unit="B", unit_scale=True)
+            bar.update(100)
+            bar.update(300)
+            bar.close()
+
+        self.assertEqual(len(statuses), 2)
+        self.assertIn("25%", statuses[0])
+        self.assertIn("100%", statuses[1])
+
+    def test_file_counter_is_hidden_once_byte_progress_is_known(self) -> None:
+        progress_class, statuses = self.make_progress_class()
+
+        byte_bar = progress_class(total=400, unit="B", unit_scale=True)
+        byte_bar.update(200)
+        file_bar = progress_class(total=4, unit="it")
+        file_bar.update(1)
+
+        self.assertEqual(len(statuses), 1)
+        self.assertIn("50%", statuses[0])
+
+    def test_repeated_percent_does_not_flood_the_status(self) -> None:
+        progress_class, statuses = self.make_progress_class()
+
+        bar = progress_class(total=1000, unit="B", unit_scale=True)
+        for _ in range(5):
+            bar.update(1)
+
+        self.assertEqual(len(statuses), 1)
+        self.assertIn("0%", statuses[0])
+
+    def test_download_is_reported_through_the_application_progress_class(
+        self,
+    ) -> None:
+        statuses: list[str] = []
+
+        with mock.patch.object(
+            mowik.huggingface_hub,
+            "snapshot_download",
+            side_effect=mowik.LocalEntryNotFoundError("brak cache"),
+        ) as snapshot_download, self.assertRaises(mowik.AppError):
+            mowik.load_model_local_first(
+                "large-v3",
+                {"device": "cpu"},
+                statuses.append,
+                mowik.Translator("pl"),
+            )
+
+        progress_class = snapshot_download.call_args.kwargs["tqdm_class"]
+        self.assertTrue(issubclass(progress_class, mowik.base_tqdm))
+
+    def test_failed_download_explains_itself_instead_of_pointing_at_the_log(
+        self,
+    ) -> None:
+        statuses: list[str] = []
+        attempts = {"count": 0}
+
+        def snapshot_download(**kwargs):
+            attempts["count"] += 1
+            if kwargs.get("local_files_only"):
+                raise mowik.LocalEntryNotFoundError("brak cache")
+            raise OSError("brak sieci")
+
+        with mock.patch.object(
+            mowik.huggingface_hub, "snapshot_download", snapshot_download
+        ), self.assertRaises(mowik.AppError) as raised:
+            mowik.load_model_local_first(
+                "large-v3",
+                {"device": "cpu"},
+                statuses.append,
+                mowik.Translator("pl"),
+            )
+
+        self.assertEqual(attempts["count"], 2)
+        self.assertIn("large-v3", str(raised.exception))
+        self.assertIn("internet", str(raised.exception).lower())
+
+
+class MicrophonePickerTests(unittest.TestCase):
+    """Skrócona lista ma być krótsza, ale nie może gubić żadnego wejścia."""
+
+    HOST_APIS = [{"name": "MME"}, {"name": "Windows WASAPI"}]
+    DEVICES = [
+        {
+            "name": "Microsoft Sound Mapper - Input",
+            "hostapi": 0,
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+            "default_samplerate": 44_100.0,
+        },
+        {
+            # MME ucina nazwy, więc ten sam mikrofon wygląda na dwa urządzenia.
+            "name": "Studio Microphone (USB Audio De",
+            "hostapi": 0,
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+            "default_samplerate": 44_100.0,
+        },
+        {
+            "name": "Studio Microphone (USB Audio Device)",
+            "hostapi": 1,
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+            "default_samplerate": 48_000.0,
+        },
+        {
+            "name": "Laptop Array (Internal)",
+            "hostapi": 1,
+            "max_input_channels": 2,
+            "max_output_channels": 0,
+            "default_samplerate": 48_000.0,
+        },
+    ]
+
+    def build(self, configured=None, **kwargs) -> mowik.MicrophoneChoiceState:
+        return mowik.build_microphone_choice_state(
+            configured,
+            self.DEVICES,
+            self.HOST_APIS,
+            mowik.Translator("en"),
+            **kwargs,
+        )
+
+    def test_variants_of_one_input_collapse_into_a_single_choice(self) -> None:
+        short = self.build()
+        full = self.build(show_all=True)
+
+        self.assertEqual(len(short.values), 3)
+        self.assertEqual(len(full.values), 5)
+
+    def test_collapsed_choice_shows_the_name_mme_truncated(self) -> None:
+        labels = list(self.build().values)
+
+        self.assertTrue(
+            any("Studio Microphone (USB Audio Device)" in label for label in labels),
+            labels,
+        )
+        self.assertFalse(
+            any(label.endswith("USB Audio De · 2 in") for label in labels),
+            labels,
+        )
+
+    def test_collapsed_choice_saves_the_preferred_host_api(self) -> None:
+        state = self.build()
+        label = next(
+            label for label in state.values if "Studio Microphone" in label
+        )
+
+        self.assertEqual(state.values[label]["host_api_name"], "Windows WASAPI")
+
+    def test_system_alias_is_replaced_by_the_default_entry(self) -> None:
+        short = list(self.build().values)
+        full = list(self.build(show_all=True).values)
+
+        self.assertFalse(any("Sound Mapper" in label for label in short), short)
+        self.assertTrue(any("Sound Mapper" in label for label in full), full)
+
+    def test_default_windows_input_is_marked(self) -> None:
+        labels = list(self.build(default_input_index=3).values)
+
+        marked = [label for label in labels if label.startswith("★")]
+        self.assertEqual(len(marked), 1)
+        self.assertIn("Laptop Array", marked[0])
+
+    def test_saved_selector_is_never_rewritten_by_the_shorter_list(self) -> None:
+        saved = mowik.audio_devices.build_microphone_selector(
+            1,
+            self.DEVICES,
+            self.HOST_APIS,
+        )
+
+        state = self.build(saved)
+
+        self.assertEqual(state.values[state.selected_label], saved)
+        self.assertEqual(
+            mowik.microphone_config_value_for_choice(
+                state,
+                state.selected_label,
+                mowik.Translator("en"),
+            ),
+            saved,
+        )
+
+    def test_same_name_devices_on_one_host_api_stay_separate(self) -> None:
+        devices = [
+            {
+                "name": "USB Microphone",
+                "hostapi": 1,
+                "max_input_channels": 1,
+                "max_output_channels": 0,
+                "default_samplerate": 48_000.0,
+            },
+            {
+                "name": "USB Microphone",
+                "hostapi": 1,
+                "max_input_channels": 1,
+                "max_output_channels": 0,
+                "default_samplerate": 48_000.0,
+            },
+        ]
+
+        state = mowik.build_microphone_choice_state(
+            None,
+            devices,
+            self.HOST_APIS,
+            mowik.Translator("en"),
+        )
+
+        self.assertEqual(len(state.values), 3)
+        self.assertEqual(len(state.blocked_labels), 2)
+
+
+class SettingsMicrophoneUiTests(unittest.TestCase):
+    """Okno ustawień musi wstać i faktycznie przełączać widok listy."""
+
+    def build_window(self):
+        try:
+            import tkinter as tk
+        except ImportError:  # pragma: no cover - Tk brakuje tylko w kiosku
+            self.skipTest("Tkinter is unavailable")
+
+        captured: dict[str, object] = {}
+
+        def capture_mainloop(root) -> None:
+            root.withdraw()
+            captured["root"] = root
+
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["ui_language"] = "en"
+        with mock.patch.object(tk.Tk, "mainloop", capture_mainloop), mock.patch.object(
+            mowik,
+            "load_config_with_revision",
+            return_value=(config, "revision"),
+        ), mock.patch.object(
+            mowik, "enable_windows_dpi_awareness"
+        ), mock.patch.object(
+            mowik.sd, "query_devices", return_value=MicrophonePickerTests.DEVICES
+        ), mock.patch.object(
+            mowik.sd, "query_hostapis", return_value=MicrophonePickerTests.HOST_APIS
+        ):
+            try:
+                mowik.run_settings_window()
+            except tk.TclError as exc:  # pragma: no cover - brak sesji graficznej
+                self.skipTest(f"Tk cannot create windows here: {exc}")
+
+        root = captured.get("root")
+        if root is None:  # pragma: no cover - mainloop zawsze jest wywoływany
+            self.fail("The settings window never reached its main loop")
+        self.addCleanup(root.destroy)
+        return root
+
+    @staticmethod
+    def walk(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from SettingsMicrophoneUiTests.walk(child)
+
+    def microphone_combo(self, root):
+        from tkinter import ttk
+
+        for widget in self.walk(root):
+            if isinstance(widget, ttk.Combobox) and any(
+                "Studio Microphone" in str(value) for value in widget["values"]
+            ):
+                return widget
+        self.fail("The microphone picker is missing from the settings window")
+
+    def variants_checkbox(self, root):
+        from tkinter import ttk
+
+        for widget in self.walk(root):
+            if isinstance(widget, ttk.Checkbutton) and "variant" in str(
+                widget.cget("text")
+            ):
+                return widget
+        self.fail("The variants switch is missing from the settings window")
+
+    def test_checkbox_switches_between_the_short_and_the_full_list(self) -> None:
+        root = self.build_window()
+        combo = self.microphone_combo(root)
+        short = list(combo["values"])
+
+        with mock.patch.object(
+            mowik.sd, "query_devices", return_value=MicrophonePickerTests.DEVICES
+        ), mock.patch.object(
+            mowik.sd, "query_hostapis", return_value=MicrophonePickerTests.HOST_APIS
+        ):
+            self.variants_checkbox(root).invoke()
+            root.update_idletasks()
+        full = list(combo["values"])
+
+        self.assertEqual(len(short), 3)
+        self.assertEqual(len(full), 5)
+        self.assertTrue(any("Windows WASAPI" in label for label in full), full)
+
+    def test_level_preview_reports_a_busy_input_instead_of_failing(self) -> None:
+        from tkinter import ttk
+
+        root = self.build_window()
+        buttons = [
+            widget
+            for widget in self.walk(root)
+            if isinstance(widget, ttk.Button) and str(widget.cget("text")) == "Test"
+        ]
+        self.assertEqual(len(buttons), 1)
+
+        with mock.patch.object(
+            mowik.sd, "InputStream", side_effect=RuntimeError("device busy")
+        ), mock.patch.object(
+            mowik.sd, "query_devices", return_value=MicrophonePickerTests.DEVICES
+        ), mock.patch.object(
+            mowik.sd, "query_hostapis", return_value=MicrophonePickerTests.HOST_APIS
+        ):
+            buttons[0].invoke()
+            root.update_idletasks()
+
+        hints = [
+            str(widget.cget("text"))
+            for widget in self.walk(root)
+            if isinstance(widget, ttk.Label) and "another program" in str(
+                widget.cget("text")
+            )
+        ]
+        self.assertEqual(len(hints), 1)
+        self.assertEqual(str(buttons[0].cget("text")), "Test")
+
+
+class MicrophoneLevelMonitorTests(unittest.TestCase):
+    def test_level_scale_spans_silence_to_a_loud_voice(self) -> None:
+        self.assertEqual(mowik.microphone_level_percent(0.0), 0)
+        self.assertEqual(mowik.microphone_level_percent(float("nan")), 0)
+        self.assertEqual(mowik.microphone_level_percent(1.0), 100)
+        quiet = mowik.microphone_level_percent(0.005)
+        speech = mowik.microphone_level_percent(0.05)
+        self.assertLess(quiet, speech)
+        self.assertTrue(0 < quiet < 100)
+
+    def test_monitor_opens_stops_and_releases_the_input(self) -> None:
+        monitor = mowik.MicrophoneLevelMonitor()
+        stream = mock.Mock()
+
+        with mock.patch.object(mowik.sd, "InputStream", return_value=stream):
+            monitor.start(3)
+            self.assertTrue(monitor.active)
+            monitor._callback(np.full((512, 1), 0.05, dtype=np.float32), 512, None, 0)
+            level = monitor.level_percent()
+            monitor.stop()
+
+        self.assertGreater(level, 0)
+        self.assertFalse(monitor.active)
+        stream.close.assert_called_once_with(ignore_errors=True)
+        self.assertEqual(monitor.level_percent(), 0)
+
+    def test_failed_open_leaves_no_stream_behind(self) -> None:
+        monitor = mowik.MicrophoneLevelMonitor()
+        stream = mock.Mock()
+        stream.start.side_effect = RuntimeError("device busy")
+
+        with mock.patch.object(mowik.sd, "InputStream", return_value=stream):
+            with self.assertRaises(RuntimeError):
+                monitor.start(None)
+
+        self.assertFalse(monitor.active)
+        stream.close.assert_called_once_with(ignore_errors=True)
+
+
+class FailureMessageTests(unittest.TestCase):
+    def make_app(self) -> mowik.MowikApp:
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["feedback"]["floating_indicator"] = False
+        app = mowik.MowikApp(config)
+        app.dictation_indicator = mock.Mock()
+        return app
+
+    def finish_with(self, error: Exception) -> mock.Mock:
+        app = self.make_app()
+        with mock.patch.object(
+            app, "_finish_dictation_after_tail", side_effect=error
+        ), mock.patch.object(app, "beep"), mock.patch.object(
+            app, "_release_busy"
+        ), mock.patch.object(
+            app, "set_status"
+        ) as set_status:
+            app._finish_dictation_safely()
+        return set_status
+
+    def test_known_reason_replaces_the_generic_recording_status(self) -> None:
+        set_status = self.finish_with(
+            mowik.AppError("Mikrofon jest zajęty przez inną aplikację.")
+        )
+
+        self.assertEqual(
+            set_status.call_args.args[0],
+            "Mikrofon jest zajęty przez inną aplikację.",
+        )
+        self.assertIn("zajęty", set_status.call_args.kwargs["notify"])
+
+    def test_unknown_error_names_its_type_without_leaking_driver_text(self) -> None:
+        set_status = self.finish_with(RuntimeError("secret driver and device details"))
+
+        notification = set_status.call_args.kwargs["notify"]
+        self.assertNotIn("secret driver", notification)
+        self.assertIn("RuntimeError", notification)
+        self.assertEqual(set_status.call_args.args[0], "Błąd nagrywania")
+
+    def test_notification_still_points_at_the_log_for_details(self) -> None:
+        set_status = self.finish_with(mowik.AppError("Brak miejsca na dysku."))
+
+        self.assertIn(str(mowik.LOG_PATH), set_status.call_args.kwargs["notify"])
+
+
+class StartupFailureVisibilityTests(unittest.TestCase):
+    def make_app(self) -> mowik.MowikApp:
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["feedback"]["floating_indicator"] = False
+        app = mowik.MowikApp(config)
+        app.dictation_indicator = mock.Mock()
+        return app
+
+    def test_shortcut_notifies_why_dictation_cannot_start(self) -> None:
+        app = self.make_app()
+        app._remember_startup_failure("Nie udało się pobrać modelu large-v3.")
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            app, "set_status"
+        ) as set_status:
+            app.begin_dictation()
+
+        set_status.assert_called_once()
+        self.assertIn("large-v3", set_status.call_args.args[0])
+        notification = set_status.call_args.kwargs["notify"]
+        self.assertIn("large-v3", notification)
+        self.assertTrue(set_status.call_args.kwargs["error"])
+
+    def test_repeated_shortcut_keeps_status_but_stops_notifying(self) -> None:
+        app = self.make_app()
+        app._remember_startup_failure("Nie udało się pobrać modelu large-v3.")
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            app, "set_status"
+        ) as set_status:
+            app.begin_dictation()
+            app.begin_dictation()
+
+        self.assertEqual(set_status.call_count, 2)
+        self.assertIsNone(set_status.call_args.kwargs["notify"])
+        self.assertIn("large-v3", set_status.call_args.args[0])
+
+    def test_loading_model_is_not_reported_as_a_failure(self) -> None:
+        app = self.make_app()
+
+        with mock.patch.object(app, "beep"), mock.patch.object(
+            app, "set_status"
+        ) as set_status:
+            app.begin_dictation()
+
+        self.assertEqual(set_status.call_args.kwargs["state"], "idle")
+        self.assertNotIn("error", set_status.call_args.kwargs)
+
+    def test_successful_load_clears_the_remembered_failure(self) -> None:
+        app = self.make_app()
+        app._remember_startup_failure("Nie udało się pobrać modelu large-v3.")
+
+        app._remember_startup_failure(None)
+
+        self.assertEqual(app._startup_failure_message(), (None, False))
 
 
 if __name__ == "__main__":

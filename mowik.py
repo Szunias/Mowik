@@ -40,12 +40,12 @@ import wave
 from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.7.5"
+APP_VERSION = "2.7.6"
 
 
 def _run_early_read_only_probe(
@@ -302,12 +302,36 @@ def configure_cuda_dll_search_paths() -> tuple[Path, ...]:
 
 CUDA_DLL_SEARCH_PATHS = configure_cuda_dll_search_paths()
 
+
+def console_streams_available() -> bool:
+    """W trybie okienkowym stdout i stderr są puste, więc tqdm nie ma gdzie pisać."""
+
+    return all(
+        getattr(stream, "write", None) is not None
+        for stream in (sys.stdout, sys.stderr)
+    )
+
+
+if not console_streams_available():
+    # Pasek postępu Hugging Face pisze do stdout/stderr.  Bez konsoli pobieranie
+    # brakujących plików modelu kończyło się AttributeError, więc aplikacja
+    # startowała bez modelu i skrót dyktowania nic nie robił.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from faster_whisper.audio import pad_or_trim
 import huggingface_hub
 from huggingface_hub.errors import LocalEntryNotFoundError
+from huggingface_hub.utils import disable_progress_bars
+from tqdm import tqdm as base_tqdm
+
+if not console_streams_available():
+    # Zmienna środowiskowa działa tylko przy pierwszym imporcie biblioteki, więc
+    # dokładamy jawne wyłączenie dla builda, który zaimportował ją wcześniej.
+    disable_progress_bars()
+
 import ctranslate2
 from PIL import Image, ImageDraw, ImageFont
 from pynput import keyboard, mouse
@@ -333,6 +357,20 @@ RESTART_ACK_TIMEOUT_SECONDS = 2.0
 RESTART_MUTEX_WAIT_SECONDS = 15.0
 RESTART_STARTED_TIMEOUT_SECONDS = 25.0
 CLIPBOARD_WRITE_RETRY_DELAYS = (0.05, 0.10)
+STARTUP_FAILURE_NOTIFY_INTERVAL = 15.0
+# WASAPI podaje pełne nazwy i natywną częstotliwość; MME tnie nazwy i dokłada
+# opóźnienie, więc na skróconej liście jest ostatnim wyborem.
+MICROPHONE_HOST_API_PREFERENCE = ("wasapi", "directsound", "mme", "wdm-ks")
+# Windows powiela domyślne wejście pod własnymi nazwami. Na skróconej liście
+# zastępuje je pozycja „Domyślny mikrofon Windows”; w pełnej nadal są widoczne.
+SYSTEM_MICROPHONE_ALIASES = frozenset(
+    {
+        "microsoft sound mapper - input",
+        "mapowanie dźwięku microsoft - input",
+        "primary sound capture driver",
+        "podstawowy sterownik przechwytywania dźwięku",
+    }
+)
 MODEL_ALLOW_PATTERNS = (
     "config.json",
     "preprocessor_config.json",
@@ -690,11 +728,97 @@ def _microphone_device_label(
     return label
 
 
+def _microphone_group_key(
+    selector: audio_devices.MicrophoneSelector,
+) -> tuple[str, int]:
+    """Zepnij warianty jednego wejścia; MME tnie nazwy po 31 znakach."""
+
+    name = " ".join(selector.name.split()).lower()
+    head = name.split("(", 1)[0].strip()
+    return head or name, selector.max_input_channels
+
+
+def _microphone_host_api_rank(host_api_name: str) -> int:
+    name = host_api_name.lower()
+    for rank, marker in enumerate(MICROPHONE_HOST_API_PREFERENCE):
+        if marker in name:
+            return rank
+    return len(MICROPHONE_HOST_API_PREFERENCE)
+
+
+def _microphone_group_hides_separate_devices(
+    indexes: Sequence[int],
+    selectors_by_index: Mapping[int, audio_devices.MicrophoneSelector],
+) -> bool:
+    """Dwa fizyczne wejścia o tej samej nazwie muszą pozostać rozróżnialne."""
+
+    seen: set[str] = set()
+    for index in indexes:
+        host_api = selectors_by_index[index].host_api_name.strip().lower()
+        if host_api in seen:
+            return True
+        seen.add(host_api)
+    return False
+
+
+def _microphone_grouped_label(
+    display_name: str,
+    selector: audio_devices.MicrophoneSelector,
+    translator: Translator,
+    *,
+    is_default: bool,
+    ambiguous: bool,
+) -> str:
+    input_channels = translator.t(
+        "{count} wej.",
+        "{count} in",
+        count=selector.max_input_channels,
+    )
+    label = f"{display_name} · {input_channels}"
+    if is_default:
+        label = "★ " + label + translator.t(
+            " — używany teraz przez Windows",
+            " — currently used by Windows",
+        )
+    if ambiguous:
+        label += translator.t(
+            " · nie można rozróżnić",
+            " · cannot distinguish",
+        )
+    return label
+
+
+def _microphone_display_name(
+    indexes: Sequence[int],
+    selectors_by_index: Mapping[int, audio_devices.MicrophoneSelector],
+    representative: int,
+) -> str:
+    """Uzupełnij nazwę uciętą przez MME, nie podmieniając jej na cudzy wariant."""
+
+    name = selectors_by_index[representative].name
+    for index in indexes:
+        candidate = selectors_by_index[index].name
+        if len(candidate) > len(name) and candidate.startswith(name):
+            name = candidate
+    return name
+
+
+def _unique_microphone_label(label: str, taken: Mapping[str, Any], index: int) -> str:
+    """Etykieta jest kluczem wyboru, więc kolizja skasowałaby cudzy wpis."""
+
+    if label not in taken:
+        return label
+    return f"{label} · #{index}"
+
+
 def build_microphone_choice_state(
     configured_value: Any,
     devices: Any,
     host_apis: Any,
     translator: Translator,
+    *,
+    show_all: bool = False,
+    default_input_index: Optional[int] = None,
 ) -> MicrophoneChoiceState:
     """Build Settings choices and migrate a valid legacy index in memory."""
 
@@ -728,19 +852,86 @@ def build_microphone_choice_state(
         selector_counts[identity] = selector_counts.get(identity, 0) + 1
 
     blocked_labels: set[str] = set()
-    for index, selector in selectors_by_index.items():
-        ambiguous = selector_counts[audio_devices.microphone_identity_key(selector)] > 1
+
+    def is_ambiguous(index: int) -> bool:
+        identity = audio_devices.microphone_identity_key(selectors_by_index[index])
+        return selector_counts[identity] > 1
+
+    def add_detailed_choice(index: int) -> None:
+        ambiguous = is_ambiguous(index)
         label = _microphone_device_label(
-            selector,
+            selectors_by_index[index],
             index,
             translator,
             ambiguous=ambiguous,
         )
-        descriptor = descriptors_by_index[index]
-        values[label] = descriptor
+        values[label] = descriptors_by_index[index]
         labels_by_index[index] = label
         if ambiguous:
             blocked_labels.add(label)
+
+    if show_all:
+        for index in selectors_by_index:
+            add_detailed_choice(index)
+    else:
+        groups: dict[tuple[str, int], list[int]] = {}
+        for index, selector in selectors_by_index.items():
+            groups.setdefault(_microphone_group_key(selector), []).append(index)
+
+        def add_grouped_choice(indexes: Sequence[int]) -> None:
+            representative = min(
+                indexes,
+                key=lambda index: (
+                    _microphone_host_api_rank(
+                        selectors_by_index[index].host_api_name
+                    ),
+                    index,
+                ),
+            )
+            ambiguous = any(is_ambiguous(index) for index in indexes)
+            label = _unique_microphone_label(
+                _microphone_grouped_label(
+                    _microphone_display_name(
+                        indexes,
+                        selectors_by_index,
+                        representative,
+                    ),
+                    selectors_by_index[representative],
+                    translator,
+                    is_default=default_input_index in indexes,
+                    ambiguous=ambiguous,
+                ),
+                values,
+                representative,
+            )
+            values[label] = descriptors_by_index[representative]
+            for index in indexes:
+                labels_by_index[index] = label
+            if ambiguous:
+                blocked_labels.add(label)
+
+        for (group_name, _channels), indexes in groups.items():
+            if group_name in SYSTEM_MICROPHONE_ALIASES:
+                continue
+            if not _microphone_group_hides_separate_devices(
+                indexes, selectors_by_index
+            ):
+                add_grouped_choice(indexes)
+                continue
+            # Wspólny początek nazwy okazał się kryć różne wejścia, więc
+            # rozdzielamy je po pełnej nazwie zamiast scalać w jedną pozycję.
+            subgroups: dict[str, list[int]] = {}
+            for index in indexes:
+                full_name = " ".join(selectors_by_index[index].name.split()).lower()
+                subgroups.setdefault(full_name, []).append(index)
+            for subgroup in subgroups.values():
+                if _microphone_group_hides_separate_devices(
+                    subgroup, selectors_by_index
+                ):
+                    for index in subgroup:
+                        add_detailed_choice(index)
+                else:
+                    add_grouped_choice(subgroup)
 
     if configured_value is None:
         return MicrophoneChoiceState(
@@ -776,11 +967,95 @@ def build_microphone_choice_state(
             blocked_labels=frozenset(blocked_labels),
         )
 
+    if isinstance(configured_value, dict):
+        # Zapisany wybór zostaje dokładnie taki, jaki jest. Skrócona lista
+        # proponuje inne API tego samego wejścia, ale zapis bez świadomej
+        # zmiany nie może po cichu podmienić ustawienia.
+        values[selected_label] = copy.deepcopy(configured_value)
+
     return MicrophoneChoiceState(
         values,
         selected_label,
         blocked_labels=frozenset(blocked_labels),
     )
+
+
+def microphone_level_percent(rms: float) -> int:
+    """Przelicz RMS na skalę, w której zwykła mowa wypełnia środek paska."""
+
+    if not math.isfinite(rms) or rms <= 0.0:
+        return 0
+    decibels = 20.0 * math.log10(rms)
+    ratio = (decibels + 60.0) / 54.0
+    return max(0, min(100, int(round(ratio * 100))))
+
+
+class MicrophoneLevelMonitor:
+    """Podsłuch wybranego wejścia w ustawieniach, niezależny od dyktowania."""
+
+    _DECAY = 0.82
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._level = 0.0
+        self._stream: Optional[Any] = None
+
+    def _callback(self, indata, frames, time_info, status) -> None:
+        del frames, time_info, status
+        block = np.asarray(indata, dtype=np.float32)
+        level = (
+            float(np.sqrt(np.mean(np.square(block)))) if block.size else 0.0
+        )
+        if not math.isfinite(level):
+            level = 0.0
+        with self._lock:
+            # Szybki wzrost i wolniejszy spadek czytają się jak zwykły wskaźnik.
+            self._level = max(level, self._level * self._DECAY)
+
+    def start(self, device: Optional[int]) -> None:
+        self.stop()
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            device=device,
+            blocksize=0,
+            latency="high",
+            callback=self._callback,
+        )
+        try:
+            stream.start()
+        except Exception:
+            try:
+                stream.close(ignore_errors=True)
+            except Exception:
+                logging.debug("Nie udało się zamknąć podglądu", exc_info=True)
+            raise
+        with self._lock:
+            self._stream = stream
+            self._level = 0.0
+
+    def stop(self) -> None:
+        with self._lock:
+            stream = self._stream
+            self._stream = None
+            self._level = 0.0
+        if stream is None:
+            return
+        try:
+            stream.stop(ignore_errors=True)
+            stream.close(ignore_errors=True)
+        except Exception:
+            logging.debug("Nie udało się zamknąć podglądu", exc_info=True)
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._stream is not None
+
+    def level_percent(self) -> int:
+        with self._lock:
+            return microphone_level_percent(self._level)
 
 
 def build_unavailable_microphone_choice_state(
@@ -1772,6 +2047,95 @@ def resolve_cpu_threads(config: dict[str, Any]) -> int:
     return max(1, min(16, estimated_physical))
 
 
+class SilentProgressStream:
+    """tqdm musi mieć dokąd pisać, a w trybie okienkowym stdout nie istnieje."""
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+def format_download_size(value: float) -> str:
+    megabytes = max(0.0, float(value)) / (1024 * 1024)
+    if megabytes >= 1024:
+        return f"{megabytes / 1024:.1f} GB"
+    return f"{megabytes:.0f} MB"
+
+
+def make_download_progress_tqdm(
+    model_name: str,
+    status_callback,
+    translator: Translator,
+):
+    """Pokaż postęp pobierania modelu w aplikacji zamiast w nieistniejącej konsoli."""
+
+    if status_callback is None:
+        return None
+
+    lock = threading.Lock()
+    state: dict[str, Any] = {"percent": -1, "seen_bytes": False}
+
+    def report(unit: str, done: float, total: Optional[float]) -> None:
+        if not total or total <= 0:
+            return
+        in_bytes = str(unit).strip().upper().startswith("B")
+        percent = min(100, max(0, int(done * 100 / total)))
+        with lock:
+            if in_bytes:
+                state["seen_bytes"] = True
+            elif state["seen_bytes"]:
+                # Licznik plików jest mniej czytelny niż postęp w bajtach.
+                return
+            if percent == state["percent"]:
+                return
+            state["percent"] = percent
+        if in_bytes:
+            status_callback(
+                translator.t(
+                    "Pobieram model {model_name}: {percent}% ({done} z {total})",
+                    "Downloading model {model_name}: {percent}% ({done} of {total})",
+                    model_name=model_name,
+                    percent=percent,
+                    done=format_download_size(done),
+                    total=format_download_size(total),
+                )
+            )
+        else:
+            status_callback(
+                translator.t(
+                    "Pobieram pliki modelu {model_name}: {done} z {total}",
+                    "Downloading model files for {model_name}: {done} of {total}",
+                    model_name=model_name,
+                    done=int(done),
+                    total=int(total),
+                )
+            )
+
+    class DownloadProgressTqdm(base_tqdm):
+        def __init__(self, *args, **kwargs):
+            # Globalnie wyłączone paski nie mogą uciszyć raportowania postępu,
+            # a własny strumień zastępuje brakujące stdout w trybie okienkowym.
+            kwargs.pop("name", None)
+            kwargs["file"] = SilentProgressStream()
+            kwargs["disable"] = False
+            super().__init__(*args, **kwargs)
+
+        def update(self, n=1):
+            updated = super().update(n)
+            try:
+                report(self.unit, self.n, self.total)
+            except Exception:
+                logging.debug("Nie udało się pokazać postępu", exc_info=True)
+            return updated
+
+    return DownloadProgressTqdm
+
+
 def load_model_local_first(
     model_name: str,
     kwargs: dict[str, Any],
@@ -1811,6 +2175,9 @@ def load_model_local_first(
             cache_dir=str(MODEL_DIR),
             force_download=True,
             allow_patterns=MODEL_ALLOW_PATTERNS,
+            tqdm_class=make_download_progress_tqdm(
+                model_name, status_callback, translator
+            ),
         )
         if not snapshot_complete(model_path):
             raise AppError(
@@ -1848,13 +2215,28 @@ def load_model_local_first(
                     model_name=model_name,
                 )
             )
-        model_path = huggingface_hub.snapshot_download(
-            repo_id=repo_id,
-            revision=revision,
-            cache_dir=str(MODEL_DIR),
-            local_files_only=False,
-            allow_patterns=MODEL_ALLOW_PATTERNS,
-        )
+        try:
+            model_path = huggingface_hub.snapshot_download(
+                repo_id=repo_id,
+                revision=revision,
+                cache_dir=str(MODEL_DIR),
+                local_files_only=False,
+                allow_patterns=MODEL_ALLOW_PATTERNS,
+                tqdm_class=make_download_progress_tqdm(
+                    model_name, status_callback, translator
+                ),
+            )
+        except Exception as download_error:
+            logging.exception("Nie udało się pobrać modelu %s", model_name)
+            raise AppError(
+                translator.t(
+                    "Nie udało się pobrać modelu {model_name}. "
+                    "Sprawdź połączenie z internetem i spróbuj ponownie.",
+                    "Could not download model {model_name}. "
+                    "Check your internet connection and try again.",
+                    model_name=model_name,
+                )
+            ) from download_error
         if not snapshot_complete(model_path):
             # Chybienie w cache zostało już zalogowane wyżej i nie jest
             # przyczyną niekompletnego świeżego pobrania.
@@ -5507,6 +5889,16 @@ def run_settings_window() -> int:
         "current": None
     }
     microphone_refresh_unset = object()
+    microphone_level_monitor = MicrophoneLevelMonitor()
+
+    def default_input_device_index() -> Optional[int]:
+        try:
+            device = sd.default.device
+            index = device[0] if isinstance(device, (list, tuple)) else device
+            return int(index) if int(index) >= 0 else None
+        except Exception:
+            # Brak domyślnego wejścia zabiera tylko gwiazdkę przy pozycji.
+            return None
 
     def display_for_value(
         mapping: dict[str, Any],
@@ -5656,6 +6048,7 @@ def run_settings_window() -> int:
     cpu_threads_var = tk.StringVar(value=str(config.get("cpu_threads", 0)))
     beam_size_var = tk.StringVar(value=str(config.get("beam_size", 2)))
     microphone_var = tk.StringVar()
+    microphone_show_all_var = tk.BooleanVar(value=False)
 
     pre_roll_var = tk.StringVar(value=str(config.get("pre_roll_ms", 300)))
     post_roll_var = tk.StringVar(value=str(config.get("post_roll_ms", 120)))
@@ -6999,6 +7392,8 @@ def run_settings_window() -> int:
                 sd.query_devices(),
                 sd.query_hostapis(),
                 translator,
+                show_all=bool(microphone_show_all_var.get()),
+                default_input_index=default_input_device_index(),
             )
         except Exception:
             logging.warning(
@@ -7019,6 +7414,96 @@ def run_settings_window() -> int:
         text=t("Odśwież", "Refresh"),
         command=lambda: refresh_microphones(),
     ).grid(row=0, column=1, padx=(px(8), 0))
+
+    level_row = ttk.Frame(microphone_row)
+    level_row.columnconfigure(1, weight=1)
+    level_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(px(6), 0))
+    level_bar = ttk.Progressbar(level_row, mode="determinate", maximum=100)
+    level_bar.grid(row=0, column=1, sticky="ew", padx=(px(8), px(8)))
+    level_hint = ttk.Label(level_row, style="Muted.TLabel", text="")
+    level_hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(px(4), 0))
+
+    def stop_level_preview(hint: str = "") -> None:
+        microphone_level_monitor.stop()
+        level_bar["value"] = 0
+        level_hint.configure(text=hint)
+        level_button.configure(text=t("Sprawdź", "Test"))
+
+    def poll_level() -> None:
+        if not microphone_level_monitor.active:
+            return
+        level_bar["value"] = microphone_level_monitor.level_percent()
+        root.after(80, poll_level)
+
+    def start_level_preview() -> None:
+        label = microphone_var.get()
+        selected = microphone_values.get(label)
+        try:
+            device = (
+                None
+                if selected is None
+                else audio_devices.resolve_microphone_device(
+                    selected,
+                    sd.query_devices(),
+                    sd.query_hostapis(),
+                )
+            )
+            microphone_level_monitor.start(device)
+        except Exception:
+            logging.warning("Nie udało się otworzyć podglądu mikrofonu")
+            stop_level_preview(
+                t(
+                    "Nie udało się otworzyć tego wejścia — może być zajęte "
+                    "przez inny program.",
+                    "Could not open this input — another program may be "
+                    "using it.",
+                )
+            )
+            return
+        level_button.configure(text=t("Zatrzymaj", "Stop"))
+        level_hint.configure(
+            text=t(
+                "Powiedz coś — pasek pokazuje, co słyszy to wejście.",
+                "Say something — the bar shows what this input hears.",
+            )
+        )
+        poll_level()
+
+    def toggle_level_preview() -> None:
+        if microphone_level_monitor.active:
+            stop_level_preview()
+        else:
+            start_level_preview()
+
+    level_button = ttk.Button(
+        level_row,
+        text=t("Sprawdź", "Test"),
+        command=toggle_level_preview,
+    )
+    level_button.grid(row=0, column=0, sticky="w")
+
+    def on_microphone_selected(event=None) -> None:
+        del event
+        if microphone_level_monitor.active:
+            # Podgląd zawsze dotyczy wejścia widocznego w polu wyboru.
+            start_level_preview()
+
+    microphone_combo.bind("<<ComboboxSelected>>", on_microphone_selected, add="+")
+
+    def toggle_microphone_variants() -> None:
+        stop_level_preview()
+        refresh_microphones()
+
+    ttk.Checkbutton(
+        microphone_row,
+        text=t(
+            "Pokaż wszystkie warianty (sterowniki i częstotliwości)",
+            "Show every variant (drivers and sample rates)",
+        ),
+        variable=microphone_show_all_var,
+        command=toggle_microphone_variants,
+    ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(px(6), 0))
+
     add_field(dictation_basics, 1, t("Mikrofon", "Microphone"), microphone_row)
     microphone_row.grid_configure(columnspan=2)
     refresh_microphones(config.get("microphone"))
@@ -10045,7 +10530,11 @@ def run_settings_window() -> int:
     show_page("start")
     refresh_dirty_state()
     update_status_indicator()
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        # Zamknięcie okna każdą drogą musi zwolnić podsłuchiwane wejście.
+        microphone_level_monitor.stop()
     return 0
 
 
@@ -10585,6 +11074,9 @@ class MowikApp:
         self.process_elevated = windows_actions.is_process_elevated()
         self.stop_event = threading.Event()
         self.model_ready = threading.Event()
+        self._startup_failure_lock = threading.Lock()
+        self._startup_failure: Optional[str] = None
+        self._startup_failure_notified_at: Optional[float] = None
         self.busy_lock = threading.Lock()
         self.busy = False
         self._input_lock = threading.Lock()
@@ -10645,6 +11137,53 @@ class MowikApp:
             "Details were saved to the log: {path}",
             path=LOG_PATH,
         )
+
+    def _failure_reason(self, error: BaseException) -> Optional[str]:
+        """Zwróć wyłącznie oczyszczony opis z AppError, nigdy surowego wyjątku."""
+
+        if isinstance(error, AppError):
+            reason = str(error).strip()
+            if reason:
+                return reason
+        return None
+
+    def _failure_notification(self, error: BaseException) -> str:
+        """Powiedz, co się stało; sam odsyłacz do logu kazał użytkownikowi zgadywać."""
+
+        reason = self._failure_reason(error) or self.translator.t(
+            "Powód techniczny: {error}.",
+            "Technical reason: {error}.",
+            error=type(error).__name__,
+        )
+        return f"{reason} {self._error_notification()}"
+
+    def _describe_startup_failure(self, error: BaseException) -> str:
+        """Nazwij powód po imieniu; sam log nie mówi użytkownikowi nic na żywo."""
+
+        return self._failure_reason(error) or self.translator.t(
+            "Nie udało się uruchomić modelu ({error}).",
+            "The model failed to start ({error}).",
+            error=type(error).__name__,
+        )
+
+    def _remember_startup_failure(self, reason: Optional[str]) -> None:
+        with self._startup_failure_lock:
+            self._startup_failure = reason
+            self._startup_failure_notified_at = None
+
+    def _startup_failure_message(self) -> tuple[Optional[str], bool]:
+        """Zwróć powód i informację, czy wypada znowu pokazać powiadomienie."""
+
+        now = time.monotonic()
+        with self._startup_failure_lock:
+            reason = self._startup_failure
+            if reason is None:
+                return None, False
+            last = self._startup_failure_notified_at
+            if last is not None and now - last < STARTUP_FAILURE_NOTIFY_INTERVAL:
+                return reason, False
+            self._startup_failure_notified_at = now
+            return reason, True
 
     def _model_status(self, status: str) -> None:
         if not self.stop_event.is_set():
@@ -10803,6 +11342,7 @@ class MowikApp:
                     self.model_name = model_name
                     self.model_device = device
                     self.model_ready.set()
+                    self._remember_startup_failure(None)
             if cancelled:
                 should_close = False
                 with self._shutdown_lock:
@@ -10860,9 +11400,10 @@ class MowikApp:
                             ),
                             state="ready",
                         )
-        except Exception:
+        except Exception as exc:
             logging.exception("Błąd inicjalizacji")
             self.model_ready.clear()
+            self._remember_startup_failure(self._describe_startup_failure(exc))
             if recorder is not None:
                 should_close = False
                 with self._shutdown_lock:
@@ -10878,9 +11419,12 @@ class MowikApp:
                         logging.exception("Nie udało się zamknąć mikrofonu po błędzie")
             if self.stop_event.is_set():
                 return
+            reason, _ = self._startup_failure_message()
             self.set_status(
-                self.translator.t("Błąd uruchomienia", "Startup error"),
-                notify=self._error_notification(),
+                reason or self.translator.t("Błąd uruchomienia", "Startup error"),
+                notify=" ".join(
+                    part for part in (reason, self._error_notification()) if part
+                ),
                 error=True,
                 state="error",
             )
@@ -11035,12 +11579,34 @@ class MowikApp:
         if not self.model_ready.is_set() or recorder is None:
             self.dictation_indicator.error()
             self.beep("error")
+            reason, may_notify = self._startup_failure_message()
+            if reason is None:
+                self.set_status(
+                    self.translator.t(
+                        "Model jeszcze się ładuje — chwilę to potrwa",
+                        "The model is still loading — this takes a moment",
+                    ),
+                    state="idle",
+                )
+                return
+            # Sam sygnał dźwiękowy kazał użytkownikowi zgadywać, co się stało.
             self.set_status(
-                self.translator.t(
-                    "Model jeszcze nie jest gotowy",
-                    "The model is not ready yet",
-                ),
-                state="idle",
+                reason,
+                notify=" ".join(
+                    part
+                    for part in (
+                        reason,
+                        self.translator.t(
+                            "Dyktowanie nie ruszy, dopóki model się nie wczyta.",
+                            "Dictation cannot start until the model loads.",
+                        ),
+                    )
+                    if part
+                )
+                if may_notify
+                else None,
+                error=True,
+                state="error",
             )
             return
         with self.busy_lock:
@@ -11137,7 +11703,7 @@ class MowikApp:
         except OperationCancelled:
             rollback_started_capture()
             return
-        except Exception:
+        except Exception as exc:
             rollback_started_capture()
             with self._shutdown_lock:
                 if self._shutdown_started or self.stop_event.is_set():
@@ -11145,8 +11711,9 @@ class MowikApp:
                 self.dictation_indicator.error()
                 logging.exception("Nie udało się rozpocząć nagrywania")
                 self.set_status(
-                    self.translator.t("Błąd nagrywania", "Recording error"),
-                    notify=self._error_notification(),
+                    self._failure_reason(exc)
+                    or self.translator.t("Błąd nagrywania", "Recording error"),
+                    notify=self._failure_notification(exc),
                     error=True,
                     state="error",
                 )
@@ -11215,7 +11782,7 @@ class MowikApp:
         )
         try:
             post_roll_thread.start()
-        except Exception:
+        except Exception as exc:
             logging.exception("Nie udało się uruchomić kończenia nagrania")
             abort = getattr(recorder, "abort", None)
             if callable(abort):
@@ -11228,8 +11795,9 @@ class MowikApp:
             self._release_busy()
             self.dictation_indicator.error()
             self.set_status(
-                self.translator.t("Błąd nagrywania", "Recording error"),
-                notify=self._error_notification(),
+                self._failure_reason(exc)
+                or self.translator.t("Błąd nagrywania", "Recording error"),
+                notify=self._failure_notification(exc),
                 error=True,
                 state="error",
             )
@@ -11247,13 +11815,14 @@ class MowikApp:
                 released_at,
                 delivery_foreground,
             )
-        except Exception:
+        except Exception as exc:
             logging.exception("Nie udało się zakończyć nagrywania")
             self._release_busy()
             self.dictation_indicator.error()
             self.set_status(
-                self.translator.t("Błąd nagrywania", "Recording error"),
-                notify=self._error_notification(),
+                self._failure_reason(exc)
+                or self.translator.t("Błąd nagrywania", "Recording error"),
+                notify=self._failure_notification(exc),
                 error=True,
                 state="error",
             )
@@ -11453,11 +12022,12 @@ class MowikApp:
             except OperationCancelled:
                 logging.info("Anulowano dostarczanie tekstu podczas zamykania")
                 self.dictation_indicator.hide()
-            except Exception:
+            except Exception as exc:
                 logging.exception("Błąd przetwarzania trybu %s", job.mode)
                 self.dictation_indicator.error()
                 self.set_status(
-                    self.translator.t(
+                    self._failure_reason(exc)
+                    or self.translator.t(
                         "Błąd wykonywania komendy"
                         if job.mode == "custom_command"
                         else "Błąd dyktowania",
@@ -11465,7 +12035,7 @@ class MowikApp:
                         if job.mode == "custom_command"
                         else "Dictation error",
                     ),
-                    notify=self._error_notification(),
+                    notify=self._failure_notification(exc),
                     error=True,
                     state="error",
                 )
@@ -12090,14 +12660,14 @@ class MowikApp:
                 settings_process_args(),
                 cwd=str(APP_ROOT),
             )
-        except Exception:
+        except Exception as exc:
             logging.exception("Nie udało się otworzyć panelu ustawień")
             self.set_status(
                 self.translator.t(
                     "Błąd otwierania ustawień",
                     "Could not open settings",
                 ),
-                notify=self._error_notification(),
+                notify=self._failure_notification(exc),
                 error=True,
                 state="error",
             )
@@ -12110,7 +12680,7 @@ class MowikApp:
     ) -> None:
         try:
             os.startfile(path)  # type: ignore[attr-defined]
-        except OSError:
+        except OSError as exc:
             logging.exception("Nie udało się otworzyć ścieżki z menu: %s", path)
             self.set_status(
                 self.translator.t(
@@ -12118,7 +12688,7 @@ class MowikApp:
                     "Could not open: {label}",
                     label=self.translator.t(polish_label, english_label),
                 ),
-                notify=self._error_notification(),
+                notify=self._failure_notification(exc),
                 error=True,
                 state="error",
             )
@@ -12159,14 +12729,15 @@ class MowikApp:
                 state="processing",
             )
             self.restart()
-        except Exception:
+        except Exception as exc:
             logging.exception("Nie udało się zastosować profilu %s", profile_name)
             self.set_status(
-                self.translator.t(
+                self._failure_reason(exc)
+                or self.translator.t(
                     "Błąd zmiany profilu",
                     "Could not change profile",
                 ),
-                notify=self._error_notification(),
+                notify=self._failure_notification(exc),
                 error=True,
                 state="error",
             )
