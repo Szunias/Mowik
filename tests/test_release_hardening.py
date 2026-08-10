@@ -770,8 +770,12 @@ class ReleasePipelineHardeningTests(unittest.TestCase):
         self.assertIn("requires the explicit -UNSIGNED.exe file name", script)
         self.assertGreaterEqual(script.count("SignatureStatus]::NotSigned"), 2)
         self.assertIn("$RepairedAppHash -cne $ExpectedAppHash", script)
-        self.assertIn("-ArgumentList '--settings'", script)
-        self.assertIn("Mowik\\config.json", script)
+        # Runnery Windows są podniesione, a Mówik odmawia wtedy startu modalnym
+        # okienkiem, którego nikt tam nie zamknie. Smoke GUI musi omijać tę
+        # ścieżkę, inaczej zadanie wisi do limitu czasu.
+        self.assertIn("-ArgumentList '--runtime-gui-smoke-test'", script)
+        self.assertNotIn("-ArgumentList '--settings'", script)
+        self.assertIn("WaitForExit($SettingsStartupTimeoutSeconds * 1000)", script)
         self.assertIn('"/DIR=`"$TestDir`""', script)
         self.assertIn('"/LOG=`"$InstallLog`""', script)
         self.assertIn('"/LOG=`"$RepairLog`""', script)

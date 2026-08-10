@@ -1,0 +1,7 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.9.0.schema.json
+# Szablon manifestu; wartości podstawia scripts/build-winget-manifest.ps1.
+PackageIdentifier: Szunias.Mowik
+PackageVersion: __VERSION__
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.9.0

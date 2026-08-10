@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.locale.1.9.0.schema.json
+# Szablon manifestu; wartości podstawia scripts/build-winget-manifest.ps1.
+PackageIdentifier: Szunias.Mowik
+PackageVersion: __VERSION__
+PackageLocale: pl-PL
+Publisher: Igor Szuniewicz
+PublisherUrl: https://github.com/Szunias
+PublisherSupportUrl: https://github.com/Szunias/Mowik/issues
+PackageName: Mówik
+PackageUrl: https://github.com/Szunias/Mowik
+License: MIT
+LicenseUrl: https://github.com/Szunias/Mowik/blob/main/LICENSE.txt
+Copyright: Copyright (c) 2026 Igor Szuniewicz
+ShortDescription: Prywatne dyktowanie działające lokalnie na Windowsie.
+Description: >-
+  Mówik zamienia mowę na tekst wyłącznie na twoim komputerze. Przytrzymaj
+  klawisz, powiedz zdanie, puść klawisz, a tekst trafi do aktywnego okna.
+  Rozpoznawanie działa lokalnie na silniku faster-whisper, więc nagrania
+  nie opuszczają komputera, a po pobraniu modelu aplikacja działa bez
+  internetu. W zestawie polski i angielski interfejs, własny słownik,
+  komendy głosowe oraz opcjonalne przyspieszenie na karcie graficznej.
+ReleaseNotesUrl: https://github.com/Szunias/Mowik/releases/tag/v__VERSION__
+ManifestType: locale
+ManifestVersion: 1.9.0

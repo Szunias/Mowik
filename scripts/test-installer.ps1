@@ -21,7 +21,11 @@ param(
     [string]$SignToolPath,
 
     [Parameter()]
-    [switch]$AllowLocalMachineMutation
+    [switch]$AllowLocalMachineMutation,
+
+    [Parameter()]
+    [ValidateRange(5, 600)]
+    [int]$SettingsStartupTimeoutSeconds = 120
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,6 +33,48 @@ Set-StrictMode -Version Latest
 
 $Root = Split-Path -Parent $PSScriptRoot
 $TempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+
+function Get-SettingsSmokeDiagnostics {
+    <#
+        Runner nie zachowuje katalogu testowego, więc powód porażki musi trafić
+        do komunikatu od razu; inaczej zostaje samo „nie utworzył konfiguracji”.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$SmokeRoot
+    )
+
+    $Lines = [Collections.Generic.List[string]]::new()
+    try {
+        $Files = @(
+            Get-ChildItem -LiteralPath $SmokeRoot -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object -First 40
+        )
+        if ($Files.Count -eq 0) {
+            $Lines.Add('Katalog testowy jest pusty.')
+        }
+        else {
+            $Lines.Add('Pliki utworzone przez panel ustawień:')
+            foreach ($File in $Files) {
+                $Lines.Add("  $($File.FullName.Substring($SmokeRoot.Length)) ($($File.Length) B)")
+            }
+        }
+
+        $LogPath = Join-Path $SmokeRoot 'Local\Mowik\mowik.log'
+        if (Test-Path -LiteralPath $LogPath -PathType Leaf) {
+            $Lines.Add('Ostatnie wpisy dziennika:')
+            foreach ($Entry in (Get-Content -LiteralPath $LogPath -Tail 25 -ErrorAction SilentlyContinue)) {
+                $Lines.Add("  $Entry")
+            }
+        }
+        else {
+            $Lines.Add('Panel ustawień nie założył nawet pliku dziennika.')
+        }
+    }
+    catch {
+        $Lines.Add("Nie udało się zebrać diagnostyki: $($_.Exception.Message)")
+    }
+    return [Environment]::NewLine + ($Lines -join [Environment]::NewLine)
+}
 if ([IO.Path]::GetFileName($InstallerFileName) -ne $InstallerFileName -or
     $InstallerFileName -notmatch '^Mowik-[0-9]+\.[0-9]+\.[0-9]+-Setup(?:-UNSIGNED)?\.exe$') {
     throw "Invalid installer file name: $InstallerFileName"
@@ -165,9 +211,15 @@ foreach ($SelectedLanguage in $Language) {
         }
 
         # Full dictation startup intentionally remains outside hosted CI: it
-        # needs a speech model and physical audio input. The Settings process
-        # is the safe packaged-GUI startup smoke and exercises frozen imports,
-        # Tk initialization and writable per-user configuration paths.
+        # needs a speech model and physical audio input.
+        #
+        # The smoke must not be `--settings`. Hosted Windows runners are
+        # elevated, and Mówik blocks elevated startup with a modal message box
+        # that nobody can dismiss there, so the process hangs until the job
+        # times out. `--runtime-gui-smoke-test` is exempt from that guard by
+        # design and still exercises frozen imports and Tk initialization.
+        # Writing per-user configuration is covered by the unit suite, which
+        # pins the elevation check instead of reading the real token.
         $SmokeAppData = Join-Path $SmokeRoot 'Roaming'
         $SmokeLocalData = Join-Path $SmokeRoot 'Local'
         New-Item -ItemType Directory -Path $SmokeAppData, $SmokeLocalData -ErrorAction Stop | Out-Null
@@ -178,15 +230,21 @@ foreach ($SelectedLanguage in $Language) {
             $env:LOCALAPPDATA = $SmokeLocalData
             $SettingsProcess = Start-Process `
                 -FilePath $AppExe `
-                -ArgumentList '--settings' `
+                -ArgumentList '--runtime-gui-smoke-test' `
                 -PassThru
-            Start-Sleep -Seconds 5
-            if ($SettingsProcess.HasExited) {
-                throw "Panel ustawień ($SelectedLanguage) zakończył się przed zakończeniem testu startu."
+            if (-not $SettingsProcess.WaitForExit($SettingsStartupTimeoutSeconds * 1000)) {
+                throw (
+                    "Zamrożony start GUI ($SelectedLanguage) nie zakończył się " +
+                    "w ciągu $SettingsStartupTimeoutSeconds s." +
+                    (Get-SettingsSmokeDiagnostics -SmokeRoot $SmokeRoot)
+                )
             }
-            $SmokeConfig = Join-Path $SmokeAppData 'Mowik\config.json'
-            if (-not (Test-Path -LiteralPath $SmokeConfig -PathType Leaf)) {
-                throw "Panel ustawień ($SelectedLanguage) nie utworzył izolowanej konfiguracji."
+            if ($SettingsProcess.ExitCode -ne 0) {
+                throw (
+                    "Zamrożony start GUI ($SelectedLanguage) zakończył się kodem " +
+                    "$($SettingsProcess.ExitCode)." +
+                    (Get-SettingsSmokeDiagnostics -SmokeRoot $SmokeRoot)
+                )
             }
         }
         finally {

@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+# Szablon manifestu; wartości podstawia scripts/build-winget-manifest.ps1.
+PackageIdentifier: Szunias.Mowik
+PackageVersion: __VERSION__
+PackageLocale: en-US
+Publisher: Igor Szuniewicz
+PublisherUrl: https://github.com/Szunias
+PublisherSupportUrl: https://github.com/Szunias/Mowik/issues
+PackageName: Mówik
+PackageUrl: https://github.com/Szunias/Mowik
+License: MIT
+LicenseUrl: https://github.com/Szunias/Mowik/blob/main/LICENSE.txt
+Copyright: Copyright (c) 2026 Igor Szuniewicz
+ShortDescription: Private, local push-to-talk dictation for Windows.
+Description: >-
+  Mówik turns speech into text entirely on your own computer. Hold a key,
+  talk, release, and the text is pasted into the active window. Speech
+  recognition runs locally with faster-whisper, so recordings never leave
+  the machine, and the app works offline once the selected model has been
+  downloaded. Polish and English interfaces, a custom dictionary, voice
+  commands, and optional GPU acceleration are included.
+Moniker: mowik
+Tags:
+  - dictation
+  - offline
+  - privacy
+  - speech-recognition
+  - speech-to-text
+  - transcription
+  - voice
+  - whisper
+ReleaseNotesUrl: https://github.com/Szunias/Mowik/releases/tag/v__VERSION__
+Documentations:
+  - DocumentLabel: Readme
+    DocumentUrl: https://github.com/Szunias/Mowik/blob/main/README.md
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

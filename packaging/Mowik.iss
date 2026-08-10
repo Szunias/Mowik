@@ -50,10 +50,12 @@ SourceDir=..
 Compression=lzma2/normal
 SolidCompression=no
 LZMANumBlockThreads=1
+; Bez AppMutex: instalator sam zamyka działającego Mówika przez Restart
+; Manager. Pytanie o zamknięcie aplikacji przerywało cichą instalację,
+; a na niej opiera się aktualizacja przez menedżery pakietów.
 CloseApplications=force
 CloseApplicationsFilter={#MyAppExeName}
 RestartApplications=no
-AppMutex=Local\MowikLocalDictation
 SetupLogging=yes
 UsePreviousAppDir=yes
 UsePreviousGroup=yes
