@@ -13768,6 +13768,27 @@ def runtime_gui_smoke_test_command() -> int:
             except Exception as exc:
                 print(f"Tk GUI cleanup failed: {exc}", file=sys.stderr)
                 status = 1
+
+    # Kapsuła dyktowania nie przechodzi przez Tk: rysuje ją Pillow, a na ekran
+    # trafia przez GDI. Sam test Tk nie wykryłby więc brakującego w bundlu
+    # ImageFilter, niezaładowanego kroju ani zepsutej konwersji do BGRA.
+    try:
+        frame = render_status_indicator_frame(
+            "recording",
+            3,
+            level=0.5,
+            label="Smoke test",
+        )
+        if frame.size != (STATUS_INDICATOR_WIDTH, STATUS_INDICATOR_HEIGHT):
+            raise AppError(f"Unexpected indicator frame size: {frame.size}")
+        if frame.getbbox() is None:
+            raise AppError("The indicator frame came out empty")
+        payload = _premultiplied_bgra(frame)
+        if len(payload) != frame.width * frame.height * 4:
+            raise AppError("Premultiplied indicator payload has a wrong size")
+    except Exception as exc:
+        print(f"Dictation indicator smoke test failed: {exc}", file=sys.stderr)
+        status = 1
     return status
 
 
