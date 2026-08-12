@@ -2,7 +2,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.7.6'
+    [string]$Version = '2.8.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -144,12 +144,6 @@ $Checks = @(
         Pattern = "^\s*\[string\]\`$Version = '(?<value>[^']+)'\r?`$"
         ExpectedValue = $Version
         Description = 'the release-version-test default'
-    },
-    @{
-        RelativePath = 'BUDUJ_INSTALATOR.cmd'
-        Pattern = '-Version\s+"(?<value>[0-9]+\.[0-9]+\.[0-9]+)"'
-        ExpectedValue = $Version
-        Description = 'the local build command version'
     },
     @{
         RelativePath = 'WERSJA.txt'

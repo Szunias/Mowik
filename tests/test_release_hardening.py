@@ -208,36 +208,58 @@ class ReleasePipelineHardeningTests(unittest.TestCase):
         self.assertIn("force_download=False", application)
         self.assertIn("force_download=True", application)
 
-    def test_installer_falls_back_to_runtime_cuda_probe_when_wmi_is_unavailable(
+    def test_source_installer_leaves_cuda_to_the_on_demand_downloader(
         self,
     ) -> None:
+        """Instalacja ze źródeł nie może wciągać CUDA do .venv.
+
+        Biblioteki GPU waża ~915 MB i są potrzebne dopiero przy pierwszym
+        użyciu karty. Pobiera je mowik_cuda do %LOCALAPPDATA%, poza katalogiem
+        aplikacji — dzięki temu raz ściągnięty komplet przeżywa aktualizacje.
+        Wcześniej install.ps1 instalował je zachłannie przy każdej instalacji.
+        """
+
         installer = (ROOT / "install.ps1").read_text(encoding="utf-8")
-        wmi_probe = installer.index("Get-CimInstance Win32_VideoController")
-        runtime_probe = installer.index("ctranslate2.get_cuda_device_count() > 0")
-        gpu_install = installer.index("requirements-gpu-hashed.txt", runtime_probe)
 
-        self.assertLess(wmi_probe, runtime_probe)
-        self.assertLess(runtime_probe, gpu_install)
+        self.assertNotIn("requirements-gpu-hashed.txt", installer)
+        self.assertNotIn("Get-CimInstance Win32_VideoController", installer)
+        self.assertNotIn("get_cuda_device_count", installer)
+        self.assertIn("mowik_cuda.py", installer)
 
-    def test_reused_environments_remove_only_the_orphaned_cudnn_distribution(
+    def test_release_build_still_removes_the_orphaned_cudnn_distribution(
         self,
     ) -> None:
-        sources = {
-            "install.ps1": (ROOT / "install.ps1").read_text(encoding="utf-8"),
-            "scripts/build-release.ps1": (
-                ROOT / "scripts" / "build-release.ps1"
-            ).read_text(encoding="utf-8"),
-        }
-        for name, source in sources.items():
-            with self.subTest(source=name):
-                self.assertIn("nvidia-cudnn-cu12", source)
-                self.assertIn("uninstall", source)
-                self.assertIn("--yes", source)
-                self.assertNotIn("pip freeze", source.casefold())
+        build = (ROOT / "scripts" / "build-release.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("nvidia-cudnn-cu12", build)
+        self.assertIn("uninstall", build)
+        self.assertIn("--yes", build)
+        self.assertNotIn("pip freeze", build.casefold())
 
         local_build = (ROOT / "BUDUJ_EXE.cmd").read_text(encoding="utf-8")
         self.assertIn("scripts\\build-release.ps1", local_build)
         self.assertNotIn("pip install", local_build)
+
+    def test_healthy_environment_is_reused_instead_of_reinstalled(self) -> None:
+        """Ponowna instalacja nie może pobierać 1,3 GB bez potrzeby.
+
+        Walidator porównuje środowisko z blokadą co do pakietu i sumy
+        kontrolnej, więc gdy przechodzi, nie ma czego instalować. Kasowanie
+        .venv zostaje wyłącznie dla NAPRAW_INSTALACJE.cmd.
+        """
+
+        installer = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        repair = (ROOT / "NAPRAW_INSTALACJE.cmd").read_text(encoding="utf-8")
+
+        self.assertIn("$ForceRebuild", installer)
+        self.assertIn("$ReusePrivateEnvironment", installer)
+        self.assertIn("-ForceRebuild", repair)
+        # Odtworzenie środowiska musi pozostać warunkowe.
+        reuse_guard = installer.index("if (-not $ReusePrivateEnvironment)")
+        removal = installer.index("Remove-PrivateEnvironment -Path $Venv")
+        self.assertLess(reuse_guard, removal)
 
     def test_frozen_build_preserves_redistributed_license_metadata(self) -> None:
         spec = (ROOT / "packaging" / "Mowik.spec").read_text(encoding="utf-8")
@@ -348,7 +370,7 @@ class ReleasePipelineHardeningTests(unittest.TestCase):
         self.assertIn("Stack[System.IO.DirectoryInfo]", installer)
         self.assertIn("$Pending.Push($Child)", installer)
         self.assertIn("Remove-PrivateEnvironment -Path $Venv", installer)
-        self.assertIn("-RemovePrivateEnvironmentOnly", repair)
+        self.assertIn("-ForceRebuild", repair)
         self.assertNotIn("rmdir /S /Q", repair)
 
     def test_source_installer_recreates_and_exactly_validates_runtime_venv(
@@ -456,7 +478,6 @@ class ReleasePipelineHardeningTests(unittest.TestCase):
         self.assertIn("--only-binary=:all:", installer)
         self.assertIn("requirements-bootstrap-hashed.txt", installer)
         self.assertIn("requirements-runtime-hashed.txt", installer)
-        self.assertIn("requirements-gpu-hashed.txt", installer)
         self.assertNotIn("pip install --upgrade pip setuptools wheel", installer)
 
     def test_inno_has_fail_closed_signed_and_explicit_unsigned_modes(self) -> None:

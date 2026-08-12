@@ -9,13 +9,20 @@ echo.
 choice /C YN /N /M "Kontynuowac? [Y/N]: "
 if errorlevel 2 exit /b 0
 
-echo Bezpiecznie usuwam uszkodzone srodowisko...
-powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0install.ps1" -RemovePrivateEnvironmentOnly
-if errorlevel 1 goto :remove_failed
-call "%~dp0ZAINSTALUJ.cmd"
-exit /b %ERRORLEVEL%
+echo Odtwarzam srodowisko od zera...
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" -ForceRebuild
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" goto :repair_failed
 
-:remove_failed
-echo Nie udalo sie bezpiecznie usunac .venv. Zamknij Mowik i sprobuj ponownie.
+echo.
+echo Naprawa zakonczona. Uruchamiam Mowik...
+call "%~dp0URUCHOM.cmd"
+exit /b 0
+
+:repair_failed
+echo.
+echo Naprawa nie powiodla sie. Kod bledu: %RC%
+echo Szczegoly sa w pliku: %~dp0instalacja.log
+echo Zamknij Mowik i sprobuj ponownie.
 pause
-exit /b 1
+exit /b %RC%

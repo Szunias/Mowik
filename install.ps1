@@ -1,7 +1,12 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [switch]$RemovePrivateEnvironmentOnly
+    [switch]$RemovePrivateEnvironmentOnly,
+    # Wymusza odtworzenie .venv nawet wtedy, gdy jest zgodne z blokada.
+    # Uzywa tego NAPRAW_INSTALACJE.cmd; zwykla instalacja ponownie wykorzystuje
+    # sprawne srodowisko zamiast pobierac okolo 1,3 GB od nowa.
+    [Parameter()]
+    [switch]$ForceRebuild
 )
 
 Set-StrictMode -Version 2.0
@@ -314,17 +319,6 @@ try {
     $VenvPython = Join-Path $Venv "Scripts\python.exe"
     $VenvPythonW = Join-Path $Venv "Scripts\pythonw.exe"
 
-    Write-Host "[2/6] Sprawdzam prywatne srodowisko programu..."
-    if (Test-Path -LiteralPath $Venv) {
-        Write-Host "Odtwarzam prywatne srodowisko .venv od zera..."
-        Remove-PrivateEnvironment -Path $Venv
-    }
-    & $PythonExe @PythonPrefix -I -S -m venv $Venv
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $VenvPython)) {
-        throw "Nie udalo sie utworzyc srodowiska .venv."
-    }
-
-    Write-Host "[3/6] Weryfikuje narzedzia i blokade bibliotek..."
     $BootstrapRequirements = Join-Path $Root "requirements-bootstrap-hashed.txt"
     $RuntimeRequirements = Join-Path $Root "requirements-runtime-hashed.txt"
     if (-not (Test-Path -LiteralPath $BootstrapRequirements -PathType Leaf)) {
@@ -333,69 +327,69 @@ try {
     if (-not (Test-Path -LiteralPath $RuntimeRequirements -PathType Leaf)) {
         throw "Brak zweryfikowanej blokady bibliotek: $RuntimeRequirements"
     }
-
-    & $VenvPython -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-deps -r $BootstrapRequirements
-    if ($LASTEXITCODE -ne 0) {
-        throw "Bezpieczna aktualizacja pip nie powiodla sie."
-    }
-
-    Write-Host "[4/6] Instaluje biblioteki Mowika..."
-    & $VenvPython -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-deps -r $RuntimeRequirements
-    if ($LASTEXITCODE -ne 0) {
-        throw "Instalacja bibliotek nie powiodla sie."
-    }
-
-    & $VenvPython -c "import importlib.metadata as m; raise SystemExit(0 if any(d.metadata.get('Name','').lower().replace('_','-') == 'nvidia-cudnn-cu12' for d in m.distributions()) else 1)" *> $null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Usuwam nieuzywany, pozostaly runtime cuDNN..."
-        & $VenvPython -m pip uninstall --yes nvidia-cudnn-cu12
-        if ($LASTEXITCODE -ne 0) {
-            throw "Nie udalo sie usunac pozostalego pakietu nvidia-cudnn-cu12."
-        }
-    }
-
-    $HasNvidiaGpu = $false
-    try {
-        $NvidiaController = Get-CimInstance Win32_VideoController -ErrorAction Stop |
-            Where-Object { [string]$_.Name -match "(?i)NVIDIA" } |
-            Select-Object -First 1
-        $HasNvidiaGpu = $null -ne $NvidiaController
-    } catch {
-        Write-Host "Nie udalo sie sprawdzic karty NVIDIA przez WMI; probuje sterownik CUDA."
-    }
-    if (-not $HasNvidiaGpu) {
-        & $VenvPython -c "import ctranslate2; raise SystemExit(0 if ctranslate2.get_cuda_device_count() > 0 else 1)" *> $null
-        $HasNvidiaGpu = $LASTEXITCODE -eq 0
-    }
-    $GpuRequirements = Join-Path $Root "requirements-gpu-hashed.txt"
-    $GpuRuntimeInstalled = $false
-    if ($HasNvidiaGpu -and (Test-Path -LiteralPath $GpuRequirements)) {
-        Write-Host "Wykryto NVIDIA. Instaluje lokalny runtime CUDA 12 (jednorazowo)..."
-        & $VenvPython -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-deps -r $GpuRequirements
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Runtime NVIDIA nie zainstalowal sie; Mowik nadal zadziala na CPU."
-        } else {
-            $GpuRuntimeInstalled = $true
-        }
-    }
-
-    & $VenvPython -m pip check
-    if ($LASTEXITCODE -ne 0) {
-        throw "Zainstalowane biblioteki maja niespojne zaleznosci."
-    }
-
     $EnvironmentValidator = Join-Path $Root "scripts\test-release-environment.py"
-    $EnvironmentLocks = @($BootstrapRequirements, $RuntimeRequirements)
-    if ($GpuRuntimeInstalled) {
-        $EnvironmentLocks += $GpuRequirements
-    }
     if (-not (Test-Path -LiteralPath $EnvironmentValidator -PathType Leaf)) {
         throw "Brak walidatora prywatnego srodowiska: $EnvironmentValidator"
     }
-    & $VenvPython $EnvironmentValidator @EnvironmentLocks
-    if ($LASTEXITCODE -ne 0) {
-        throw "Prywatne srodowisko nie odpowiada dokladnie blokadzie bibliotek."
+    $EnvironmentLocks = @($BootstrapRequirements, $RuntimeRequirements)
+
+    Write-Host "[2/6] Sprawdzam prywatne srodowisko programu..."
+    # Walidator porownuje srodowisko z blokada co do pakietu i sumy kontrolnej.
+    # Jesli przechodzi, nie ma czego instalowac: ponowna instalacja oznaczalaby
+    # pobranie okolo 1,3 GB tylko po to, by odtworzyc to samo. Kasujemy .venv
+    # dopiero wtedy, gdy naprawde sie rozjechalo.
+    $ReusePrivateEnvironment = $false
+    if ((-not $ForceRebuild) -and (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+        Write-Host "Znalazlem istniejace .venv; sprawdzam jego zgodnosc z blokada..."
+        & $VenvPython $EnvironmentValidator @EnvironmentLocks *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $ReusePrivateEnvironment = $true
+            Write-Host "Srodowisko jest kompletne i zgodne — pomijam pobieranie bibliotek."
+        } else {
+            Write-Host "Srodowisko odbiega od blokady — odtwarzam je od zera."
+        }
     }
+
+    if (-not $ReusePrivateEnvironment) {
+        if (Test-Path -LiteralPath $Venv) {
+            Write-Host "Odtwarzam prywatne srodowisko .venv od zera..."
+            Remove-PrivateEnvironment -Path $Venv
+        }
+        & $PythonExe @PythonPrefix -I -S -m venv $Venv
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $VenvPython)) {
+            throw "Nie udalo sie utworzyc srodowiska .venv."
+        }
+
+        Write-Host "[3/6] Weryfikuje narzedzia i blokade bibliotek..."
+        & $VenvPython -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-deps -r $BootstrapRequirements
+        if ($LASTEXITCODE -ne 0) {
+            throw "Bezpieczna aktualizacja pip nie powiodla sie."
+        }
+
+        Write-Host "[4/6] Instaluje biblioteki Mowika..."
+        & $VenvPython -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: --no-deps -r $RuntimeRequirements
+        if ($LASTEXITCODE -ne 0) {
+            throw "Instalacja bibliotek nie powiodla sie."
+        }
+
+        & $VenvPython -m pip check
+        if ($LASTEXITCODE -ne 0) {
+            throw "Zainstalowane biblioteki maja niespojne zaleznosci."
+        }
+
+        & $VenvPython $EnvironmentValidator @EnvironmentLocks
+        if ($LASTEXITCODE -ne 0) {
+            throw "Prywatne srodowisko nie odpowiada dokladnie blokadzie bibliotek."
+        }
+    } else {
+        Write-Host "[3/6] Blokada bibliotek juz zweryfikowana — pomijam."
+        Write-Host "[4/6] Biblioteki Mowika sa na miejscu — pomijam pobieranie."
+    }
+
+    # Biblioteki CUDA nie sa juz instalowane do .venv. Mowik pobiera je na
+    # zadanie do %LOCALAPPDATA%\Mowik przy pierwszym uzyciu GPU (mowik_cuda.py),
+    # dzieki czemu 915 MB nie leci przy kazdej instalacji, a raz pobrany komplet
+    # przezywa aktualizacje aplikacji.
 
     Write-Host "Sprawdzam import bibliotek..."
     & $VenvPython -c "import faster_whisper,ctranslate2,numpy,sounddevice,pynput,pystray,pyperclip,PIL; print('Biblioteki: OK')"
@@ -420,7 +414,7 @@ try {
         throw "Brakuje pythonw.exe w srodowisku .venv."
     }
 
-    Set-Content -LiteralPath (Join-Path $Root ".installed") -Value "Mowik 2.7.6" -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Root ".installed") -Value "Mowik 2.8.0" -Encoding ASCII
     Write-Host ""
     Write-Host "INSTALACJA ZAKONCZONA POMYSLNIE" -ForegroundColor Green
     Write-Host "Przytrzymaj F8, powiedz zdanie i pusc F8."

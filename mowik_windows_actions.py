@@ -282,19 +282,43 @@ def _explorer_path_from_com(hwnd: int) -> Optional[Path]:
         import pythoncom  # type: ignore[import-not-found]
         import win32com.client  # type: ignore[import-not-found]
 
+        def collect_paths() -> set[Path]:
+            """Zbierz ścieżki i porzuć wszystkie wskaźniki COM przed wyjściem.
+
+            CoUninitialize() zamyka apartament, więc żaden interfejs nie może
+            go przeżyć. Wcześniej ``shell`` i kolekcja okien były zmiennymi
+            zewnętrznej ramki i wciąż żyły w chwili zamknięcia apartamentu —
+            klasyczne źródło wyciekających proxy przy każdym naciśnięciu skrótu.
+            """
+
+            shell = None
+            windows = None
+            try:
+                shell = win32com.client.Dispatch("Shell.Application")
+                windows = shell.Windows()
+                found: set[Path] = set()
+                for window in windows:
+                    try:
+                        if int(window.HWND) != hwnd:
+                            continue
+                        path = _canonical_local_directory(
+                            window.Document.Folder.Self.Path
+                        )
+                        if path is not None:
+                            found.add(path)
+                    except Exception:
+                        continue
+                return found
+            except Exception:
+                return set()
+            finally:
+                window = None
+                windows = None
+                shell = None
+
         pythoncom.CoInitialize()
         initialized = True
-        shell = win32com.client.Dispatch("Shell.Application")
-        matches: set[Path] = set()
-        for window in shell.Windows():
-            try:
-                if int(window.HWND) != hwnd:
-                    continue
-                path = _canonical_local_directory(window.Document.Folder.Self.Path)
-                if path is not None:
-                    matches.add(path)
-            except Exception:
-                continue
+        matches = collect_paths()
         # Kilka kart Explorera może współdzielić HWND. Nie zgadujemy aktywnej karty.
         return next(iter(matches)) if len(matches) == 1 else None
     except Exception:

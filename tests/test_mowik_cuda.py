@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import zipfile
@@ -61,9 +63,30 @@ class PinnedPackageTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "mowik.py"
         ).read_text(encoding="utf-8")
 
-        for name in cuda.REQUIRED_LIBRARIES:
+        for name in cuda.PRELOADED_LIBRARIES:
             with self.subTest(library=name):
                 self.assertIn(Path(name).name, source)
+
+    def test_required_libraries_cover_every_downloaded_package(self) -> None:
+        """Komplet musi obejmować każdy pobierany pakiet, nie tylko cuBLAS.
+
+        Inaczej przerwane rozpakowanie po zapisaniu cuBLAS przechodzi jako
+        gotowy komplet, a GPU pada dopiero przy pierwszej transkrypcji.
+        """
+
+        for package in cuda.CUDA_PACKAGES:
+            directory = package.member_prefix.removeprefix("nvidia/").rstrip("/")
+            with self.subTest(package=package.project):
+                self.assertTrue(
+                    any(
+                        name.startswith(f"{directory}/")
+                        for name in cuda.REQUIRED_LIBRARIES
+                    ),
+                    f"Brak weryfikacji plików z {package.project}",
+                )
+
+        for name in cuda.PRELOADED_LIBRARIES:
+            self.assertIn(name, cuda.REQUIRED_LIBRARIES)
 
 
 class DownloadUrlTests(unittest.TestCase):
@@ -308,6 +331,58 @@ class EnsureRuntimeTests(unittest.TestCase):
         self.assertFalse(self.root.exists())
         leftovers = list(self.root.parent.glob(f"{self.root.name}.*"))
         self.assertEqual(leftovers, [])
+
+
+class DiscardStaleDownloadsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.parent = Path(directory.name)
+        self.root = self.parent / "cuda-12.9"
+
+    def make_directory(self, name: str, age_seconds: float = 0.0) -> Path:
+        path = self.parent / name
+        path.mkdir()
+        (path / "payload.bin").write_bytes(b"x")
+        if age_seconds:
+            stamp = time.time() - age_seconds
+            os.utime(path, (stamp, stamp))
+        return path
+
+    def test_removes_abandoned_staging_directories(self) -> None:
+        """Zabity proces zostawiał katalog roboczy z setkami MB na zawsze."""
+
+        abandoned = self.make_directory(
+            f"{self.root.name}.4242.deadbeef.tmp",
+            age_seconds=2 * cuda.STALE_DOWNLOAD_SECONDS,
+        )
+
+        self.assertEqual(cuda.discard_stale_downloads(self.root), 1)
+        self.assertFalse(abandoned.exists())
+
+    def test_keeps_staging_directory_of_a_running_download(self) -> None:
+        fresh = self.make_directory(f"{self.root.name}.777.feedface.tmp")
+
+        self.assertEqual(cuda.discard_stale_downloads(self.root), 0)
+        self.assertTrue(fresh.exists())
+
+    def test_removes_previous_layout_but_keeps_the_current_one(self) -> None:
+        previous = self.make_directory("cuda-12.4")
+        current = self.make_directory(self.root.name)
+
+        self.assertEqual(cuda.discard_stale_downloads(self.root), 1)
+        self.assertFalse(previous.exists())
+        self.assertTrue(current.exists())
+
+    def test_ignores_unrelated_directories_and_missing_parent(self) -> None:
+        models = self.make_directory("models")
+
+        self.assertEqual(cuda.discard_stale_downloads(self.root), 0)
+        self.assertTrue(models.exists())
+        self.assertEqual(
+            cuda.discard_stale_downloads(self.parent / "missing" / "cuda-12.9"),
+            0,
+        )
 
 
 if __name__ == "__main__":

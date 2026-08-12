@@ -18,6 +18,7 @@ import os
 import shutil
 import ssl
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -73,11 +74,23 @@ CUDA_PACKAGES: tuple[CudaPackage, ...] = (
     ),
 )
 
-# Te dwie biblioteki decydują, czy komplet nadaje się do użycia; ładuje je
-# jawnie configure_cuda_dll_search_paths().
-REQUIRED_LIBRARIES: tuple[str, ...] = (
+# Te dwie biblioteki configure_cuda_dll_search_paths() ładuje jawnie, pełną
+# ścieżką — one decydują o wyborze dostawcy cuBLAS.
+PRELOADED_LIBRARIES: tuple[str, ...] = (
     "cublas/bin/cublasLt64_12.dll",
     "cublas/bin/cublas64_12.dll",
+)
+
+# Komplet, który musi istnieć, by pobranie uznać za udane. To szerszy zbiór niż
+# preloadowany: NVRTC ładuje dopiero CTranslate2 w trakcie inferencji, więc gdy
+# sprawdzaliśmy sam cuBLAS, brakujący NVRTC (antywirus, ręczne czyszczenie,
+# przerwane rozpakowanie po zapisaniu cuBLAS) przechodził jako komplet, a GPU
+# padało dopiero przy pierwszej transkrypcji.
+# Celowo bez nvrtc-builtins64_*.dll: ta nazwa nosi numer wersji CUDA, więc po
+# podbiciu pakietu dawałaby fałszywe "niekompletne". Oba pliki pochodzą z tego
+# samego wheela, więc obecność głównego wystarcza jako sygnał.
+REQUIRED_LIBRARIES: tuple[str, ...] = PRELOADED_LIBRARIES + (
+    "cuda_nvrtc/bin/nvrtc64_120_0.dll",
 )
 
 ProgressCallback = Callable[[int, Optional[int]], None]
@@ -262,6 +275,51 @@ def extract_libraries(archive_path: Path, root: Path, prefix: str) -> int:
     return extracted
 
 
+STALE_DOWNLOAD_SECONDS = 24 * 60 * 60
+
+
+def discard_stale_downloads(
+    root: Path,
+    *,
+    maximum_age_seconds: float = STALE_DOWNLOAD_SECONDS,
+) -> int:
+    """Usuń porzucone katalogi pobierania i komplety w starym układzie.
+
+    Katalog roboczy jest sprzątany tylko wtedy, gdy pobieranie zakończy się
+    normalnie albo wyjątkiem. Zabicie procesu w trakcie ściągania ~600 MB
+    zostawiało go na dysku na zawsze, a każda kolejna próba tworzyła nowy.
+    Zmiana ``CUDA_RUNTIME_LAYOUT`` zostawiała z kolei cały poprzedni komplet.
+    """
+
+    parent = root.parent
+    removed = 0
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return 0
+    cutoff = time.time() - max(0.0, float(maximum_age_seconds))
+    for entry in entries:
+        if not entry.is_dir() or entry == root:
+            continue
+        name = entry.name
+        stale_download = name.startswith(f"{root.name}.") and name.endswith(".tmp")
+        # Katalogi innych układów rozpoznajemy po prefiksie "cuda-"; bieżący
+        # został już wykluczony powyżej.
+        stale_layout = name.startswith("cuda-") and not name.endswith(".tmp")
+        if not stale_download and not stale_layout:
+            continue
+        if stale_download:
+            try:
+                if entry.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            removed += 1
+    return removed
+
+
 def ensure_runtime(
     root: Path,
     *,
@@ -274,6 +332,7 @@ def ensure_runtime(
     if is_runtime_complete(root):
         return root
 
+    discard_stale_downloads(root)
     context = ssl_context if ssl_context is not None else _create_ssl_context()
     staging = root.with_name(f"{root.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:

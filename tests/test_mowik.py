@@ -458,6 +458,42 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertFalse(app.model_ready.is_set())
         recorder.close.assert_called_once_with()
 
+    def test_shutdown_flag_without_handover_still_closes_the_microphone(
+        self,
+    ) -> None:
+        """Zamknięcie w trakcie ładowania nie może osierocić strumienia.
+
+        Odtwarza wąskie okno, w którym shutdown() ustawił już flagę, ale nie
+        zdążył przejąć recordera z pola. Wtedy zamknięcie należy do wątku
+        ładującego — inaczej mikrofon zostaje otwarty do końca procesu.
+        """
+
+        config = copy.deepcopy(mowik.DEFAULT_CONFIG)
+        config["feedback"]["floating_indicator"] = False
+        app = mowik.MowikApp(config)
+        recorder = mock.Mock()
+
+        def flag_shutdown_without_handover(*_args):
+            with app._shutdown_lock:
+                app._shutdown_started = True
+            return object(), "small", "cpu"
+
+        with mock.patch.object(
+            mowik,
+            "ContinuousRecorder",
+            return_value=recorder,
+        ), mock.patch.object(
+            mowik,
+            "create_model",
+            side_effect=flag_shutdown_without_handover,
+        ), mock.patch.object(app, "set_status"):
+            app._load_runtime()
+
+        self.assertIsNone(app.recorder)
+        self.assertIsNone(app.model)
+        self.assertFalse(app.model_ready.is_set())
+        recorder.close.assert_called_once_with()
+
     def test_model_ready_does_not_hide_disconnected_microphone_status(self) -> None:
         config = copy.deepcopy(mowik.DEFAULT_CONFIG)
         config["feedback"]["floating_indicator"] = False
@@ -1993,14 +2029,22 @@ class ShortcutCaptureTests(unittest.TestCase):
 
 class StatusIndicatorTests(unittest.TestCase):
     def test_indicator_position_uses_monitor_work_area(self) -> None:
+        expected_y = (
+            1040
+            - mowik.STATUS_INDICATOR_BOTTOM_MARGIN
+            - mowik.STATUS_INDICATOR_HEIGHT
+        )
         self.assertEqual(
             mowik.status_indicator_window_position((0, 0, 1920, 1040)),
-            (788, 930),
+            ((1920 - mowik.STATUS_INDICATOR_WIDTH) // 2, expected_y),
         )
         x, y = mowik.status_indicator_window_position(
             (-1920, 0, 0, 1040)
         )
-        self.assertEqual((x, y), (-1132, 930))
+        self.assertEqual(
+            (x, y),
+            (-1920 + (1920 - mowik.STATUS_INDICATOR_WIDTH) // 2, expected_y),
+        )
 
     def test_indicator_position_clamps_scaled_windows_to_each_work_area(self) -> None:
         cases = (

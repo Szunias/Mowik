@@ -45,7 +45,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.7.6"
+APP_VERSION = "2.8.0"
 
 
 def _run_early_read_only_probe(
@@ -339,7 +339,7 @@ if not console_streams_available():
     disable_progress_bars()
 
 import ctranslate2
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from pynput import keyboard, mouse
 import pystray
 import pyperclip
@@ -1896,6 +1896,12 @@ def parse_restart_request_timestamp_ns(value: str) -> Optional[int]:
 def take_fresh_restart_request(not_before_ns: int) -> Optional[str]:
     """Atomowo przejmij request i odrzuć plik pochodzący ze starego procesu."""
 
+    # Ta funkcja jest odpytywana prawie trzy razy na sekundę przez cały czas
+    # życia procesu, a plik żądania pojawia się raz na kilka minut w najlepszym
+    # razie. Tani test istnienia oszczędza os.replace i uuid4 na każdą próbę;
+    # atomowość przejęcia zapewnia i tak dopiero os.replace poniżej.
+    if not RESTART_REQUEST_PATH.exists():
+        return None
     claimed_path = RESTART_REQUEST_PATH.with_name(
         f"{RESTART_REQUEST_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.claimed"
     )
@@ -2813,6 +2819,11 @@ def open_custom_command_target(
                 error=exc,
             )
         ) from exc
+
+
+# Sygnał zwrotny własnej komendy: status końcowy jest już ustawiony i
+# wywołujący nie powinien go nadpisywać domyślnym "Gotowy".
+COMMAND_STATUS_HANDLED = "handled"
 
 
 @dataclass(frozen=True)
@@ -4066,11 +4077,28 @@ STATUS_INDICATOR_STATES = frozenset(
         "command_success",
     }
 )
-STATUS_INDICATOR_WIDTH = 344
-STATUS_INDICATOR_HEIGHT = 76
+# Okno jest większe niż sama kapsuła: nadmiarowy margines mieści rozmyty cień
+# i akcentową poświatę, które przy warstwowym oknie są naprawdę przezroczyste.
+STATUS_INDICATOR_WIDTH = 360
+STATUS_INDICATOR_HEIGHT = 112
+STATUS_INDICATOR_MARGIN_X = 22
+STATUS_INDICATOR_MARGIN_TOP = 20
+STATUS_INDICATOR_MARGIN_BOTTOM = 24
 # Zachowany alias dla prostych integracji i starszych testów renderera.
 STATUS_INDICATOR_SIZE = STATUS_INDICATOR_HEIGHT
-STATUS_INDICATOR_BOTTOM_MARGIN = 34
+# Odstęp mierzony do krawędzi okna; wizualnie kapsuła siedzi o margines wyżej.
+STATUS_INDICATOR_BOTTOM_MARGIN = 12
+# Każdy stan dostaje parę barw; gradient między nimi biegnie przez wizualizator
+# i pierścień ikony, dzięki czemu kapsuła czyta się jako jeden obiekt.
+STATUS_INDICATOR_ACCENTS: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
+    "recording": ((56, 189, 248), (129, 140, 248)),
+    "command": ((192, 132, 252), (244, 114, 182)),
+    "processing": ((45, 212, 191), (56, 189, 248)),
+    "success": ((52, 211, 153), (110, 231, 183)),
+    "error": ((248, 113, 113), (251, 146, 60)),
+}
+STATUS_INDICATOR_SURFACE_TOP = (26, 32, 52)
+STATUS_INDICATOR_SURFACE_BOTTOM = (12, 15, 27)
 STATUS_INDICATOR_MIN_PROCESSING_SECONDS = 0.25
 STATUS_INDICATOR_SUCCESS_SECONDS = 1.8
 STATUS_INDICATOR_ERROR_SECONDS = 1.35
@@ -4195,6 +4223,141 @@ def _status_indicator_fit_text(
     return "".join(clusters[:low]).rstrip() + ellipsis
 
 
+def _indicator_mix(
+    first: tuple[int, int, int],
+    second: tuple[int, int, int],
+    position: float,
+) -> tuple[int, int, int]:
+    """Zmieszaj dwie barwy akcentu w podanym punkcie gradientu."""
+
+    position = min(1.0, max(0.0, float(position)))
+    return tuple(  # type: ignore[return-value]
+        int(round(first[index] + (second[index] - first[index]) * position))
+        for index in range(3)
+    )
+
+
+@lru_cache(maxsize=8)
+def _indicator_capsule_body(
+    size: tuple[int, int],
+    radius: int,
+) -> Image.Image:
+    """Korpus kapsuły z pionowym gradientem zamiast sztucznego połysku."""
+
+    body_width, body_height = size
+    column = Image.new("RGB", (1, body_height))
+    pixels = column.load()
+    for row in range(body_height):
+        pixels[0, row] = _indicator_mix(
+            STATUS_INDICATOR_SURFACE_TOP,
+            STATUS_INDICATOR_SURFACE_BOTTOM,
+            row / max(1, body_height - 1),
+        )
+    body = column.resize(size, Image.Resampling.BILINEAR).convert("RGBA")
+    mask = Image.new("L", (body_width * 2, body_height * 2), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, body_width * 2 - 1, body_height * 2 - 1),
+        radius=radius * 2,
+        fill=252,
+    )
+    body.putalpha(mask.resize(size, Image.Resampling.LANCZOS))
+    return body
+
+
+@lru_cache(maxsize=6)
+def _indicator_chrome(
+    size: tuple[int, int],
+    box: tuple[int, int, int, int],
+    radius: int,
+    accent: tuple[int, int, int],
+    scale: int,
+) -> Image.Image:
+    """Nieruchome tło kapsuły: cień, poświata, korpus i obwódka.
+
+    Nic tutaj nie zależy od numeru klatki ani od poziomu mikrofonu, więc cała
+    warstwa jest liczona raz na stan i tylko kopiowana przy 20 kl./s. Cień i
+    poświata powstają w rozdzielczości docelowej — rozmycie i tak zjada
+    schodki, a rozmywanie płótna 3× było najdroższą operacją klatki.
+    """
+
+    width, height = size
+    left, top, right, bottom = box
+    shadow = Image.new("RGBA", size, (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (left, top + 5, right, bottom + 5),
+        radius=radius,
+        fill=(2, 6, 23, 170),
+    )
+    chrome = shadow.filter(ImageFilter.GaussianBlur(7))
+    glow = Image.new("RGBA", size, (0, 0, 0, 0))
+    ImageDraw.Draw(glow).rounded_rectangle(
+        box,
+        radius=radius,
+        fill=(*accent, 70),
+    )
+    chrome.alpha_composite(glow.filter(ImageFilter.GaussianBlur(9)))
+    chrome = chrome.resize(
+        (width * scale, height * scale),
+        Image.Resampling.BILINEAR,
+    )
+    chrome.alpha_composite(
+        _indicator_capsule_body(
+            ((right - left) * scale, (bottom - top) * scale),
+            radius * scale,
+        ),
+        (left * scale, top * scale),
+    )
+    ImageDraw.Draw(chrome).rounded_rectangle(
+        (left * scale, top * scale, right * scale, bottom * scale),
+        radius=radius * scale,
+        outline=(*_indicator_mix(accent, (148, 163, 184), 0.45), 125),
+        width=scale,
+    )
+    return chrome
+
+
+def _indicator_microphone(
+    draw: ImageDraw.ImageDraw,
+    center_x: float,
+    center_y: float,
+    size: float,
+    color: tuple[int, int, int],
+) -> None:
+    """Sylwetka mikrofonu — czytelniejsza niż abstrakcyjna kropka."""
+
+    body_width = size * 0.52
+    body_height = size * 0.78
+    draw.rounded_rectangle(
+        (
+            center_x - body_width / 2,
+            center_y - body_height / 2 - size * 0.08,
+            center_x + body_width / 2,
+            center_y + body_height * 0.16,
+        ),
+        radius=body_width / 2,
+        fill=(*color, 255),
+    )
+    arc_radius = size * 0.46
+    stroke = max(1, int(size * 0.13))
+    draw.arc(
+        (
+            center_x - arc_radius,
+            center_y - arc_radius * 0.72,
+            center_x + arc_radius,
+            center_y + arc_radius,
+        ),
+        start=15,
+        end=165,
+        fill=(*color, 255),
+        width=stroke,
+    )
+    draw.line(
+        (center_x, center_y + size * 0.42, center_x, center_y + size * 0.62),
+        fill=(*color, 255),
+        width=stroke,
+    )
+
+
 def render_status_indicator_frame(
     state: str,
     frame: int = 0,
@@ -4219,7 +4382,6 @@ def render_status_indicator_frame(
     scale = 3
     canvas_width = width * scale
     canvas_height = height * scale
-    image = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
     if state == "hidden":
         return Image.new(
             "RGBA",
@@ -4228,237 +4390,237 @@ def render_status_indicator_frame(
         )
     command_mode = state.startswith("command_")
     base_state = state.removeprefix("command_")
+
+    if base_state == "error":
+        accent, accent_end = STATUS_INDICATOR_ACCENTS["error"]
+    elif command_mode:
+        accent, accent_end = STATUS_INDICATOR_ACCENTS["command"]
+    elif base_state == "success":
+        accent, accent_end = STATUS_INDICATOR_ACCENTS["success"]
+    elif base_state == "processing":
+        accent, accent_end = STATUS_INDICATOR_ACCENTS["processing"]
+    else:
+        accent, accent_end = STATUS_INDICATOR_ACCENTS["recording"]
+    soft_accent = (*_indicator_mix(accent_end, (255, 255, 255), 0.28), 255)
+
+    capsule_left = STATUS_INDICATOR_MARGIN_X
+    capsule_top = STATUS_INDICATOR_MARGIN_TOP
+    capsule_right = width - STATUS_INDICATOR_MARGIN_X
+    capsule_bottom = height - STATUS_INDICATOR_MARGIN_BOTTOM
+    capsule_height = capsule_bottom - capsule_top
+    capsule_radius = capsule_height // 2
+
+    image = _indicator_chrome(
+        (width, height),
+        (capsule_left, capsule_top, capsule_right, capsule_bottom),
+        capsule_radius,
+        accent,
+        scale,
+    ).copy()
     draw = ImageDraw.Draw(image)
-    radius = int(canvas_height * 0.42)
-    inset = 4 * scale
-    shadow_box = (
-        inset,
-        inset + 2 * scale,
-        canvas_width - inset,
-        canvas_height - inset,
-    )
-    draw.rounded_rectangle(
-        shadow_box,
-        radius=radius,
-        fill=(2, 6, 23, 118),
-    )
-    capsule_box = (
-        inset,
-        inset,
-        canvas_width - inset,
-        canvas_height - inset - 2 * scale,
-    )
-    draw.rounded_rectangle(
-        capsule_box,
-        radius=radius,
-        fill=(9, 15, 29, 248),
-        outline=(71, 85, 105, 175),
-        width=scale,
-    )
-    draw.rounded_rectangle(
-        (
-            inset + scale,
-            inset + scale,
-            canvas_width - inset - scale,
-            int(canvas_height * 0.48),
-        ),
-        radius=max(scale, radius - scale),
-        fill=(20, 30, 48, 255),
-    )
 
-    accent = (168, 85, 247, 255) if command_mode else (34, 211, 238, 255)
-    soft_accent = (
-        (196, 181, 253, 225) if command_mode else (103, 232, 249, 225)
-    )
-    if base_state == "success" and not command_mode:
-        accent = (34, 197, 94, 255)
-        soft_accent = (134, 239, 172, 225)
-    elif base_state == "error":
-        accent = (239, 68, 68, 255)
-        soft_accent = (252, 165, 165, 225)
-
-    icon_x = int(39 * scale)
-    icon_y = canvas_height // 2 - scale
-    icon_radius = int(21 * scale)
-    draw.ellipse(
-        (
-            icon_x - icon_radius,
-            icon_y - icon_radius,
-            icon_x + icon_radius,
-            icon_y + icon_radius,
-        ),
-        fill=(15, 23, 42, 255),
-        outline=(51, 65, 85, 230),
-        width=scale,
-    )
+    icon_x = (capsule_left + 24) * scale
+    icon_y = (capsule_top + capsule_height // 2) * scale
+    icon_radius = 17 * scale
 
     if base_state == "recording":
-        pulse = (math.sin(int(frame) * 0.32) + 1.0) / 2.0
-        pulse_radius = int((14.5 + 2.0 * pulse + 2.5 * level) * scale)
+        # Oddech ikony niesie informację o poziomie mikrofonu również wtedy,
+        # gdy wizualizator zasłoni długa etykieta.
+        pulse = (math.sin(int(frame) * 0.28) + 1.0) / 2.0
+        halo_radius = icon_radius * (0.95 + 0.28 * pulse + 0.12 * level)
+        # Rozmycie liczone na kwadraciku wokół ikony, a nie na całym płótnie —
+        # różnica to rząd wielkości w koszcie klatki.
+        halo_blur = 4 * scale
+        halo_span = int(halo_radius + halo_blur * 3)
+        halo = Image.new("RGBA", (halo_span * 2, halo_span * 2), (0, 0, 0, 0))
+        ImageDraw.Draw(halo).ellipse(
+            (
+                halo_span - halo_radius,
+                halo_span - halo_radius,
+                halo_span + halo_radius,
+                halo_span + halo_radius,
+            ),
+            fill=(*accent, 90),
+        )
+        image.alpha_composite(
+            halo.filter(ImageFilter.GaussianBlur(halo_blur)),
+            (int(icon_x) - halo_span, int(icon_y) - halo_span),
+        )
+        draw = ImageDraw.Draw(image)
         draw.ellipse(
             (
-                icon_x - pulse_radius,
-                icon_y - pulse_radius,
-                icon_x + pulse_radius,
-                icon_y + pulse_radius,
+                icon_x - icon_radius,
+                icon_y - icon_radius,
+                icon_x + icon_radius,
+                icon_y + icon_radius,
             ),
-            outline=soft_accent,
-            width=2 * scale,
+            fill=(*_indicator_mix(accent, (10, 14, 26), 0.72), 255),
+            outline=(*accent, 190),
+            width=scale,
         )
-        dot_radius = int((5.0 + 2.5 * level) * scale)
-        draw.ellipse(
-            (
-                icon_x - dot_radius,
-                icon_y - dot_radius,
-                icon_x + dot_radius,
-                icon_y + dot_radius,
-            ),
-            fill=accent,
-        )
+        _indicator_microphone(draw, icon_x, icon_y, icon_radius * 1.15, accent_end)
     elif base_state == "processing":
-        spinner_radius = int(14 * scale)
+        spinner_radius = int(icon_radius * 0.92)
         spinner_box = (
             icon_x - spinner_radius,
             icon_y - spinner_radius,
             icon_x + spinner_radius,
             icon_y + spinner_radius,
         )
-        draw.ellipse(spinner_box, outline=(51, 65, 85, 255), width=3 * scale)
-        start = (int(frame) * 16 - 90) % 360
-        draw.arc(
-            spinner_box,
-            start=start,
-            end=start + 235,
-            fill=accent,
-            width=3 * scale,
-        )
-    elif base_state == "success":
-        success_radius = int(15 * scale)
-        draw.ellipse(
-            (
-                icon_x - success_radius,
-                icon_y - success_radius,
-                icon_x + success_radius,
-                icon_y + success_radius,
-            ),
-            fill=accent,
-        )
-        points = (
-            (icon_x - 7 * scale, icon_y),
-            (icon_x - 2 * scale, icon_y + 6 * scale),
-            (icon_x + 9 * scale, icon_y - 7 * scale),
-        )
-        draw.line(
-            points,
-            fill=(255, 255, 255, 255),
-            width=3 * scale,
-            joint="curve",
-        )
-    else:
-        error_radius = int(15 * scale)
-        draw.ellipse(
-            (
-                icon_x - error_radius,
-                icon_y - error_radius,
-                icon_x + error_radius,
-                icon_y + error_radius,
-            ),
-            fill=accent,
-        )
-        offset = 6 * scale
         stroke = 3 * scale
-        draw.line(
-            (icon_x - offset, icon_y - offset, icon_x + offset, icon_y + offset),
-            fill=(255, 255, 255, 255),
-            width=stroke,
+        draw.ellipse(spinner_box, outline=(51, 65, 85, 200), width=stroke)
+        start = (int(frame) * 14 - 90) % 360
+        segments = 12
+        for index in range(segments):
+            segment_start = start + index * (250 / segments)
+            draw.arc(
+                spinner_box,
+                start=segment_start,
+                end=segment_start + (250 / segments) + 1,
+                fill=(
+                    *_indicator_mix(
+                        accent,
+                        accent_end,
+                        index / (segments - 1),
+                    ),
+                    255,
+                ),
+                width=stroke,
+            )
+    else:
+        draw.ellipse(
+            (
+                icon_x - icon_radius,
+                icon_y - icon_radius,
+                icon_x + icon_radius,
+                icon_y + icon_radius,
+            ),
+            fill=(*accent, 255),
         )
-        draw.line(
-            (icon_x + offset, icon_y - offset, icon_x - offset, icon_y + offset),
-            fill=(255, 255, 255, 255),
-            width=stroke,
-        )
+        glyph = icon_radius * 1.5
+        stroke = max(scale, int(glyph * 0.22))
+        if base_state == "success":
+            draw.line(
+                (
+                    (icon_x - glyph * 0.42, icon_y + glyph * 0.02),
+                    (icon_x - glyph * 0.10, icon_y + glyph * 0.34),
+                    (icon_x + glyph * 0.45, icon_y - glyph * 0.34),
+                ),
+                fill=(255, 255, 255, 255),
+                width=stroke,
+                joint="curve",
+            )
+        else:
+            offset = glyph * 0.32
+            draw.line(
+                (
+                    icon_x - offset,
+                    icon_y - offset,
+                    icon_x + offset,
+                    icon_y + offset,
+                ),
+                fill=(255, 255, 255, 255),
+                width=stroke,
+            )
+            draw.line(
+                (
+                    icon_x + offset,
+                    icon_y - offset,
+                    icon_x - offset,
+                    icon_y + offset,
+                ),
+                fill=(255, 255, 255, 255),
+                width=stroke,
+            )
 
+    # Wszystko żyje w jednej, pionowo wyśrodkowanej linii — bez mikroskopijnej
+    # etykiety w rogu i pustki pod nią, która psuła rytm poprzedniej wersji.
     label = status_indicator_preview_text(label, 128)
     detail = status_indicator_preview_text(detail, 256)
-    text_x = 72 * scale
-    label_font = _status_indicator_font(10 * scale, bold=True)
-    detail_font = _status_indicator_font(15 * scale, bold=not bool(detail))
+    text_x = icon_x + icon_radius + 14 * scale
     text_right = canvas_width - (
-        52 * scale if base_state == "processing" else 22 * scale
-    )
+        STATUS_INDICATOR_MARGIN_X + (46 if base_state == "processing" else 16)
+    ) * scale
     available_text_width = max(scale, text_right - text_x)
-    label = _status_indicator_fit_text(
-        draw,
-        label,
-        label_font,
-        available_text_width,
-    )
-    detail = _status_indicator_fit_text(
-        draw,
-        detail,
-        detail_font,
-        available_text_width,
-    )
-    label_y = 15 * scale
-    detail_y = 33 * scale
-    draw.text(
-        (text_x, label_y),
-        label.upper(),
-        font=label_font,
-        fill=soft_accent,
-    )
 
-    if base_state == "recording" and not detail:
-        wave_left = text_x
-        wave_right = canvas_width - 22 * scale
-        baseline = 47 * scale
-        bar_count = 18
-        spacing = max(3 * scale, (wave_right - wave_left) // bar_count)
-        bar_width = max(2 * scale, spacing // 3)
-        visual_level = max(0.12, level)
-        for index in range(bar_count):
-            phase = int(frame) * 0.34 + index * 0.72
-            wave = 0.35 + 0.65 * abs(math.sin(phase))
-            center_weight = 0.55 + 0.45 * math.sin(
-                math.pi * (index + 1) / (bar_count + 1)
-            )
-            bar_height = int(
-                (3.0 + 18.0 * visual_level * wave * center_weight) * scale
-            )
-            x = wave_left + index * spacing
-            draw.rounded_rectangle(
-                (
-                    x,
-                    baseline - bar_height // 2,
-                    x + bar_width,
-                    baseline + bar_height // 2,
-                ),
-                radius=bar_width // 2,
-                fill=accent,
-            )
-    else:
+    if base_state == "recording":
+        label_font = _status_indicator_font(13 * scale, bold=True)
+        label = _status_indicator_fit_text(
+            draw,
+            label,
+            label_font,
+            available_text_width,
+        )
         draw.text(
-            (text_x, detail_y),
-            detail or label,
-            font=detail_font,
+            (text_x, icon_y),
+            label,
+            font=label_font,
+            fill=(226, 232, 240, 255),
+            anchor="lm",
+        )
+        wave_left = text_x + draw.textbbox((0, 0), label, font=label_font)[2]
+        wave_left += 14 * scale
+        wave_right = canvas_width - (STATUS_INDICATOR_MARGIN_X + 16) * scale
+        bar_count = 16
+        if wave_right - wave_left >= 16 * scale:
+            slot = (wave_right - wave_left) / bar_count
+            bar_width = slot * 0.58
+            half_height = 15 * scale
+            for index in range(bar_count):
+                position = index / (bar_count - 1)
+                phase = int(frame) * 0.30 + index * 0.55
+                wave = 0.45 + 0.55 * abs(math.sin(phase))
+                envelope = (
+                    math.sin(math.pi * (index + 0.5) / bar_count) ** 0.65
+                )
+                # Minimum jest ułamkiem pełnej wysokości, a nie stałą równą
+                # szerokości słupka — cicha mowa przestaje wyglądać jak rząd
+                # identycznych kropek udających pasek ładowania.
+                amplitude = 0.14 + 0.86 * level * wave * envelope
+                bar_height = max(bar_width, half_height * 2 * amplitude)
+                x = wave_left + index * slot + (slot - bar_width) / 2
+                draw.rounded_rectangle(
+                    (
+                        x,
+                        icon_y - bar_height / 2,
+                        x + bar_width,
+                        icon_y + bar_height / 2,
+                    ),
+                    radius=bar_width / 2,
+                    fill=(*_indicator_mix(accent, accent_end, position), 255),
+                )
+    else:
+        text = detail if base_state == "success" and detail else label
+        text_font = _status_indicator_font(14 * scale, bold=base_state != "success")
+        draw.text(
+            (text_x, icon_y),
+            _status_indicator_fit_text(
+                draw,
+                text,
+                text_font,
+                available_text_width,
+            ),
+            font=text_font,
             fill=(241, 245, 249, 255),
+            anchor="lm",
         )
 
     if base_state == "processing":
-        dot_y = 48 * scale
-        dot_start = canvas_width - 42 * scale
+        dot_start = canvas_width - (STATUS_INDICATOR_MARGIN_X + 38) * scale
         active_dot = (int(frame) // 3) % 3
         for index in range(3):
-            dot_radius = (2 if index == active_dot else 1) * scale
-            x = dot_start + index * 9 * scale
+            dot_radius = (3 if index == active_dot else 2) * scale
+            x = dot_start + index * 10 * scale
             draw.ellipse(
                 (
                     x - dot_radius,
-                    dot_y - dot_radius,
+                    icon_y - dot_radius,
                     x + dot_radius,
-                    dot_y + dot_radius,
+                    icon_y + dot_radius,
                 ),
-                fill=accent if index == active_dot else (71, 85, 105, 255),
+                fill=(
+                    soft_accent if index == active_dot else (71, 85, 105, 255)
+                ),
             )
 
     rendered = image.resize((width, height), Image.Resampling.LANCZOS)
@@ -4468,6 +4630,159 @@ def render_status_indicator_frame(
             Image.Resampling.LANCZOS,
         )
     return rendered
+
+
+class _IndicatorPoint(ctypes.Structure):
+    _fields_ = (("x", ctypes.c_long), ("y", ctypes.c_long))
+
+
+class _IndicatorSize(ctypes.Structure):
+    _fields_ = (("cx", ctypes.c_long), ("cy", ctypes.c_long))
+
+
+class _IndicatorBlendFunction(ctypes.Structure):
+    _fields_ = (
+        ("BlendOp", ctypes.c_ubyte),
+        ("BlendFlags", ctypes.c_ubyte),
+        ("SourceConstantAlpha", ctypes.c_ubyte),
+        ("AlphaFormat", ctypes.c_ubyte),
+    )
+
+
+class _IndicatorBitmapInfoHeader(ctypes.Structure):
+    _fields_ = (
+        ("biSize", ctypes.c_uint32),
+        ("biWidth", ctypes.c_long),
+        ("biHeight", ctypes.c_long),
+        ("biPlanes", ctypes.c_uint16),
+        ("biBitCount", ctypes.c_uint16),
+        ("biCompression", ctypes.c_uint32),
+        ("biSizeImage", ctypes.c_uint32),
+        ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long),
+        ("biClrUsed", ctypes.c_uint32),
+        ("biClrImportant", ctypes.c_uint32),
+    )
+
+
+def _premultiplied_bgra(image: Image.Image) -> bytes:
+    """Przetłumacz klatkę RGBA na format oczekiwany przez ``AC_SRC_ALPHA``.
+
+    GDI kompozytuje warstwowe okna zakładając kanały już przemnożone przez
+    alfę i ułożone jako BGRA. Bez tego półprzezroczysty cień rozjaśniałby się
+    do białej mgły zamiast przyciemniać pulpit.
+    """
+
+    buffer = np.asarray(image.convert("RGBA"), dtype=np.uint16)
+    alpha = buffer[:, :, 3]
+    premultiplied = (buffer[:, :, :3] * alpha[:, :, None] + 127) // 255
+    payload = np.empty(buffer.shape, dtype=np.uint8)
+    payload[:, :, 0] = premultiplied[:, :, 2]
+    payload[:, :, 1] = premultiplied[:, :, 1]
+    payload[:, :, 2] = premultiplied[:, :, 0]
+    payload[:, :, 3] = alpha.astype(np.uint8)
+    return np.ascontiguousarray(payload).tobytes()
+
+
+def blit_layered_window(hwnd: int, image: Image.Image, x: int, y: int) -> None:
+    """Wyślij klatkę na ekran z pełną przezroczystością każdego piksela.
+
+    ``UpdateLayeredWindow`` zastępuje sztuczkę z kolorem kluczowym: dopiero
+    ono pozwala na rozmyty cień i poświatę, bo półprzezroczyste piksele są
+    mieszane z pulpitem, a nie z tłem okna.
+    """
+
+    width, height = image.size
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    user32.GetDC.argtypes = [ctypes.c_void_p]
+    user32.GetDC.restype = ctypes.c_void_p
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    gdi32.CreateDIBSection.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    gdi32.CreateDIBSection.restype = ctypes.c_void_p
+    gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.SelectObject.restype = ctypes.c_void_p
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+    user32.UpdateLayeredWindow.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(_IndicatorPoint),
+        ctypes.POINTER(_IndicatorSize),
+        ctypes.c_void_p,
+        ctypes.POINTER(_IndicatorPoint),
+        ctypes.c_uint32,
+        ctypes.POINTER(_IndicatorBlendFunction),
+        ctypes.c_uint32,
+    ]
+    user32.UpdateLayeredWindow.restype = ctypes.c_bool
+
+    screen_dc = user32.GetDC(None)
+    if not screen_dc:
+        raise ctypes.WinError(ctypes.get_last_error())
+    memory_dc = None
+    bitmap = None
+    previous_bitmap = None
+    try:
+        memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+        if not memory_dc:
+            raise ctypes.WinError(ctypes.get_last_error())
+        header = _IndicatorBitmapInfoHeader()
+        header.biSize = ctypes.sizeof(_IndicatorBitmapInfoHeader)
+        header.biWidth = width
+        header.biHeight = -height  # ujemna wysokość = układ od góry w dół
+        header.biPlanes = 1
+        header.biBitCount = 32
+        header.biCompression = 0  # BI_RGB
+        bits = ctypes.c_void_p()
+        bitmap = gdi32.CreateDIBSection(
+            memory_dc,
+            ctypes.byref(header),
+            0,  # DIB_RGB_COLORS
+            ctypes.byref(bits),
+            None,
+            0,
+        )
+        if not bitmap or not bits:
+            raise ctypes.WinError(ctypes.get_last_error())
+        payload = _premultiplied_bgra(image)
+        ctypes.memmove(bits, payload, len(payload))
+        previous_bitmap = gdi32.SelectObject(memory_dc, bitmap)
+        blend = _IndicatorBlendFunction(0, 0, 255, 1)  # AC_SRC_OVER/AC_SRC_ALPHA
+        destination = _IndicatorPoint(int(x), int(y))
+        span = _IndicatorSize(width, height)
+        source = _IndicatorPoint(0, 0)
+        ctypes.set_last_error(0)
+        updated = user32.UpdateLayeredWindow(
+            ctypes.c_void_p(hwnd),
+            screen_dc,
+            ctypes.byref(destination),
+            ctypes.byref(span),
+            memory_dc,
+            ctypes.byref(source),
+            0,
+            ctypes.byref(blend),
+            2,  # ULW_ALPHA
+        )
+        if not updated:
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        if memory_dc:
+            if previous_bitmap:
+                gdi32.SelectObject(memory_dc, previous_bitmap)
+            gdi32.DeleteDC(memory_dc)
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        user32.ReleaseDC(None, screen_dc)
 
 
 class _IndicatorRect(ctypes.Structure):
@@ -4672,7 +4987,7 @@ class FloatingStatusIndicator:
         return int(user32.GetAncestor(widget, 2) or widget.value or 0)
 
     @classmethod
-    def _configure_no_activate(cls, root) -> int:
+    def _configure_no_activate(cls, root, layered: bool = False) -> int:
         hwnd = cls._window_handle(root)
         if not hwnd:
             raise ctypes.WinError()
@@ -4692,6 +5007,8 @@ class FloatingStatusIndicator:
         ex_style |= 0x00000020  # WS_EX_TRANSPARENT: clicks pass through
         ex_style |= 0x00000080  # WS_EX_TOOLWINDOW: no taskbar / Alt+Tab
         ex_style |= 0x08000000  # WS_EX_NOACTIVATE: preserve paste target
+        if layered:
+            ex_style |= 0x00080000  # WS_EX_LAYERED: per-pixel alpha via GDI
         ctypes.set_last_error(0)
         previous = set_style(ctypes.c_void_p(hwnd), -20, long_ptr(ex_style))
         if previous == 0 and ctypes.get_last_error() != 0:
@@ -4748,7 +5065,6 @@ class FloatingStatusIndicator:
             root.overrideredirect(True)
             root.configure(background=transparent)
             root.attributes("-topmost", True)
-            root.wm_attributes("-transparentcolor", transparent)
 
             ui_scale = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
             window_width = max(
@@ -4774,12 +5090,40 @@ class FloatingStatusIndicator:
             )
             canvas.pack(fill="both", expand=True)
             root.update_idletasks()
-            hwnd = self._configure_no_activate(root)
+            hwnd = self._configure_no_activate(root, layered=True)
+
+            # Warstwowe okno GDI daje prawdziwy miękki cień, ale wymaga
+            # sprawnej kompozycji pulpitu. Gdy pierwsza próba zawiedzie,
+            # wracamy do koloru kluczowego — kapsuła straci cień, lecz
+            # wskaźnik pozostanie użyteczny.
+            layered = True
+            try:
+                blit_layered_window(
+                    hwnd,
+                    Image.new(
+                        "RGBA",
+                        (window_width, window_height),
+                        (0, 0, 0, 0),
+                    ),
+                    0,
+                    0,
+                )
+            except Exception:
+                layered = False
+                logging.warning(
+                    "Warstwowe okno wskaźnika niedostępne; używam koloru "
+                    "kluczowego",
+                    exc_info=True,
+                )
+                self._configure_no_activate(root, layered=False)
+                root.wm_attributes("-transparentcolor", transparent)
 
             current_state = "hidden"
             current_frame = 0
             current_label = ""
             current_detail = ""
+            current_x = 0
+            current_y = 0
             meter_level = 0.0
             generation = 0
             processing_started = 0.0
@@ -4806,6 +5150,21 @@ class FloatingStatusIndicator:
             def fallback_work_area() -> tuple[int, int, int, int]:
                 return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
 
+            def place_window(
+                work_area: Optional[tuple[int, int, int, int]],
+            ) -> tuple[int, int]:
+                nonlocal current_x, current_y
+                current_x, current_y = status_indicator_window_position(
+                    work_area or fallback_work_area(),
+                    (window_width, window_height),
+                    bottom_margin,
+                )
+                root.geometry(
+                    f"{window_width}x{window_height}"
+                    f"{current_x:+d}{current_y:+d}"
+                )
+                return current_x, current_y
+
             def render_current() -> None:
                 nonlocal current_photo, meter_level
                 if current_state == "hidden":
@@ -4826,6 +5185,14 @@ class FloatingStatusIndicator:
                     label=current_label,
                     detail=current_detail,
                 )
+                if layered:
+                    blit_layered_window(
+                        hwnd,
+                        frame_image,
+                        current_x,
+                        current_y,
+                    )
+                    return
                 current_photo = ImageTk.PhotoImage(frame_image, master=root)
                 canvas.delete("all")
                 canvas.create_image(
@@ -4857,15 +5224,7 @@ class FloatingStatusIndicator:
                 current_label = label
                 current_detail = detail
                 meter_level = 0.0
-                area = work_area or fallback_work_area()
-                x, y = status_indicator_window_position(
-                    area,
-                    (window_width, window_height),
-                    bottom_margin,
-                )
-                root.geometry(
-                    f"{window_width}x{window_height}{x:+d}{y:+d}"
-                )
+                x, y = place_window(work_area)
                 render_current()
                 self._show_no_activate(
                     root,
@@ -4946,15 +5305,7 @@ class FloatingStatusIndicator:
                 meter_level = 0.0
                 if state in processing_states:
                     processing_started = time.monotonic()
-                area = work_area or fallback_work_area()
-                x, y = status_indicator_window_position(
-                    area,
-                    (window_width, window_height),
-                    bottom_margin,
-                )
-                root.geometry(
-                    f"{window_width}x{window_height}{x:+d}{y:+d}"
-                )
+                x, y = place_window(work_area)
                 render_current()
                 self._show_no_activate(
                     root,
@@ -5512,6 +5863,32 @@ def run_settings_window() -> int:
         bordercolor=[("focus", colors["primary"])],
         lightcolor=[("focus", colors["primary"])],
         darkcolor=[("focus", colors["primary"])],
+    )
+    # Przycisk "Usuń" niesie skutek nieodwracalny, więc nie może wyglądać
+    # dokładnie tak samo jak "Edytuj" obok niego.
+    style.configure(
+        "Danger.TButton",
+        background=colors["surface_alt"],
+        foreground=colors["danger"],
+        bordercolor=colors["danger"],
+        lightcolor=colors["surface_alt"],
+        darkcolor=colors["surface_alt"],
+        padding=(px(14), px(9)),
+        font=(ui_font_family, 10),
+    )
+    style.map(
+        "Danger.TButton",
+        background=[
+            ("disabled", colors["control_disabled"]),
+            ("pressed", colors["danger"]),
+            ("active", colors["danger"]),
+        ],
+        foreground=[
+            ("disabled", colors["disabled_text"]),
+            ("pressed", colors["white"]),
+            ("active", colors["white"]),
+        ],
+        bordercolor=[("disabled", colors["border"])],
     )
     style.configure(
         "NavActive.TButton",
@@ -6591,6 +6968,7 @@ def run_settings_window() -> int:
         page.grid_remove()
 
     nav_buttons: dict[str, ttk.Button] = {}
+    nav_markers: dict[str, tk.Frame] = {}
     active_page_key = {"value": "start"}
 
     def widget_is_inside(widget, ancestor) -> bool:
@@ -6684,6 +7062,12 @@ def run_settings_window() -> int:
             button.configure(
                 style="NavActive.TButton" if key == page_key else "Nav.TButton"
             )
+        for key, marker in nav_markers.items():
+            marker.configure(
+                background=(
+                    colors["primary"] if key == page_key else colors["sidebar"]
+                )
+            )
         def finish_page_layout() -> None:
             canvas = page_canvases[page_key]
             content = page_contents[page_key]
@@ -6730,20 +7114,34 @@ def run_settings_window() -> int:
         )
         nav_row += 1
         for page_key, label in items:
-            button = ttk.Button(
-                sidebar,
-                text=label,
-                style="Nav.TButton",
-                command=lambda selected=page_key: show_page(selected),
-            )
-            button.grid(
+            # Wiersz nawigacji to pasek akcentu + przycisk. Sama plama tła nie
+            # wystarczała, by na pierwszy rzut oka wskazać otwartą stronę.
+            row = tk.Frame(sidebar, background=colors["sidebar"])
+            row.grid(
                 row=nav_row,
                 column=0,
                 sticky="ew",
                 padx=px(10),
                 pady=px(1),
             )
+            row.columnconfigure(1, weight=1)
+            marker = tk.Frame(
+                row,
+                background=colors["sidebar"],
+                width=px(3),
+            )
+            marker.grid(row=0, column=0, sticky="ns")
+            marker.grid_propagate(False)
+            button = ttk.Button(
+                row,
+                text=label,
+                style="Nav.TButton",
+                cursor="hand2",
+                command=lambda selected=page_key: show_page(selected),
+            )
+            button.grid(row=0, column=1, sticky="ew")
             nav_buttons[page_key] = button
+            nav_markers[page_key] = marker
             nav_row += 1
 
     ttk.Label(
@@ -7142,10 +7540,13 @@ def run_settings_window() -> int:
             pady=pady,
         )
         container.columnconfigure(0, weight=1)
+        # Ciało musi mieć tło kontenera. Ze stylem Surface (ciemniejszym niż
+        # surface_alt karty) po rozwinięciu pojawiał się niezamierzony,
+        # wgłębiony prostokąt zamiast jednolitej powierzchni.
         body = ttk.Frame(
             container,
             name="body",
-            style="Surface.TFrame",
+            style="Alt.TFrame",
             padding=(px(14), px(8), px(14), px(14)),
         )
         body.columnconfigure(1, weight=1)
@@ -9032,6 +9433,7 @@ def run_settings_window() -> int:
             ttk.Button(
                 card_actions,
                 text=t("Edytuj", "Edit"),
+                cursor="hand2",
                 command=lambda selected=item_index: open_custom_command_editor(
                     selected
                 ),
@@ -9039,6 +9441,8 @@ def run_settings_window() -> int:
             ttk.Button(
                 card_actions,
                 text=t("Usuń", "Delete"),
+                style="Danger.TButton",
+                cursor="hand2",
                 command=lambda selected=item_index: remove_custom_command(selected),
             ).grid(row=0, column=1)
 
@@ -11084,7 +11488,14 @@ class ContinuousRecorder:
 
     def begin(self) -> None:
         if not self.ensure_stream_alive():
-            raise AppError("Microphone stream is unavailable")
+            # Ten komunikat trafia wprost na pasek statusu i do powiadomienia,
+            # więc musi być przetłumaczony i mówić, co zrobić.
+            raise AppError(
+                Translator.from_config(self.config).t(
+                    "Mikrofon jest niedostępny — sprawdź podłączenie.",
+                    "The microphone is unavailable — check the connection.",
+                )
+            )
         with self._lock:
             if self._recording:
                 return
@@ -11399,6 +11810,24 @@ class MowikApp:
                 return
             except Exception:
                 logging.exception("Nie udało się obsłużyć prośby o restart")
+                # Żądanie restartu zostało już skonsumowane z dysku, więc nikt
+                # go nie powtórzy. Bez tego status zostawał na "Stosuję nowe
+                # ustawienia…" na zawsze, a użytkownik był przekonany, że
+                # zmiany weszły — mimo że proces działa na starej konfiguracji.
+                try:
+                    self.set_status(
+                        self.translator.t(
+                            "Nie udało się zastosować ustawień — uruchom "
+                            "Mówika ponownie ręcznie.",
+                            "Could not apply the settings — please restart "
+                            "Mówik manually.",
+                        ),
+                        error=True,
+                    )
+                except Exception:
+                    logging.exception(
+                        "Nie udało się zgłosić nieudanego restartu"
+                    )
 
     def _start_listeners(self) -> None:
         self.keyboard_listener = keyboard.Listener(
@@ -11437,11 +11866,21 @@ class MowikApp:
                 self.config,
                 self._model_status,
             )
+            should_close = False
             with self._shutdown_lock:
                 cancelled = self._shutdown_started or self.stop_event.is_set()
                 if cancelled:
+                    # Decyzja o zamknięciu musi paść pod tym samym zamkiem, pod
+                    # którym zerujemy pole. Wcześniej pole było zerowane tutaj,
+                    # a warunek zamknięcia sprawdzany w osobnym bloku — gdzie
+                    # nie mógł już zajść, bo pole było puste. Efekt: gdy
+                    # shutdown() ustawił flagę, ale nie przejął jeszcze
+                    # recordera, strumień mikrofonu zostawał otwarty na stałe.
                     if self.recorder is recorder:
                         self.recorder = None
+                        should_close = True
+                    elif not recorder_published:
+                        should_close = True
                 else:
                     self.model = model
                     self.model_name = model_name
@@ -11449,13 +11888,6 @@ class MowikApp:
                     self.model_ready.set()
                     self._remember_startup_failure(None)
             if cancelled:
-                should_close = False
-                with self._shutdown_lock:
-                    if self.recorder is recorder:
-                        self.recorder = None
-                        should_close = True
-                    elif not recorder_published:
-                        should_close = True
                 if should_close:
                     recorder.close()
                 return
@@ -11602,9 +12034,13 @@ class MowikApp:
         try:
             worker.start()
         except Exception:
+            # Brak wolnego wątku degraduje się do "brak kontekstu Explorera",
+            # co jest obsługiwane. Podniesienie wyjątku ubiłoby cały hook.
             self._explorer_context_slots.release()
             ready.set()
-            raise
+            logging.warning(
+                "Nie udało się rozwiązać kontekstu Explorera: brak wątku"
+            )
 
     def _take_command_context(self) -> command_engine.ExecutionContext:
         with self._command_context_lock:
@@ -11667,12 +12103,22 @@ class MowikApp:
                     self._active_input = None
                     self.key_down = False
                     should_end = True
-        if should_begin is not None:
+        # pynput zatrzymuje listenera, gdy callback rzuci wyjątek, a zgłasza go
+        # dopiero w join(), którego nikt tu nie woła. Bez tej osłony jedna
+        # nieudana próba startu wątku wyłączałaby skrót na stałe, w milczeniu.
+        try:
+            if should_begin is not None:
+                if should_begin == "custom_command":
+                    self._begin_command_context_capture()
+                self.begin_dictation(should_begin)
+                if should_begin == "custom_command" and not self.capture_active:
+                    self._discard_command_context()
+            elif should_end:
+                self.end_dictation()
+        except Exception:
+            logging.exception("Błąd obsługi skrótu dyktowania")
             if should_begin == "custom_command":
-                self._begin_command_context_capture()
-            self.begin_dictation(should_begin)
-        elif should_end:
-            self.end_dictation()
+                self._discard_command_context()
 
     def begin_dictation(self, mode: str = "dictation") -> None:
         if mode not in {"dictation", "custom_command"}:
@@ -12025,6 +12471,7 @@ class MowikApp:
                 # Zgodność z kolejką z wersji 2.6 i prostymi integracjami.
                 job = SpeechJob(np.asarray(queued_job), "dictation", None)
             manual_multiline_delivery = False
+            command_status_handled = False
             try:
                 if self.stop_event.is_set():
                     continue
@@ -12055,12 +12502,17 @@ class MowikApp:
                     continue
 
                 if job.mode == "custom_command":
-                    if not self._deliver_custom_command(
+                    outcome = self._deliver_custom_command(
                         text,
                         job.execution_context,
                         job.delivery_foreground,
-                    ):
+                    )
+                    if not outcome:
                         continue
+                    # Komenda mogła zostawić instrukcję dla użytkownika
+                    # ("wklej ręcznie przez Ctrl+V"). Bez tego wyjątku
+                    # nadpisywaliśmy ją zaraz potem statusem "Gotowy".
+                    command_status_handled = outcome == COMMAND_STATUS_HANDLED
                 else:
                     self._set_text_delivery_status()
                     if self.stop_event.is_set():
@@ -12078,16 +12530,20 @@ class MowikApp:
                         paste_kwargs["expected_foreground"] = (
                             job.delivery_foreground
                         )
-                    if multiline and paste_enabled:
-                        if not copy_enabled:
-                            raise AppError(
-                                self.translator.t(
-                                    "Tekst wielowierszowy wymaga włączonego schowka.",
-                                    "Multi-line text requires clipboard copying.",
-                                )
-                            )
+                    if multiline and copy_enabled:
+                        # Także przy wyłączonym auto-wklejaniu: tekst trafia do
+                        # schowka, więc użytkownik musi o tym usłyszeć. Wcześniej
+                        # ta ścieżka kończyła się statusem "Gotowy", mimo że nic
+                        # nie zostało wklejone.
                         windows_set_clipboard_text(text, self.translator)
                         manual_multiline_delivery = True
+                    elif multiline and paste_enabled:
+                        raise AppError(
+                            self.translator.t(
+                                "Tekst wielowierszowy wymaga włączonego schowka.",
+                                "Multi-line text requires clipboard copying.",
+                            )
+                        )
                     else:
                         paste_text(text, self.config, **paste_kwargs)
                     logging.info(
@@ -12102,7 +12558,9 @@ class MowikApp:
                         job.mode,
                         time.perf_counter() - job.released_at,
                     )
-                if manual_multiline_delivery:
+                if command_status_handled:
+                    pass
+                elif manual_multiline_delivery:
                     self.set_status(
                         self.translator.t(
                             "Tekst wielowierszowy skopiowano — wklej go ręcznie przez Ctrl+V",
@@ -12148,6 +12606,11 @@ class MowikApp:
             finally:
                 self._release_busy()
                 self.jobs.task_done()
+                # Bez tego lokalne referencje trzymają bufor audio poprzedniej
+                # wypowiedzi (dziesiątki MB) aż do następnego zadania, czyli
+                # potencjalnie przez cały czas bezczynności.
+                job = None
+                queued_job = None
 
     def _set_text_delivery_status(self) -> None:
         paste_settings = self.config.get("paste", {})
@@ -12190,7 +12653,15 @@ class MowikApp:
         transcript: str,
         execution_context: Optional[command_engine.ExecutionContext] = None,
         delivery_foreground: Optional[tuple[int, ...]] = None,
-    ) -> bool:
+    ) -> bool | str:
+        """Wykonaj własną komendę.
+
+        Zwraca ``False`` gdy nic nie dostarczono, ``True`` po zwykłym sukcesie
+        i ``COMMAND_STATUS_HANDLED`` gdy ustawiono już własny status końcowy,
+        którego wywołujący nie powinien nadpisywać.
+        """
+
+        status_handled = False
         if self.stop_event.is_set():
             return False
         match = self._custom_command_registry.match(transcript)
@@ -12436,6 +12907,7 @@ class MowikApp:
                         ),
                         state="ready",
                     )
+                    status_handled = True
                 else:
                     paste_text(
                         value,
@@ -12497,6 +12969,7 @@ class MowikApp:
                             ),
                             state="ready",
                         )
+                        status_handled = True
                         launched_terminal = None
                     else:
                         cleanup_launched_terminal()
@@ -12532,7 +13005,7 @@ class MowikApp:
             action,
             len(value),
         )
-        return True
+        return COMMAND_STATUS_HANDLED if status_handled else True
 
     def transcribe(
         self,
