@@ -5486,6 +5486,10 @@ class FailureMessageTests(unittest.TestCase):
     def make_app(self) -> mowik.MowikApp:
         config = copy.deepcopy(mowik.DEFAULT_CONFIG)
         config["feedback"]["floating_indicator"] = False
+        # Domyślne ``ui_language: "auto"`` idzie za locale systemu, więc test
+        # asertujący polskie brzmienie komunikatu przechodził na polskim
+        # Windowsie i przewracał wydanie na anglojęzycznym runnerze CI.
+        config["ui_language"] = "pl"
         app = mowik.MowikApp(config)
         app.dictation_indicator = mock.Mock()
         return app
