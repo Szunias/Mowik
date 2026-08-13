@@ -45,7 +45,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 APP_NAME = "Mowik"
 APP_DISPLAY_NAME = "Mówik"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 
 
 def _run_early_read_only_probe(

@@ -18,7 +18,7 @@ kontrolną i datę.
 2. Wygeneruj manifesty z sumą kontrolną opublikowanego pliku:
 
    ```powershell
-   scripts\build-winget-manifest.ps1 -Version 2.8.0 -InstallerSha256 <SHA-256 z SHA256SUMS.txt>
+   scripts\build-winget-manifest.ps1 -Version 2.9.0 -InstallerSha256 <SHA-256 z SHA256SUMS.txt>
    ```
 
    Bez `-InstallerSha256` skrypt policzy sumę z `release\Mowik-<wersja>-Setup-UNSIGNED.exe`.
@@ -26,8 +26,8 @@ kontrolną i datę.
 3. Sprawdź i przetestuj lokalnie:
 
    ```powershell
-   winget validate --manifest release\winget\manifests\s\Szunias\Mowik\2.8.0
-   winget install --manifest release\winget\manifests\s\Szunias\Mowik\2.8.0
+   winget validate --manifest release\winget\manifests\s\Szunias\Mowik\2.9.0
+   winget install --manifest release\winget\manifests\s\Szunias\Mowik\2.9.0
    ```
 
 4. Zrób forka `microsoft/winget-pkgs`, skopiuj katalog `manifests\s\Szunias\Mowik\<wersja>`

@@ -1,3 +1,3 @@
-Mowik 2.8.0
-Brakujące pliki modelu pobierają się teraz także w trybie okienkowym i widać postęp w procentach; błędy podają powód zamiast odsyłać do dziennika; lista mikrofonów pokazuje jedno wejście zamiast wszystkich wariantów sterowników, oznacza urządzenie domyślne i pozwala sprawdzić poziom sygnału przed zapisaniem wyboru.
-Publiczny instalator 2.8.0 jest niepodpisany; pobieraj go wyłącznie z oficjalnego wydania GitHub i sprawdź SHA-256 z plikiem SHA256SUMS.txt.
+Mowik 2.9.0
+Długie dyktowanie nie gubi już końcówek: przy nagraniach dłuższych niż pół minuty przepadało nawet 40 procent podyktowanego tekstu, bo silnik przeskakiwał materiał, którego nie zdążył przepisać. Tekst pojawia się szybciej po puszczeniu klawisza, bo Mówik przestał przepuszczać własne, wpisywane znaki przez swój podsłuch klawiatury. Słownik trafia do silnika w całości i w formie, która nie psuje interpunkcji — wcześniej ze stu dwudziestu terminów działało około trzydziestu, a ostatni bywał ucięty w połowie. Doszedł filtr fraz z napisów, które model wypluwał po nagraniu ciszy, oraz łagodniejsze przycinanie początku wypowiedzi, żeby nie znikała pierwsza głoska.
+Publiczny instalator 2.9.0 jest niepodpisany; pobieraj go wyłącznie z oficjalnego wydania GitHub i sprawdź SHA-256 z plikiem SHA256SUMS.txt.
