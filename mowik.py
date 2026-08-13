@@ -176,7 +176,7 @@ _reject_elevated_runtime_before_native_imports()
 import mowik_commands as command_engine
 import mowik_audio_devices as audio_devices
 import mowik_cuda as cuda_runtime
-from mowik_i18n import Translator
+from mowik_i18n import Translator, resolve_ui_language
 import mowik_windows_actions as windows_actions
 
 
@@ -350,6 +350,15 @@ SETTINGS_MUTEX_NAME = r"Local\MowikLocalDictation.Settings"
 CONFIG_WRITE_MUTEX_NAME = r"Local\MowikLocalDictation.ConfigWrite"
 PROCESS_STARTED_AT_NS = time.time_ns()
 SAMPLE_RATE = 16_000
+# Podpis ('MOWI') wstawiany w `dwExtraInfo` każdego zdarzenia klawiatury, które
+# sami wstrzykujemy przez SendInput. Globalny hook WH_KEYBOARD_LL widzi także
+# nasze własne znaki, a Windows blokuje SendInput do powrotu procedury hooka —
+# przez co wpisywanie kosztowało 2,5 raza więcej niż powinno (2,61 ms na znak
+# wobec 1,04 ms bez hooka). Podpis pozwala hookowi odrzucić własne zdarzenia
+# zanim dotkną Pythona. Filtrujemy po własnym podpisie, a nie po fladze
+# LLKHF_INJECTED, bo tamtą ustawiają też RDP, KVM i klawiatura ekranowa —
+# odrzucanie ich zablokowałoby skrót użytkownika.
+MOWIK_INJECTED_INPUT_SIGNATURE = 0x4D4F5749
 DEFAULT_MAXIMUM_RECORDING_SECONDS = 300
 MAXIMUM_RECORDING_SECONDS = 3_600
 MAX_RECORDING_BUFFER_BYTES = 256 * 1024 * 1024
@@ -454,7 +463,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "threshold": 0.45,
         "min_speech_duration_ms": 120,
         "min_silence_duration_ms": 250,
-        "speech_pad_ms": 180,
+        # Enkoder Whispera zawsze pracuje na oknie 30 s, więc dla dyktowania
+        # krótszego niż ~29 s dłuższy pad nie kosztuje ani milisekundy — mel
+        # i tak jest dopychany zerami. Dawne 180 ms to raptem 5-6 okien Silero
+        # wstecz i ucinało ciche polskie nagłosy („Wyślij" → „ślij").
+        "speech_pad_ms": 300,
     },
     "dictionary": {
         "enabled": True,
@@ -2361,6 +2374,26 @@ def warm_up_cuda_model(model: WhisperModel, config: dict[str, Any]) -> None:
     model.encode(pad_or_trim(features))
 
 
+def warm_up_voice_activity_detector() -> None:
+    """Zbuduj sesję ONNX Silero, zanim użytkownik pierwszy raz naciśnie skrót.
+
+    faster-whisper tworzy ją leniwie przy pierwszym ``transcribe``, więc koszt
+    (zmierzone 0,32 s) płaciło pierwsze dyktowanie w sesji — już po tym, jak
+    użytkownik puścił klawisz i czeka na tekst. Robimy to na etapie ładowania,
+    gdzie i tak jest widoczny postęp. Dotyczy tak samo CPU jak GPU, bo VAD nie
+    korzysta z karty; dotąd użytkownicy CPU nie mieli żadnej rozgrzewki.
+    """
+
+    try:
+        from faster_whisper.vad import get_vad_model
+
+        get_vad_model()
+    except Exception:
+        # Rozgrzewka jest wyłącznie optymalizacją — jeśli zawiedzie, VAD i tak
+        # załaduje się leniwie przy pierwszym dyktowaniu.
+        logging.debug("Nie udało się rozgrzać VAD", exc_info=True)
+
+
 def create_model(
     config: dict[str, Any], status_callback=None, *, force_download: bool = False
 ) -> tuple[WhisperModel, str, str]:
@@ -2411,6 +2444,8 @@ def create_model(
             translator,
             force_download=force_download,
         )
+        if bool(config.get("vad", {}).get("enabled", True)):
+            warm_up_voice_activity_detector()
         if device == "cuda":
             if status_callback:
                 status_callback(
@@ -2483,6 +2518,120 @@ def create_model(
             translator,
         )
         return model, fallback_model, "cpu"
+
+
+def resolve_transcription_language(config: Mapping[str, Any]) -> Optional[str]:
+    """Ustal j\u0119zyk przekazywany do Whispera; ``None`` oznacza autodetekcj\u0119.
+
+    Autodetekcja kosztuje osobny przebieg enkodera \u2014 przy kr\u00f3tkiej komendzie
+    tyle samo co sama transkrypcja, czyli podwaja czas oczekiwania. Pomiar na
+    24 nagraniach po ok. 1,6 s: 873 ms na nagranie przy autodetekcji wobec
+    464 ms przy podanym j\u0119zyku, przy identycznych transkrypcjach. Dlatego
+    domy\u015blne ``auto`` idzie teraz za j\u0119zykiem interfejsu, a kto faktycznie
+    dyktuje w kilku j\u0119zykach, wybiera ``detect``.
+    """
+
+    configured = str(config.get("language", "auto")).strip().lower()
+    if configured == "detect":
+        return None
+    if configured and configured != "auto":
+        return configured
+    return resolve_ui_language(str(config.get("ui_language", "auto")))
+
+
+# Whisper przycina prompt kontekstowy do ``max_length // 2 - 1`` = 223 token\u00f3w
+# (faster_whisper/transcribe.py). Polskie s\u0142owa z diakrytykami tokenizuj\u0105 si\u0119
+# po ~3-4 tokeny, wi\u0119c lista 120 termin\u00f3w (~1450 znak\u00f3w) traci\u0142a po drodze
+# dwie trzecie pozycji \u2014 i ucina\u0142a ostatni\u0105 w po\u0142owie. Kikut w promptcie jest
+# gorszy ni\u017c jego brak: zach\u0119ca model do halucynowania podobnych s\u0142\u00f3w.
+# Tniemy wi\u0119c sami, po granicy terminu, z zapasem na zdanie kieruj\u0105ce.
+TRANSCRIPTION_PROMPT_TOKEN_BUDGET = 223
+TRANSCRIPTION_PROMPT_CHARS_PER_TOKEN = 4
+
+
+def build_transcription_prompt(terms: Sequence[str], language: Optional[str]) -> str:
+    """Zbuduj prompt kontekstowy dla Whispera z listy termin\u00f3w s\u0142ownika.
+
+    ``hotwords`` w faster-whisper nie jest osobnym mechanizmem biasowania \u2014
+    trafia dok\u0142adnie w ten sam slot ``<|startofprev|>`` co ``initial_prompt``,
+    czyli jest zwyk\u0142ym promptem kontekstowym. Dlatego jego *styl* przecieka do
+    wyj\u015bcia: go\u0142a lista rozdzielona przecinkami, bez kropki i bez wielkiej
+    litery, statystycznie ci\u0105gnie dekoder ku tekstowi bez interpunkcji.
+    Opakowujemy j\u0105 wi\u0119c w zdanie, kt\u00f3re modeluje po\u017c\u0105dany wynik.
+    """
+
+    lead = {
+        "pl": "Transkrypcja po polsku, z pe\u0142n\u0105 interpunkcj\u0105 i wielkimi literami.",
+        "en": "Transcript in English, fully punctuated and capitalised.",
+    }.get(language or "", "")
+    if not terms:
+        return lead
+
+    budget = TRANSCRIPTION_PROMPT_TOKEN_BUDGET * TRANSCRIPTION_PROMPT_CHARS_PER_TOKEN
+    intro = f"{lead} W tek\u015bcie mog\u0105 wyst\u0105pi\u0107 nazwy: " if lead else ""
+    if language and language != "pl" and lead:
+        intro = f"{lead} Names that may appear: "
+    remaining = budget - len(intro) - 1
+    kept: list[str] = []
+    for term in terms:
+        addition = len(term) + (2 if kept else 0)
+        if remaining - addition < 0:
+            break
+        kept.append(term)
+        remaining -= addition
+    if not kept:
+        return lead
+    if len(kept) < len(terms):
+        logging.info(
+            "S\u0142ownik: do promptu trafi\u0142o %d z %d termin\u00f3w (limit %d token\u00f3w).",
+            len(kept),
+            len(terms),
+            TRANSCRIPTION_PROMPT_TOKEN_BUDGET,
+        )
+    return f"{intro}{', '.join(kept)}."
+
+
+# Whisper wyuczył się tych fraz z napisów do filmów i wypluwa je na ciszy albo
+# szumie. Domyślne progi faster-whisper ich nie łapią: pominięcie ciszy jest
+# kasowane, gdy ``avg_logprob`` jest wysokie, a akurat te frazy model zna na
+# pamięć, więc mają wysoki logprob mimo ``no_speech_prob`` bliskiego jedynki.
+#
+# Celowo NIE filtrujemy tu podziękowań ani pożegnań („Dziękuję", „Do widzenia").
+# Owszem, Whisper też je halucynuje, ale to są zdania, które użytkownik ma
+# pełne prawo naprawdę podyktować — zjedzenie prawdziwego tekstu byłoby gorsze
+# niż przepuszczenie halucynacji.
+WHISPER_SUBTITLE_HALLUCINATIONS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"napisy\s+(?:stworzone\s+)?przez\s+społeczność\s+amara\.org",
+        r"napisy\s+(?:zrobione|wykonane|tworzone)\s+przez\s+\S+",
+        r"subtitles\s+by\s+the\s+amara\.org\s+community",
+        r"zapraszam(?:y)?\s+do\s+subskrypcji(?:\s+kanału)?",
+        r"do\s+zobaczenia\s+w\s+(?:następnym|kolejnym)\s+odcinku",
+        r"dziękuję\s+za\s+(?:obejrzenie|uwagę)\s+(?:filmu|materiału|odcinka)",
+    )
+)
+
+
+def strip_whisper_hallucinations(text: str) -> str:
+    """Usuń frazy z napisów, które Whisper wypluwa na ciszy i szumie.
+
+    Pusty wynik jest już poprawnie obsłużony wyżej jako „brak mowy" — nic nie
+    zostaje wklejone, a kapsuła pokazuje błąd zamiast udawać sukces.
+    """
+
+    cleaned = text
+    for pattern in WHISPER_SUBTITLE_HALLUCINATIONS:
+        cleaned = pattern.sub(" ", cleaned)
+    if cleaned == text:
+        return text
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,!?…-")
+    logging.info(
+        "Odfiltrowano halucynację Whispera (%d → %d znaków).",
+        len(text),
+        len(cleaned),
+    )
+    return cleaned
 
 
 def normalize_transcript(text: str) -> str:
@@ -3003,7 +3152,10 @@ def cleanup_with_ollama(
         MAX_OLLAMA_TIMEOUT_SECONDS,
         max(1, int(settings.get("timeout_seconds", 45))),
     )
-    transcription_language = str(config.get("language", "auto")).strip().lower()
+    # Przy dawnym odczycie wprost z configu polski użytkownik z domyślnym
+    # „auto” dostawał angielski prompt do polskiego tekstu, przez co małe
+    # modele lokalne chętnie anglicyzowały interpunkcję.
+    transcription_language = resolve_transcription_language(config) or ""
     glossary = ", ".join(dictionary_terms[:80])
     if transcription_language == "pl":
         glossary = glossary or "brak"
@@ -3655,6 +3807,7 @@ def windows_type_unicode_text(
     KEYEVENTF_KEYUP = 0x0002
     KEYEVENTF_UNICODE = 0x0004
 
+
     class KEYBDINPUT(ctypes.Structure):
         _fields_ = [
             ("wVk", wintypes.WORD),
@@ -3719,7 +3872,7 @@ def windows_type_unicode_text(
                 code_unit,
                 KEYEVENTF_UNICODE,
                 0,
-                0,
+                MOWIK_INJECTED_INPUT_SIGNATURE,
             )
             release = INPUT()
             release.type = INPUT_KEYBOARD
@@ -3728,7 +3881,7 @@ def windows_type_unicode_text(
                 code_unit,
                 KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
                 0,
-                0,
+                MOWIK_INJECTED_INPUT_SIGNATURE,
             )
             inputs.extend((press, release))
         array_type = INPUT * len(inputs)
@@ -6353,7 +6506,8 @@ def run_settings_window() -> int:
         t("Karta NVIDIA (CUDA)", "NVIDIA GPU (CUDA)"): "cuda",
     }
     language_values: dict[str, Any] = {
-        t("Wykryj automatycznie", "Detect automatically"): "auto",
+        t("Jak interfejs (zalecane)", "Same as interface (recommended)"): "auto",
+        t("Wykryj z nagrania", "Detect from recording"): "detect",
         t("Polski", "Polish"): "pl",
         t("Angielski", "English"): "en",
         t("Niemiecki", "German"): "de",
@@ -11829,10 +11983,32 @@ class MowikApp:
                         "Nie udało się zgłosić nieudanego restartu"
                     )
 
+    @staticmethod
+    def _ignore_own_injected_keys(msg: Any, data: Any) -> bool:
+        """Odrzuć w hooku zdarzenia, które Mówik sam przed chwilą wstrzyknął.
+
+        Zwrócenie ``False`` pomija `PostThreadMessage` i całe przetwarzanie po
+        stronie Pythona, ale **nie** tłumi zdarzenia — znak normalnie dociera do
+        aplikacji docelowej. Skraca to procedurę hooka przy każdym wpisywanym
+        znaku, co jest istotne podwójnie: przyspiesza wpisywanie i zmniejsza
+        ryzyko, że Windows usunie hooka za przekroczenie LowLevelHooksTimeout
+        (objawiające się jako „skrót nagle przestał działać do restartu").
+        """
+
+        try:
+            if data.dwExtraInfo == MOWIK_INJECTED_INPUT_SIGNATURE:
+                return False
+        except AttributeError:
+            # Starsze/inne wydania pynput mogą nie eksponować dwExtraInfo —
+            # wtedy po prostu zachowujemy się jak dotąd.
+            pass
+        return True
+
     def _start_listeners(self) -> None:
         self.keyboard_listener = keyboard.Listener(
             on_press=self._on_key_press,
             on_release=self._on_key_release,
+            win32_event_filter=self._ignore_own_injected_keys,
         )
         self.keyboard_listener.start()
         self.mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
@@ -13075,7 +13251,8 @@ class MowikApp:
                 definition.phrase
                 for definition in self._custom_command_registry.definitions
             ] + hotword_terms
-        glossary = ", ".join(hotword_terms)
+        prompt_language = resolve_transcription_language(self.config)
+        glossary = build_transcription_prompt(hotword_terms, prompt_language)
 
         vad_settings = self.config.get("vad", {})
         vad_enabled = bool(vad_settings.get("enabled", True))
@@ -13087,11 +13264,10 @@ class MowikApp:
             "min_silence_duration_ms": int(
                 vad_settings.get("min_silence_duration_ms", 250)
             ),
-            "speech_pad_ms": int(vad_settings.get("speech_pad_ms", 180)),
+            "speech_pad_ms": int(vad_settings.get("speech_pad_ms", 300)),
         }
 
-        configured_language = str(self.config.get("language", "auto")).strip()
-        language: Optional[str] = None if configured_language.lower() == "auto" else configured_language
+        language = prompt_language
 
         whisper_started = time.perf_counter()
         segments, info = model.transcribe(
@@ -13099,24 +13275,49 @@ class MowikApp:
             language=language,
             task="transcribe",
             beam_size=max(1, int(self.config.get("beam_size", 2))),
-            temperature=0.0,
+            # Skalar zamienia się w jednoelementową listę temperatur, przez co
+            # `compression_ratio_threshold` wykrywał zapętlenie („że że że"),
+            # ustawiał `needs_fallback` — i nie miał na co spaść, więc zepsuty
+            # wynik trafiał do użytkownika. Kolejne przebiegi uruchamiają się
+            # wyłącznie wtedy, gdy pierwszy i tak był do wyrzucenia, więc w
+            # normalnym przypadku pętla przerywa po pierwszym obiegu i nie
+            # kosztuje ani milisekundy.
+            temperature=[0.0, 0.2, 0.4],
             condition_on_previous_text=False,
-            hotwords=glossary[:1800] if glossary else None,
+            hotwords=glossary or None,
             vad_filter=vad_enabled,
             vad_parameters=vad_parameters if vad_enabled else None,
-            without_timestamps=True,
+            # Bez znaczników czasu pętla dekodowania przesuwa okno zawsze o
+            # pełne 30 s, więc gdy model skończył zdanie w połowie okna, reszta
+            # przepadała: zmierzone 33% utraconego tekstu przy 90 s nagrania i
+            # 41% przy 199 s. Ze znacznikami `seek` cofa się do ostatniego
+            # timestampu i dokańcza materiał. Dla dyktowań poniżej 30 s (czyli
+            # typowego push-to-talk) nie zmienia się nic — to jedno okno.
+            without_timestamps=False,
         )
         transcript = "".join(segment.text for segment in segments)
         whisper_elapsed = time.perf_counter() - whisper_started
+        # RTF liczony względem surowego nagrania wygląda lepiej, niż jest —
+        # przy dyktowaniu z pauzami dekoder dostaje tylko część materiału.
+        # Logujemy obie długości, żeby ocena zmian nie była zniekształcona.
+        reported_speech = getattr(info, "duration_after_vad", None)
+        speech_duration = (
+            float(reported_speech)
+            if isinstance(reported_speech, (int, float))
+            else audio_duration
+        )
         logging.info(
             "Whisper: język=%s prawdopodobieństwo=%.3f, znaków=%d, "
-            "czas=%.3f s, RTF=%.3f",
+            "czas=%.3f s, RTF=%.3f, mowy=%.2f s (RTF mowy=%.3f)",
             getattr(info, "language", "?"),
             float(getattr(info, "language_probability", 0.0)),
             len(transcript),
             whisper_elapsed,
             whisper_elapsed / max(0.001, audio_duration),
+            speech_duration,
+            whisper_elapsed / max(0.001, speech_duration or audio_duration),
         )
+        transcript = strip_whisper_hallucinations(transcript)
         transcript = normalize_transcript(transcript)
         if mode == "custom_command":
             logging.info(

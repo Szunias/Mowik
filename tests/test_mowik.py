@@ -1286,6 +1286,78 @@ class FeedbackConfigTests(NonElevatedProcessMixin, unittest.TestCase):
             self.assertEqual(sources["stop"], "")
 
 
+class TranscriptionPromptTests(unittest.TestCase):
+    """Prompt kontekstowy Whispera — ``hotwords`` to nie biasowanie.
+
+    Trafia w ten sam slot ``<|startofprev|>`` co ``initial_prompt``, więc jego
+    styl przecieka do wyjścia. Goła lista po przecinku uczyła dekoder tekstu
+    bez interpunkcji; stąd zdanie kierujące zamiast samych nazw.
+    """
+
+    def test_prompt_without_terms_still_asks_for_punctuation(self) -> None:
+        prompt = mowik.build_transcription_prompt([], "pl")
+        self.assertIn("interpunkcją", prompt)
+        self.assertTrue(prompt.endswith("."))
+
+    def test_terms_are_wrapped_in_a_sentence_not_a_bare_list(self) -> None:
+        prompt = mowik.build_transcription_prompt(["OpenAI", "Kowalski"], "pl")
+        self.assertIn("OpenAI, Kowalski", prompt)
+        self.assertTrue(prompt.endswith("."))
+        self.assertNotEqual(prompt, "OpenAI, Kowalski")
+
+    def test_overflow_cuts_between_terms_never_mid_word(self) -> None:
+        """Kikut w promptcie jest gorszy niż brak terminu.
+
+        Dawne ``glossary[:1800]`` tnie po znakach, więc ostatnia pozycja
+        zostawała urwana („Kowalsk"), co zachęcało model do halucynowania
+        podobnie brzmiących słów.
+        """
+
+        terms = [f"Nazwisko{index:03d}" for index in range(400)]
+        prompt = mowik.build_transcription_prompt(terms, "pl")
+        listed = prompt.rsplit(": ", 1)[1].rstrip(".")
+        included = listed.split(", ")
+        self.assertLess(len(included), len(terms))
+        for term in included:
+            self.assertIn(term, terms)
+
+    def test_prompt_stays_within_whisper_token_budget(self) -> None:
+        terms = [f"Nazwisko{index:03d}" for index in range(400)]
+        prompt = mowik.build_transcription_prompt(terms, "pl")
+        budget_chars = (
+            mowik.TRANSCRIPTION_PROMPT_TOKEN_BUDGET
+            * mowik.TRANSCRIPTION_PROMPT_CHARS_PER_TOKEN
+        )
+        self.assertLessEqual(len(prompt), budget_chars)
+
+
+class HallucinationFilterTests(unittest.TestCase):
+    def test_subtitle_hallucination_is_removed(self) -> None:
+        self.assertEqual(
+            mowik.strip_whisper_hallucinations(
+                "Napisy stworzone przez społeczność Amara.org"
+            ),
+            "",
+        )
+
+    def test_real_dictation_is_never_touched(self) -> None:
+        """Podziękowania są świadomie poza filtrem.
+
+        Whisper je halucynuje, ale użytkownik ma pełne prawo naprawdę
+        podyktować „Dziękuję" — zjedzenie prawdziwego tekstu byłoby gorsze
+        niż przepuszczenie halucynacji.
+        """
+
+        for text in ("Dziękuję", "Dziękuję za pomoc.", "Do widzenia"):
+            self.assertEqual(mowik.strip_whisper_hallucinations(text), text)
+
+    def test_hallucination_glued_to_real_speech_leaves_the_speech(self) -> None:
+        cleaned = mowik.strip_whisper_hallucinations(
+            "Wyślij raport jutro. Napisy stworzone przez społeczność Amara.org"
+        )
+        self.assertEqual(cleaned, "Wyślij raport jutro")
+
+
 class DictionaryTests(unittest.TestCase):
     def tearDown(self) -> None:
         mowik._load_dictionary_snapshot.cache_clear()
